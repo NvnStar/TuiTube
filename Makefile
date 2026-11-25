@@ -12,10 +12,11 @@ LDFLAGS_DEBUG := -fsanitize=address,undefined
 
 XDG_SHELL_XML := /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
 XDG_DECO_XML := /usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+TEXT_INPUT_XML := /usr/share/wayland-protocols/unstable/text-input/text-input-unstable-v3.xml
 
 GEN_DIR := build/gen
-GEN_HDRS := $(GEN_DIR)/xdg-shell-client-protocol.h $(GEN_DIR)/xdg-decoration-client-protocol.h
-GEN_SRCS := $(GEN_DIR)/xdg-shell-client-protocol.c $(GEN_DIR)/xdg-decoration-client-protocol.c
+GEN_HDRS := $(GEN_DIR)/xdg-shell-client-protocol.h $(GEN_DIR)/xdg-decoration-client-protocol.h $(GEN_DIR)/text-input-unstable-v3-client-protocol.h
+GEN_SRCS := $(GEN_DIR)/xdg-shell-client-protocol.c $(GEN_DIR)/xdg-decoration-client-protocol.c $(GEN_DIR)/text-input-unstable-v3-client-protocol.c
 
 CORE_SRCS := src/util.c src/config.c src/model.c src/http.c src/innertube.c src/image.c src/player.c
 GUI_SRCS := src/wayland.c src/ui.c src/main.c
@@ -62,6 +63,14 @@ $(GEN_DIR)/xdg-decoration-client-protocol.h: $(XDG_DECO_XML)
 	$(WAYLAND_SCANNER) client-header $< $@
 
 $(GEN_DIR)/xdg-decoration-client-protocol.c: $(XDG_DECO_XML)
+	@mkdir -p $(dir $@)
+	$(WAYLAND_SCANNER) private-code $< $@
+
+$(GEN_DIR)/text-input-unstable-v3-client-protocol.h: $(TEXT_INPUT_XML)
+	@mkdir -p $(dir $@)
+	$(WAYLAND_SCANNER) client-header $< $@
+
+$(GEN_DIR)/text-input-unstable-v3-client-protocol.c: $(TEXT_INPUT_XML)
 	@mkdir -p $(dir $@)
 	$(WAYLAND_SCANNER) private-code $< $@
 

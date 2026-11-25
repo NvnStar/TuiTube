@@ -40,6 +40,16 @@ static void test_util_utf8_and_entities(void) {
 
     assert(utf8_clamp_pos(s, 8, len) == 6);
 
+    /* Vietnamese multi-byte UTF-8 ("Tiếng Việt"):
+       'T'(1) 'i'(1) 'ế'(3) 'n'(1) 'g'(1) ' '(1) 'V'(1) 'i'(1) 'ệ'(3) 't'(1) = 14 bytes */
+    const char *vi = "Ti\xE1\xBA\xBFng Vi\xE1\xBB\x87t";
+    size_t vi_len = strlen(vi);
+    assert(vi_len == 14);
+    assert(utf8_next_char(vi, 2, vi_len) == 5);
+    assert(utf8_prev_char(vi, 5) == 2);
+    assert(utf8_clamp_pos(vi, 4, vi_len) == 2);
+    assert(utf8_clamp_pos(vi, 12, vi_len) == 10);
+
     char *unesc = tt_xml_unescape("Rock &amp; Roll &lt;3 &quot;Hi&quot; &#39;ok&#39; &#x2605;");
     assert(unesc != NULL);
     assert(strcmp(unesc, "Rock & Roll <3 \"Hi\" 'ok' \xE2\x98\x85") == 0);

@@ -78,5 +78,6 @@ void ui_on_pointer_axis(void *ctx, double dx, double dy);
 void ui_on_pointer_leave(void *ctx);
 void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
                const char *utf8, bool pressed);
+void ui_on_ime(void *ctx, const WaylandImeEvent *ev);
 
 #endif

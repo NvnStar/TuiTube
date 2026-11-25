@@ -5,6 +5,7 @@
 #include "wayland.h"
 #include "config.h"
 #include "player.h"
+#include "text-input-unstable-v3-client-protocol.h"
 #include "util.h"
 #include "xdg-decoration-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
@@ -23,6 +24,7 @@
 #include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-cursor.h>
+#include <xkbcommon/xkbcommon-compose.h>
 
 typedef struct {
     struct wl_buffer *buffer;
@@ -51,6 +53,7 @@ struct WaylandApp {
     struct wl_output *output;
     struct wl_data_device_manager *data_mgr;
     struct zxdg_decoration_manager_v1 *deco_mgr;
+    struct zwp_text_input_manager_v3 *ti_mgr;
 
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
@@ -59,11 +62,32 @@ struct WaylandApp {
 
     struct wl_pointer *pointer;
     struct wl_keyboard *keyboard;
+    struct zwp_text_input_v3 *text_input;
     struct wl_data_device *data_device;
     struct wl_data_source *clipboard_source;
     WaylandOffer *offers;
     WaylandOffer *selection_offer;
     char *owned_clipboard;
+
+    bool ti_focused;
+    bool ime_enabled;
+    bool ime_committed_enabled;
+    uint32_t ti_commit_serial;
+    char *ti_pending_preedit;
+    int32_t ti_pending_cursor_begin;
+    int32_t ti_pending_cursor_end;
+    char *ti_pending_commit;
+    uint32_t ti_pending_del_before;
+    uint32_t ti_pending_del_after;
+    char *ime_surrounding_text;
+    int32_t ime_surrounding_cursor;
+    int32_t ime_surrounding_anchor;
+    bool ime_has_surrounding;
+    int32_t ime_rect_x;
+    int32_t ime_rect_y;
+    int32_t ime_rect_w;
+    int32_t ime_rect_h;
+    bool ime_has_rect;
 
     struct wl_cursor_theme *cursor_theme;
     struct wl_surface *cursor_surface;
@@ -72,6 +96,8 @@ struct WaylandApp {
     struct xkb_context *xkb_ctx;
     struct xkb_keymap *xkb_keymap;
     struct xkb_state *xkb_state;
+    struct xkb_compose_table *xkb_compose_table;
+    struct xkb_compose_state *xkb_compose_state;
     int repeat_timer_fd;
     int repeat_rate;
     int repeat_delay;
@@ -482,15 +508,64 @@ static uint32_t active_mods(WaylandApp *wl) {
     return mods;
 }
 
+static xkb_keysym_t normalize_keypad_sym(xkb_keysym_t sym) {
+    switch (sym) {
+        case XKB_KEY_KP_Enter:     return XKB_KEY_Return;
+        case XKB_KEY_KP_Left:      return XKB_KEY_Left;
+        case XKB_KEY_KP_Right:     return XKB_KEY_Right;
+        case XKB_KEY_KP_Up:        return XKB_KEY_Up;
+        case XKB_KEY_KP_Down:      return XKB_KEY_Down;
+        case XKB_KEY_KP_Home:      return XKB_KEY_Home;
+        case XKB_KEY_KP_End:       return XKB_KEY_End;
+        case XKB_KEY_KP_Page_Up:   return XKB_KEY_Page_Up;
+        case XKB_KEY_KP_Page_Down: return XKB_KEY_Page_Down;
+        case XKB_KEY_KP_Delete:    return XKB_KEY_Delete;
+        case XKB_KEY_KP_Insert:    return XKB_KEY_Insert;
+        default:                   return sym;
+    }
+}
+
 static void dispatch_xkb_key(WaylandApp *wl, uint32_t xkb_code, bool pressed) {
     if (!wl->xkb_state || !wl->cbs.on_key) return;
-    xkb_keysym_t sym = xkb_state_key_get_one_sym(wl->xkb_state, xkb_code);
+    uint32_t mods = active_mods(wl);
+    xkb_keysym_t sym = normalize_keypad_sym(xkb_state_key_get_one_sym(wl->xkb_state, xkb_code));
     char utf8[64] = {0};
+
     if (pressed) {
-        int n = xkb_state_key_get_utf8(wl->xkb_state, xkb_code, utf8, sizeof(utf8));
-        if (n < 0) utf8[0] = '\0';
+        bool has_shortcut_mod = (mods & (TT_MOD_CTRL | TT_MOD_ALT | TT_MOD_SUPER)) != 0;
+        if (has_shortcut_mod) {
+            /* Fall back to base Latin layout keysym so shortcuts work under non-Latin XKB groups */
+            if (wl->xkb_keymap && sym > 0x7fu && !(sym >= 0xff00u && sym <= 0xffffu)) {
+                const xkb_keysym_t *syms = NULL;
+                int n = xkb_keymap_key_get_syms_by_level(wl->xkb_keymap, xkb_code, 0, 0, &syms);
+                if (n > 0 && syms && syms[0] >= 0x20u && syms[0] <= 0x7eu) {
+                    sym = syms[0];
+                }
+            }
+        } else if (wl->xkb_compose_state) {
+            xkb_compose_state_feed(wl->xkb_compose_state, sym);
+            enum xkb_compose_status st = xkb_compose_state_get_status(wl->xkb_compose_state);
+            if (st == XKB_COMPOSE_COMPOSING) {
+                utf8[0] = '\0';
+            } else if (st == XKB_COMPOSE_COMPOSED) {
+                int n = xkb_compose_state_get_utf8(wl->xkb_compose_state, utf8, sizeof(utf8));
+                if (n < 0) utf8[0] = '\0';
+                xkb_keysym_t csym = xkb_compose_state_get_one_sym(wl->xkb_compose_state);
+                if (csym != XKB_KEY_NoSymbol) sym = csym;
+                xkb_compose_state_reset(wl->xkb_compose_state);
+            } else if (st == XKB_COMPOSE_CANCELLED) {
+                utf8[0] = '\0';
+                xkb_compose_state_reset(wl->xkb_compose_state);
+            } else {
+                int n = xkb_state_key_get_utf8(wl->xkb_state, xkb_code, utf8, sizeof(utf8));
+                if (n < 0) utf8[0] = '\0';
+            }
+        } else {
+            int n = xkb_state_key_get_utf8(wl->xkb_state, xkb_code, utf8, sizeof(utf8));
+            if (n < 0) utf8[0] = '\0';
+        }
     }
-    wl->cbs.on_key(wl->user_ctx, active_mods(wl), sym, utf8, pressed);
+    wl->cbs.on_key(wl->user_ctx, mods, sym, utf8, pressed);
 }
 
 static void keyboard_keymap(void *data, struct wl_keyboard *kb, uint32_t format,
@@ -533,6 +608,9 @@ static void keyboard_leave(void *data, struct wl_keyboard *kb, uint32_t serial,
     (void)kb; (void)serial; (void)surface;
     WaylandApp *wl = data;
     disarm_repeat_timer(wl);
+    if (wl->xkb_compose_state) {
+        xkb_compose_state_reset(wl->xkb_compose_state);
+    }
 }
 
 static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial,
@@ -605,6 +683,245 @@ static const struct wl_seat_listener seat_listener = {
     .capabilities = seat_capabilities,
     .name = seat_name
 };
+
+/* Text Input v3 (IME: Fcitx5, IBus, etc.) */
+static void ti_clear_pending(WaylandApp *wl) {
+    free(wl->ti_pending_preedit);
+    wl->ti_pending_preedit = NULL;
+    wl->ti_pending_cursor_begin = 0;
+    wl->ti_pending_cursor_end = 0;
+    free(wl->ti_pending_commit);
+    wl->ti_pending_commit = NULL;
+    wl->ti_pending_del_before = 0;
+    wl->ti_pending_del_after = 0;
+}
+
+static void ime_commit(WaylandApp *wl) {
+    if (!wl || !wl->text_input) return;
+    zwp_text_input_v3_commit(wl->text_input);
+    wl->ti_commit_serial++;
+    wl_display_flush(wl->display);
+}
+
+static void ime_send_enable_state(WaylandApp *wl) {
+    if (!wl || !wl->text_input || !wl->ti_focused) return;
+    zwp_text_input_v3_enable(wl->text_input);
+    zwp_text_input_v3_set_content_type(
+        wl->text_input,
+        ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
+        ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
+    zwp_text_input_v3_set_surrounding_text(
+        wl->text_input,
+        wl->ime_surrounding_text ? wl->ime_surrounding_text : "",
+        wl->ime_has_surrounding ? wl->ime_surrounding_cursor : 0,
+        wl->ime_has_surrounding ? wl->ime_surrounding_anchor : 0);
+    if (wl->ime_has_rect) {
+        zwp_text_input_v3_set_cursor_rectangle(
+            wl->text_input,
+            wl->ime_rect_x, wl->ime_rect_y,
+            wl->ime_rect_w, wl->ime_rect_h);
+    } else {
+        zwp_text_input_v3_set_cursor_rectangle(wl->text_input, 48, 8, 1, 24);
+    }
+    wl->ime_committed_enabled = true;
+    ime_commit(wl);
+}
+
+static void ti_enter(void *data, struct zwp_text_input_v3 *ti, struct wl_surface *surface) {
+    (void)ti;
+    WaylandApp *wl = data;
+    ti_clear_pending(wl);
+    wl->ti_focused = (surface == wl->surface);
+    wl->ime_committed_enabled = false;
+    if (wl->ti_focused && wl->ime_enabled) {
+        ime_send_enable_state(wl);
+    }
+}
+
+static void ti_leave(void *data, struct zwp_text_input_v3 *ti, struct wl_surface *surface) {
+    (void)ti;
+    WaylandApp *wl = data;
+    if (surface != wl->surface) return;
+    wl->ti_focused = false;
+    wl->ime_committed_enabled = false;
+    ti_clear_pending(wl);
+    if (wl->cbs.on_ime) {
+        WaylandImeEvent ev = {.reset = true};
+        wl->cbs.on_ime(wl->user_ctx, &ev);
+    }
+}
+
+static void ti_preedit_string(void *data, struct zwp_text_input_v3 *ti,
+                              const char *text, int32_t cursor_begin, int32_t cursor_end) {
+    (void)ti;
+    WaylandApp *wl = data;
+    free(wl->ti_pending_preedit);
+    wl->ti_pending_preedit = (text && text[0]) ? tt_strdup(text) : NULL;
+    wl->ti_pending_cursor_begin = cursor_begin;
+    wl->ti_pending_cursor_end = cursor_end;
+}
+
+static void ti_commit_string(void *data, struct zwp_text_input_v3 *ti, const char *text) {
+    (void)ti;
+    WaylandApp *wl = data;
+    free(wl->ti_pending_commit);
+    wl->ti_pending_commit = (text && text[0]) ? tt_strdup(text) : NULL;
+}
+
+static void ti_delete_surrounding_text(void *data, struct zwp_text_input_v3 *ti,
+                                       uint32_t before_length, uint32_t after_length) {
+    (void)ti;
+    WaylandApp *wl = data;
+    wl->ti_pending_del_before = before_length;
+    wl->ti_pending_del_after = after_length;
+}
+
+static void ti_done(void *data, struct zwp_text_input_v3 *ti, uint32_t serial) {
+    (void)ti;
+    (void)serial;
+    WaylandApp *wl = data;
+
+    char *preedit = wl->ti_pending_preedit;
+    int32_t cbegin = wl->ti_pending_cursor_begin;
+    int32_t cend = wl->ti_pending_cursor_end;
+    char *commit = wl->ti_pending_commit;
+    uint32_t del_before = wl->ti_pending_del_before;
+    uint32_t del_after = wl->ti_pending_del_after;
+
+    wl->ti_pending_preedit = NULL;
+    wl->ti_pending_cursor_begin = 0;
+    wl->ti_pending_cursor_end = 0;
+    wl->ti_pending_commit = NULL;
+    wl->ti_pending_del_before = 0;
+    wl->ti_pending_del_after = 0;
+
+    if (wl->cbs.on_ime) {
+        WaylandImeEvent ev = {
+            .preedit_text = preedit,
+            .preedit_cursor_begin = cbegin,
+            .preedit_cursor_end = cend,
+            .commit_text = commit,
+            .delete_before = del_before,
+            .delete_after = del_after,
+            .reset = false
+        };
+        wl->cbs.on_ime(wl->user_ctx, &ev);
+    }
+
+    free(preedit);
+    free(commit);
+}
+
+static const struct zwp_text_input_v3_listener text_input_listener = {
+    .enter = ti_enter,
+    .leave = ti_leave,
+    .preedit_string = ti_preedit_string,
+    .commit_string = ti_commit_string,
+    .delete_surrounding_text = ti_delete_surrounding_text,
+    .done = ti_done
+};
+
+void wayland_ime_set_enabled(WaylandApp *wl, bool enabled) {
+    if (!wl) return;
+    wl->ime_enabled = enabled;
+    if (!wl->text_input || !wl->ti_focused) return;
+
+    if (enabled) {
+        if (!wl->ime_committed_enabled) {
+            ime_send_enable_state(wl);
+        }
+    } else {
+        if (wl->ime_committed_enabled) {
+            zwp_text_input_v3_disable(wl->text_input);
+            wl->ime_committed_enabled = false;
+            ime_commit(wl);
+        }
+    }
+}
+
+void wayland_ime_set_surrounding(WaylandApp *wl, const char *text,
+                                 int32_t cursor_byte, int32_t anchor_byte,
+                                 bool external_change) {
+    if (!wl) return;
+    const char *src = text ? text : "";
+    size_t len = strlen(src);
+    size_t cur = cursor_byte < 0 ? 0 : ((size_t)cursor_byte > len ? len : (size_t)cursor_byte);
+    size_t anc = anchor_byte < 0 ? 0 : ((size_t)anchor_byte > len ? len : (size_t)anchor_byte);
+    cur = utf8_clamp_pos(src, cur, len);
+    anc = utf8_clamp_pos(src, anc, len);
+
+    /* Respect Wayland text-input-v3 4000-byte surrounding text limit */
+    const size_t max_bytes = 3900;
+    size_t win_start = 0;
+    size_t win_end = len;
+    if (len > max_bytes) {
+        size_t half = max_bytes / 2;
+        win_start = cur > half ? (cur - half) : 0;
+        while (win_start < len && ((unsigned char)src[win_start] & 0xC0u) == 0x80u) {
+            win_start++;
+        }
+        win_end = win_start + max_bytes;
+        if (win_end > len) win_end = len;
+        win_end = utf8_clamp_pos(src, win_end, len);
+        if (cur < win_start) cur = win_start;
+        if (cur > win_end) cur = win_end;
+        if (anc < win_start) anc = win_start;
+        if (anc > win_end) anc = win_end;
+    }
+
+    size_t slice_len = win_end - win_start;
+    int32_t rel_cur = (int32_t)(cur - win_start);
+    int32_t rel_anc = (int32_t)(anc - win_start);
+
+    if (wl->ime_has_surrounding && wl->ime_surrounding_text &&
+        strlen(wl->ime_surrounding_text) == slice_len &&
+        memcmp(wl->ime_surrounding_text, src + win_start, slice_len) == 0 &&
+        wl->ime_surrounding_cursor == rel_cur &&
+        wl->ime_surrounding_anchor == rel_anc &&
+        !external_change) {
+        return;
+    }
+
+    char *copy = tt_strndup(src + win_start, slice_len);
+    if (!copy) return;
+    free(wl->ime_surrounding_text);
+    wl->ime_surrounding_text = copy;
+    wl->ime_surrounding_cursor = rel_cur;
+    wl->ime_surrounding_anchor = rel_anc;
+    wl->ime_has_surrounding = true;
+
+    if (wl->text_input && wl->ti_focused && wl->ime_committed_enabled) {
+        zwp_text_input_v3_set_surrounding_text(
+            wl->text_input, wl->ime_surrounding_text, rel_cur, rel_anc);
+        zwp_text_input_v3_set_text_change_cause(
+            wl->text_input,
+            external_change ? ZWP_TEXT_INPUT_V3_CHANGE_CAUSE_OTHER
+                            : ZWP_TEXT_INPUT_V3_CHANGE_CAUSE_INPUT_METHOD);
+        ime_commit(wl);
+    }
+}
+
+void wayland_ime_set_cursor_rect(WaylandApp *wl, int32_t x, int32_t y,
+                                 int32_t w, int32_t h) {
+    if (!wl) return;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (wl->ime_has_rect &&
+        wl->ime_rect_x == x && wl->ime_rect_y == y &&
+        wl->ime_rect_w == w && wl->ime_rect_h == h) {
+        return;
+    }
+    wl->ime_rect_x = x;
+    wl->ime_rect_y = y;
+    wl->ime_rect_w = w;
+    wl->ime_rect_h = h;
+    wl->ime_has_rect = true;
+
+    if (wl->text_input && wl->ti_focused && wl->ime_committed_enabled) {
+        zwp_text_input_v3_set_cursor_rectangle(wl->text_input, x, y, w, h);
+        ime_commit(wl);
+    }
+}
 
 /* Data Offer / Clipboard */
 static void data_offer_handle(void *data, struct wl_data_offer *offer, const char *mime) {
@@ -762,6 +1079,8 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
         wl->data_mgr = wl_registry_bind(reg, name, &wl_data_device_manager_interface, v);
     } else if (strcmp(iface, zxdg_decoration_manager_v1_interface.name) == 0) {
         wl->deco_mgr = wl_registry_bind(reg, name, &zxdg_decoration_manager_v1_interface, 1);
+    } else if (strcmp(iface, zwp_text_input_manager_v3_interface.name) == 0) {
+        wl->ti_mgr = wl_registry_bind(reg, name, &zwp_text_input_manager_v3_interface, 1);
     }
 }
 
@@ -798,6 +1117,17 @@ WaylandApp *wayland_create(int init_width, int init_height, const char *title,
         return NULL;
     }
 
+    const char *locale = getenv("LC_ALL");
+    if (!locale || !locale[0]) locale = getenv("LC_CTYPE");
+    if (!locale || !locale[0]) locale = getenv("LANG");
+    if (!locale || !locale[0]) locale = "C";
+    wl->xkb_compose_table = xkb_compose_table_new_from_locale(
+        wl->xkb_ctx, locale, XKB_COMPOSE_COMPILE_NO_FLAGS);
+    if (wl->xkb_compose_table) {
+        wl->xkb_compose_state = xkb_compose_state_new(
+            wl->xkb_compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
+    }
+
     wl->display = wl_display_connect(NULL);
     if (!wl->display) {
         if (err_buf && err_cap) {
@@ -823,6 +1153,13 @@ WaylandApp *wayland_create(int init_width, int init_height, const char *title,
     if (wl->data_mgr && wl->seat) {
         wl->data_device = wl_data_device_manager_get_data_device(wl->data_mgr, wl->seat);
         wl_data_device_add_listener(wl->data_device, &data_device_listener, wl);
+    }
+
+    if (wl->ti_mgr && wl->seat) {
+        wl->text_input = zwp_text_input_manager_v3_get_text_input(wl->ti_mgr, wl->seat);
+        if (wl->text_input) {
+            zwp_text_input_v3_add_listener(wl->text_input, &text_input_listener, wl);
+        }
     }
 
     wl->cursor_theme = wl_cursor_theme_load(NULL, 24, wl->shm);
@@ -879,11 +1216,17 @@ void wayland_destroy(WaylandApp *wl) {
 
     if (wl->pointer) wl_pointer_destroy(wl->pointer);
     if (wl->keyboard) wl_keyboard_destroy(wl->keyboard);
+    if (wl->text_input) zwp_text_input_v3_destroy(wl->text_input);
+    ti_clear_pending(wl);
+    free(wl->ime_surrounding_text);
+    if (wl->xkb_compose_state) xkb_compose_state_unref(wl->xkb_compose_state);
+    if (wl->xkb_compose_table) xkb_compose_table_unref(wl->xkb_compose_table);
     if (wl->xkb_state) xkb_state_unref(wl->xkb_state);
     if (wl->xkb_keymap) xkb_keymap_unref(wl->xkb_keymap);
     if (wl->xkb_ctx) xkb_context_unref(wl->xkb_ctx);
     if (wl->repeat_timer_fd >= 0) close(wl->repeat_timer_fd);
 
+    if (wl->ti_mgr) zwp_text_input_manager_v3_destroy(wl->ti_mgr);
     if (wl->deco_mgr) zxdg_decoration_manager_v1_destroy(wl->deco_mgr);
     if (wl->data_mgr) wl_data_device_manager_destroy(wl->data_mgr);
     if (wl->output) wl_output_destroy(wl->output);

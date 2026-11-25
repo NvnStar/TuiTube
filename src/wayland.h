@@ -28,6 +28,16 @@ typedef enum {
 } TtMouseButton;
 
 typedef struct {
+    const char *preedit_text;
+    int32_t preedit_cursor_begin;
+    int32_t preedit_cursor_end;
+    const char *commit_text;
+    uint32_t delete_before;
+    uint32_t delete_after;
+    bool reset;
+} WaylandImeEvent;
+
+typedef struct {
     void (*on_render)(void *ctx, cairo_t *cr, int width, int height);
     void (*on_resize)(void *ctx, int width, int height);
     void (*on_pointer_motion)(void *ctx, double x, double y);
@@ -37,6 +47,7 @@ typedef struct {
     void (*on_pointer_leave)(void *ctx);
     void (*on_key)(void *ctx, uint32_t mods, xkb_keysym_t sym,
                    const char *utf8, bool pressed);
+    void (*on_ime)(void *ctx, const WaylandImeEvent *ev);
 } WaylandCallbacks;
 
 typedef struct WaylandApp WaylandApp;
@@ -60,6 +71,13 @@ void wayland_minimize(WaylandApp *wl);
 
 bool wayland_clipboard_copy(WaylandApp *wl, const char *text);
 char *wayland_clipboard_paste(WaylandApp *wl);
+
+void wayland_ime_set_enabled(WaylandApp *wl, bool enabled);
+void wayland_ime_set_surrounding(WaylandApp *wl, const char *text,
+                                 int32_t cursor_byte, int32_t anchor_byte,
+                                 bool external_change);
+void wayland_ime_set_cursor_rect(WaylandApp *wl, int32_t x, int32_t y,
+                                 int32_t w, int32_t h);
 
 int wayland_poll_once(WaylandApp *wl, int extra_fd, int timeout_ms, bool *out_extra_ready);
 void wayland_render_if_needed(WaylandApp *wl);

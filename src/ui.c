@@ -156,6 +156,11 @@ struct UiState {
     bool search_sel_all;
     double last_search_tx;
 
+    char *ime_preedit;
+    size_t ime_preedit_len;
+    int32_t ime_cursor_begin;
+    int32_t ime_cursor_end;
+
     FocusZone focus_zone;
     bool show_filters;
     SearchFilter filter;
@@ -797,6 +802,37 @@ static void draw_thumb_placeholder(cairo_t *cr, const Theme *t, Rect box, ItemKi
     draw_icon(cr, placeholder_icon_for_kind(kind), ib, t->base.fg, 0.28);
 }
 
+static void ime_clear_preedit(UiState *ui) {
+    if (!ui) return;
+    free(ui->ime_preedit);
+    ui->ime_preedit = NULL;
+    ui->ime_preedit_len = 0;
+    ui->ime_cursor_begin = 0;
+    ui->ime_cursor_end = 0;
+}
+
+static void ime_sync_surrounding(UiState *ui, bool external_change) {
+    if (!ui || !ui->wl) return;
+    int32_t cursor = ui->search_sel_all ? (int32_t)ui->search_len : (int32_t)ui->search_cursor;
+    int32_t anchor = ui->search_sel_all ? 0 : (int32_t)ui->search_cursor;
+    wayland_ime_set_surrounding(ui->wl, ui->search_buf ? ui->search_buf : "",
+                                cursor, anchor, external_change);
+}
+
+static void set_focus_zone(UiState *ui, FocusZone zone) {
+    if (!ui) return;
+    FocusZone prev = ui->focus_zone;
+    if (prev == FOCUS_SEARCH && zone != FOCUS_SEARCH) {
+        ime_clear_preedit(ui);
+        wayland_ime_set_enabled(ui->wl, false);
+    }
+    ui->focus_zone = zone;
+    if (zone == FOCUS_SEARCH && !ui->show_help) {
+        wayland_ime_set_enabled(ui->wl, true);
+        ime_sync_surrounding(ui, true);
+    }
+}
+
 UiState *ui_create(TuiTubeConfig *cfg, WaylandApp *wl, ThumbCache *thumbs,
                    FavoriteList *favs, HistoryList *history,
                    const UiCallbacks *cbs, void *user_ctx) {
@@ -828,6 +864,8 @@ UiState *ui_create(TuiTubeConfig *cfg, WaylandApp *wl, ThumbCache *thumbs,
 
     ui_reload_font(ui);
     ui_reload_mascot(ui);
+    wayland_ime_set_enabled(ui->wl, true);
+    ime_sync_surrounding(ui, false);
     return ui;
 }
 
@@ -837,6 +875,7 @@ void ui_destroy(UiState *ui) {
     free(ui->font_family);
     if (ui->mascot_surf) cairo_surface_destroy(ui->mascot_surf);
     free(ui->search_buf);
+    ime_clear_preedit(ui);
     media_list_free(&ui->list);
     media_item_free_fields(&ui->detail_item);
     str_list_free(&ui->inflight_keys, &ui->inflight_count, &ui->inflight_cap);
@@ -1040,6 +1079,8 @@ void ui_set_search_text(UiState *ui, const char *text) {
     ui->search_len = len;
     ui->search_cursor = len;
     ui->search_sel_all = false;
+    ime_clear_preedit(ui);
+    ime_sync_surrounding(ui, true);
     wayland_request_redraw(ui->wl);
 }
 
@@ -1493,6 +1534,7 @@ static void render_search_box(UiState *ui, cairo_t *cr, const Layout *L) {
     const Theme *t = &ui->cfg->theme;
     Rect sb = L->search_box;
     bool focused = (ui->focus_zone == FOCUS_SEARCH);
+    bool has_text = (ui->search_len > 0 || ui->ime_preedit_len > 0);
 
     draw_rounded_rect(cr, sb, 6.0);
     set_cairo_color(cr, t->text_normal.bg, 1.0);
@@ -1507,7 +1549,7 @@ static void render_search_box(UiState *ui, cairo_t *cr, const Layout *L) {
               t->base.fg, focused ? 0.9 : 0.6);
 
     double text_left = sb.x + 10.0 + icon_sz + 8.0;
-    double text_right = (ui->search_len > 0) ? (L->btn_search_clear.x - 4.0) : (sb.x + sb.w - 8.0);
+    double text_right = has_text ? (L->btn_search_clear.x - 4.0) : (sb.x + sb.w - 8.0);
     double inner_w = text_right - text_left;
     if (inner_w < 10.0) inner_w = 10.0;
 
@@ -1515,8 +1557,48 @@ static void render_search_box(UiState *ui, cairo_t *cr, const Layout *L) {
     cairo_rectangle(cr, text_left, sb.y + 2.0, inner_w, sb.h - 4.0);
     cairo_clip(cr);
 
-    const char *disp = ui->search_len > 0 ? ui->search_buf : "Search YouTube or paste URL...";
-    bool is_placeholder = (ui->search_len == 0);
+    StrBuf composed;
+    sb_init(&composed);
+    const char *disp = "Search YouTube or paste URL...";
+    bool is_placeholder = !has_text;
+    size_t preedit_start = ui->search_cursor;
+    size_t preedit_end = ui->search_cursor;
+    size_t caret_byte = ui->search_cursor;
+    bool hide_caret = false;
+    size_t preedit_sel_a = 0;
+    size_t preedit_sel_b = 0;
+
+    if (has_text) {
+        if (ui->ime_preedit_len > 0 && ui->ime_preedit) {
+            sb_append_n(&composed, ui->search_buf, ui->search_cursor);
+            preedit_start = composed.len;
+            sb_append_n(&composed, ui->ime_preedit, ui->ime_preedit_len);
+            preedit_end = composed.len;
+            sb_append_n(&composed, ui->search_buf + ui->search_cursor,
+                        ui->search_len - ui->search_cursor);
+            disp = composed.data ? composed.data : "";
+
+            if (ui->ime_cursor_begin < 0 && ui->ime_cursor_end < 0) {
+                hide_caret = true;
+                caret_byte = preedit_end;
+            } else {
+                size_t cb = ui->ime_cursor_begin < 0 ? 0 : (size_t)ui->ime_cursor_begin;
+                size_t ce = ui->ime_cursor_end < 0 ? cb : (size_t)ui->ime_cursor_end;
+                if (cb > ui->ime_preedit_len) cb = ui->ime_preedit_len;
+                if (ce > ui->ime_preedit_len) ce = ui->ime_preedit_len;
+                cb = utf8_clamp_pos(ui->ime_preedit, cb, ui->ime_preedit_len);
+                ce = utf8_clamp_pos(ui->ime_preedit, ce, ui->ime_preedit_len);
+                caret_byte = preedit_start + cb;
+                if (cb != ce) {
+                    preedit_sel_a = preedit_start + (cb < ce ? cb : ce);
+                    preedit_sel_b = preedit_start + (cb < ce ? ce : cb);
+                }
+            }
+        } else {
+            disp = ui->search_buf;
+            caret_byte = ui->search_cursor;
+        }
+    }
 
     PangoLayout *pl = pango_cairo_create_layout(cr);
     PangoFontDescription *fd = make_font_desc(ui, 1.0, false);
@@ -1532,7 +1614,7 @@ static void render_search_box(UiState *ui, cairo_t *cr, const Layout *L) {
     int cursor_x_px = 0;
     if (!is_placeholder) {
         PangoRectangle pos;
-        pango_layout_get_cursor_pos(pl, (int)ui->search_cursor, &pos, NULL);
+        pango_layout_get_cursor_pos(pl, (int)caret_byte, &pos, NULL);
         cursor_x_px = pos.x / PANGO_SCALE;
         if (cursor_x_px > inner_w - 2.0) {
             tx -= (cursor_x_px - (inner_w - 2.0));
@@ -1540,19 +1622,51 @@ static void render_search_box(UiState *ui, cairo_t *cr, const Layout *L) {
     }
     ui->last_search_tx = tx;
 
-    if (!is_placeholder && ui->search_sel_all && focused) {
+    if (!is_placeholder && ui->search_sel_all && focused && ui->ime_preedit_len == 0) {
         set_cairo_color(cr, t->text_selected.bg, 0.35);
         cairo_rectangle(cr, tx, sb.y + 4.0, tw, sb.h - 8.0);
         cairo_fill(cr);
     }
 
+    if (ui->ime_preedit_len > 0 && preedit_sel_b > preedit_sel_a) {
+        PangoRectangle pa, pb;
+        pango_layout_get_cursor_pos(pl, (int)preedit_sel_a, &pa, NULL);
+        pango_layout_get_cursor_pos(pl, (int)preedit_sel_b, &pb, NULL);
+        double sx = tx + (double)pa.x / PANGO_SCALE;
+        double sw = (double)(pb.x - pa.x) / PANGO_SCALE;
+        if (sw > 0.5) {
+            set_cairo_color(cr, t->text_selected.bg, 0.30);
+            cairo_rectangle(cr, sx, sb.y + 4.0, sw, sb.h - 8.0);
+            cairo_fill(cr);
+        }
+    }
+
     set_cairo_color(cr, t->text_normal.fg, is_placeholder ? 0.50 : 1.0);
     cairo_move_to(cr, tx, ty);
     pango_cairo_show_layout(cr, pl);
-    g_object_unref(pl);
 
-    if (focused) {
-        double cx = tx + (is_placeholder ? 0.0 : (double)cursor_x_px);
+    if (ui->ime_preedit_len > 0 && preedit_end > preedit_start) {
+        PangoRectangle p1, p2;
+        pango_layout_get_cursor_pos(pl, (int)preedit_start, &p1, NULL);
+        pango_layout_get_cursor_pos(pl, (int)preedit_end, &p2, NULL);
+        double ux1 = tx + (double)p1.x / PANGO_SCALE;
+        double ux2 = tx + (double)p2.x / PANGO_SCALE;
+        if (ux2 > ux1 + 0.5) {
+            double uy = ty + th + 1.0;
+            if (uy > sb.y + sb.h - 3.0) uy = sb.y + sb.h - 3.0;
+            set_cairo_color(cr, t->elem_selected.bg, 0.95);
+            cairo_set_line_width(cr, 1.5);
+            cairo_move_to(cr, ux1, uy);
+            cairo_line_to(cr, ux2, uy);
+            cairo_stroke(cr);
+        }
+    }
+
+    g_object_unref(pl);
+    sb_free(&composed);
+
+    double cx = tx + (is_placeholder ? 0.0 : (double)cursor_x_px);
+    if (focused && !hide_caret) {
         set_cairo_color(cr, t->text_normal.fg, 0.92);
         cairo_set_line_width(cr, 1.5);
         cairo_move_to(cr, cx, sb.y + 6.0);
@@ -1560,9 +1674,22 @@ static void render_search_box(UiState *ui, cairo_t *cr, const Layout *L) {
         cairo_stroke(cr);
     }
 
+    if (focused) {
+        double sc = config_effective_ui_scale(ui->cfg);
+        double clamped_cx = cx;
+        if (clamped_cx < text_left) clamped_cx = text_left;
+        if (clamped_cx > text_right) clamped_cx = text_right;
+        wayland_ime_set_cursor_rect(
+            ui->wl,
+            (int32_t)lround(clamped_cx * sc),
+            (int32_t)lround(sb.y * sc),
+            1,
+            (int32_t)lround(sb.h * sc));
+    }
+
     cairo_restore(cr);
 
-    if (ui->search_len > 0) {
+    if (has_text) {
         Rect cr_btn = L->btn_search_clear;
         bool hot = (ui->hover_id == HIT_BTN_SEARCH_CLEAR || ui->pressed_id == HIT_BTN_SEARCH_CLEAR);
         if (hot) {
@@ -2222,7 +2349,9 @@ static HitId hit_test(UiState *ui, const Layout *L, double x, double y) {
         if (pt_in_rect(x, y, L->csd_bar)) return HIT_CSD_TITLEBAR;
     }
     if (pt_in_rect(x, y, L->btn_back)) return HIT_BTN_BACK;
-    if (ui->search_len > 0 && pt_in_rect(x, y, L->btn_search_clear)) return HIT_BTN_SEARCH_CLEAR;
+    if ((ui->search_len > 0 || ui->ime_preedit_len > 0) && pt_in_rect(x, y, L->btn_search_clear)) {
+        return HIT_BTN_SEARCH_CLEAR;
+    }
     if (pt_in_rect(x, y, L->search_box)) return HIT_SEARCH_BOX;
     if (pt_in_rect(x, y, L->btn_go)) return HIT_BTN_GO;
     if (pt_in_rect(x, y, L->btn_filters)) return HIT_BTN_FILTERS;
@@ -2515,6 +2644,31 @@ static size_t search_cursor_from_click(const UiState *ui, double lx) {
     return pos;
 }
 
+static void search_insert_utf8(UiState *ui, const char *utf8);
+
+static void ime_commit_preedit_locally(UiState *ui) {
+    if (!ui || !ui->ime_preedit || ui->ime_preedit_len == 0) return;
+    char *tmp = ui->ime_preedit;
+    ui->ime_preedit = NULL;
+    ui->ime_preedit_len = 0;
+    ui->ime_cursor_begin = 0;
+    ui->ime_cursor_end = 0;
+    search_insert_utf8(ui, tmp);
+    free(tmp);
+}
+
+static void toggle_help_modal(UiState *ui, bool open) {
+    ui->show_help = open;
+    if (open) {
+        ui->ctx_menu.open = false;
+        ime_clear_preedit(ui);
+        wayland_ime_set_enabled(ui->wl, false);
+    } else if (ui->focus_zone == FOCUS_SEARCH) {
+        wayland_ime_set_enabled(ui->wl, true);
+        ime_sync_surrounding(ui, true);
+    }
+}
+
 void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
                           bool double_click, double x, double y) {
     UiState *ui = ctx;
@@ -2535,7 +2689,7 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
     if (btn == TT_BTN_RIGHT) {
         if (!pressed) return;
         if (ui->show_help) {
-            ui->show_help = false;
+            toggle_help_modal(ui, false);
             wayland_request_redraw(ui->wl);
             return;
         }
@@ -2546,7 +2700,7 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
             double rel_y = ly - L.list_area.y + ui->list_scroll_y;
             size_t idx = rel_y >= 0.0 ? (size_t)(rel_y / rh) : ui->list.count;
             if (idx < ui->list.count) {
-                ui->focus_zone = FOCUS_LIST;
+                set_focus_zone(ui, FOCUS_LIST);
                 select_list_row(ui, idx);
                 build_ctx_menu(ui, ui_get_detail_item(ui), lx, ly);
             } else {
@@ -2597,7 +2751,7 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
     switch (h) {
         case HIT_HELP_CLOSE:
         case HIT_HELP_BACKDROP:
-            ui->show_help = false;
+            toggle_help_modal(ui, false);
             break;
         case HIT_HELP_MODAL:
             break;
@@ -2629,14 +2783,16 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
             }
             break;
         case HIT_BTN_SEARCH_CLEAR:
+            ime_clear_preedit(ui);
             ui->search_len = 0;
             ui->search_cursor = 0;
             ui->search_buf[0] = '\0';
             ui->search_sel_all = false;
-            ui->focus_zone = FOCUS_SEARCH;
+            set_focus_zone(ui, FOCUS_SEARCH);
+            ime_sync_surrounding(ui, true);
             break;
         case HIT_SEARCH_BOX:
-            ui->focus_zone = FOCUS_SEARCH;
+            ime_commit_preedit_locally(ui);
             if (double_click) {
                 ui->search_sel_all = true;
                 ui->search_cursor = ui->search_len;
@@ -2644,32 +2800,34 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
                 ui->search_sel_all = false;
                 ui->search_cursor = search_cursor_from_click(ui, lx);
             }
+            set_focus_zone(ui, FOCUS_SEARCH);
             break;
         case HIT_BTN_GO:
-            ui->focus_zone = FOCUS_LIST;
+            ime_commit_preedit_locally(ui);
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             if (ui->cbs.on_search) ui->cbs.on_search(ui->user_ctx, ui->search_buf, ui->filter);
             break;
         case HIT_BTN_FILTERS:
             ui->show_filters = !ui->show_filters;
             break;
         case HIT_BTN_FEED:
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             if (ui->cbs.on_show_feed) ui->cbs.on_show_feed(ui->user_ctx);
             break;
         case HIT_BTN_FAVS:
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             if (ui->cbs.on_show_favorites) ui->cbs.on_show_favorites(ui->user_ctx);
             break;
         case HIT_BTN_HISTORY:
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             if (ui->cbs.on_show_history) ui->cbs.on_show_history(ui->user_ctx);
             break;
         case HIT_BTN_HELP:
-            ui->show_help = !ui->show_help;
+            toggle_help_modal(ui, !ui->show_help);
             break;
         case HIT_BTN_SORT:
             ui->filter.sort = (SearchSort)(((int)ui->filter.sort + 1) % 4);
@@ -2706,12 +2864,12 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
             Rect tr = desc_scrollbar_thumb_rect(ui, L.desc_scrollbar);
             ui->dragging_desc_scrollbar = true;
             ui->desc_sb_drag_offset = pt_in_rect(lx, ly, tr) ? (ly - tr.y) : (tr.h * 0.5);
-            ui->focus_zone = FOCUS_DETAIL;
+            set_focus_zone(ui, FOCUS_DETAIL);
             break;
         }
         case HIT_LIST_ITEM: {
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             double rh = row_height(ui);
             size_t idx = (size_t)((ly - L.list_area.y + ui->list_scroll_y) / rh);
             if (idx < ui->list.count) {
@@ -2723,8 +2881,8 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
             break;
         }
         case HIT_LIST_AREA:
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             break;
         case HIT_DETAIL_THUMB:
         case HIT_ACT_PLAY:
@@ -2746,8 +2904,8 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
             copy_item_field(ui, 0);
             break;
         case HIT_RIGHT_PANE:
-            ui->focus_zone = FOCUS_DETAIL;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_DETAIL);
             break;
         default:
             break;
@@ -2806,6 +2964,28 @@ static void search_insert_utf8(UiState *ui, const char *utf8) {
     ui->search_cursor += add;
 }
 
+static size_t search_prev_word_pos(const UiState *ui) {
+    size_t pos = ui->search_cursor;
+    while (pos > 0 && isspace((unsigned char)ui->search_buf[pos - 1])) {
+        pos = utf8_prev_char(ui->search_buf, pos);
+    }
+    while (pos > 0 && !isspace((unsigned char)ui->search_buf[pos - 1])) {
+        pos = utf8_prev_char(ui->search_buf, pos);
+    }
+    return pos;
+}
+
+static size_t search_next_word_pos(const UiState *ui) {
+    size_t pos = ui->search_cursor;
+    while (pos < ui->search_len && isspace((unsigned char)ui->search_buf[pos])) {
+        pos = utf8_next_char(ui->search_buf, pos, ui->search_len);
+    }
+    while (pos < ui->search_len && !isspace((unsigned char)ui->search_buf[pos])) {
+        pos = utf8_next_char(ui->search_buf, pos, ui->search_len);
+    }
+    return pos;
+}
+
 static void search_delete_prev_word(UiState *ui) {
     if (ui->search_sel_all) {
         ui->search_len = 0;
@@ -2815,17 +2995,26 @@ static void search_delete_prev_word(UiState *ui) {
         return;
     }
     if (ui->search_cursor == 0) return;
-    size_t pos = ui->search_cursor;
-    while (pos > 0 && isspace((unsigned char)ui->search_buf[pos - 1])) {
-        pos = utf8_prev_char(ui->search_buf, pos);
-    }
-    while (pos > 0 && !isspace((unsigned char)ui->search_buf[pos - 1])) {
-        pos = utf8_prev_char(ui->search_buf, pos);
-    }
+    size_t pos = search_prev_word_pos(ui);
     memmove(ui->search_buf + pos, ui->search_buf + ui->search_cursor,
             ui->search_len - ui->search_cursor + 1);
     ui->search_len -= (ui->search_cursor - pos);
     ui->search_cursor = pos;
+}
+
+static void search_delete_next_word(UiState *ui) {
+    if (ui->search_sel_all) {
+        ui->search_len = 0;
+        ui->search_cursor = 0;
+        ui->search_buf[0] = '\0';
+        ui->search_sel_all = false;
+        return;
+    }
+    if (ui->search_cursor >= ui->search_len) return;
+    size_t pos = search_next_word_pos(ui);
+    memmove(ui->search_buf + ui->search_cursor, ui->search_buf + pos,
+            ui->search_len - pos + 1);
+    ui->search_len -= (pos - ui->search_cursor);
 }
 
 static void execute_action(UiState *ui, KeyAction act) {
@@ -2860,18 +3049,18 @@ static void execute_action(UiState *ui, KeyAction act) {
             copy_item_field(ui, 2);
             break;
         case ACT_SHOW_FAVORITES:
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             if (ui->cbs.on_show_favorites) ui->cbs.on_show_favorites(ui->user_ctx);
             break;
         case ACT_SHOW_FEED:
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             if (ui->cbs.on_show_feed) ui->cbs.on_show_feed(ui->user_ctx);
             break;
         case ACT_SHOW_HISTORY:
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             if (ui->cbs.on_show_history) ui->cbs.on_show_history(ui->user_ctx);
             break;
         case ACT_ADD_FAVORITES:
@@ -2905,19 +3094,19 @@ static void execute_action(UiState *ui, KeyAction act) {
             if (ui->cfg->playlist_width < 200) ui->cfg->playlist_width = 200;
             break;
         case ACT_FOCUS_SEARCH_INPUT:
-            ui->focus_zone = FOCUS_SEARCH;
-            ui->search_sel_all = true;
+            ui->search_sel_all = (ui->search_len > 0);
+            ui->search_cursor = ui->search_len;
+            set_focus_zone(ui, FOCUS_SEARCH);
             break;
         case ACT_FOCUS_PLAYLIST:
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             break;
         case ACT_NAV_BACK:
             if (ui->cbs.on_navigate_back) ui->cbs.on_navigate_back(ui->user_ctx);
             break;
         case ACT_TOGGLE_HELP:
-            ui->ctx_menu.open = false;
-            ui->show_help = !ui->show_help;
+            toggle_help_modal(ui, !ui->show_help);
             break;
         default:
             break;
@@ -2947,6 +3136,113 @@ static void scroll_desc(UiState *ui, double delta) {
     wayland_request_redraw(ui->wl);
 }
 
+void ui_on_ime(void *ctx, const WaylandImeEvent *ev) {
+    UiState *ui = ctx;
+    if (!ui || !ev) return;
+
+    if (ev->reset) {
+        ime_clear_preedit(ui);
+        wayland_request_redraw(ui->wl);
+        return;
+    }
+
+    if (ui->focus_zone != FOCUS_SEARCH || ui->show_help) {
+        ime_clear_preedit(ui);
+        return;
+    }
+
+    /* 1. Clear existing preedit string */
+    ime_clear_preedit(ui);
+
+    bool text_modified = false;
+    bool has_commit = (ev->commit_text && ev->commit_text[0]);
+    bool has_preedit = (ev->preedit_text && ev->preedit_text[0]);
+
+    /* 2. Delete requested surrounding text (UTF-8 byte counts around cursor) */
+    if (ev->delete_before > 0 || ev->delete_after > 0) {
+        if (ui->search_sel_all) {
+            ui->search_len = 0;
+            ui->search_cursor = 0;
+            ui->search_buf[0] = '\0';
+            ui->search_sel_all = false;
+            text_modified = true;
+        }
+        size_t before = ev->delete_before > ui->search_cursor ? ui->search_cursor : ev->delete_before;
+        size_t after = ev->delete_after > (ui->search_len - ui->search_cursor)
+                       ? (ui->search_len - ui->search_cursor) : ev->delete_after;
+        size_t del_start = utf8_clamp_pos(ui->search_buf, ui->search_cursor - before, ui->search_len);
+        size_t del_end = ui->search_cursor + after;
+        while (del_end < ui->search_len && ((unsigned char)ui->search_buf[del_end] & 0xC0u) == 0x80u) {
+            del_end++;
+        }
+        if (del_end > del_start) {
+            memmove(ui->search_buf + del_start, ui->search_buf + del_end,
+                    ui->search_len - del_end + 1);
+            ui->search_len -= (del_end - del_start);
+            ui->search_cursor = del_start;
+            text_modified = true;
+        }
+    }
+
+    /* 3. Insert committed UTF-8 string */
+    if (has_commit) {
+        char *clean = tt_strdup(ev->commit_text);
+        if (clean) {
+            for (char *p = clean; *p; p++) {
+                if (*p == '\r' || *p == '\n') *p = ' ';
+            }
+            search_insert_utf8(ui, clean);
+            free(clean);
+            text_modified = true;
+        }
+    }
+
+    /* 4. Sync updated surrounding text back to IME */
+    if (text_modified) {
+        ime_sync_surrounding(ui, false);
+    }
+
+    /* 5. Set new inline preedit string */
+    if (has_preedit) {
+        if (ui->search_sel_all) {
+            ui->search_len = 0;
+            ui->search_cursor = 0;
+            ui->search_buf[0] = '\0';
+            ui->search_sel_all = false;
+            ime_sync_surrounding(ui, false);
+        }
+        ui->ime_preedit = tt_strdup(ev->preedit_text);
+        if (ui->ime_preedit) {
+            ui->ime_preedit_len = strlen(ui->ime_preedit);
+            ui->ime_cursor_begin = ev->preedit_cursor_begin;
+            ui->ime_cursor_end = ev->preedit_cursor_end;
+        }
+    }
+
+    wayland_request_redraw(ui->wl);
+}
+
+static bool is_modifier_keysym(xkb_keysym_t sym) {
+    switch (sym) {
+        case XKB_KEY_Shift_L:
+        case XKB_KEY_Shift_R:
+        case XKB_KEY_Control_L:
+        case XKB_KEY_Control_R:
+        case XKB_KEY_Alt_L:
+        case XKB_KEY_Alt_R:
+        case XKB_KEY_Super_L:
+        case XKB_KEY_Super_R:
+        case XKB_KEY_Meta_L:
+        case XKB_KEY_Meta_R:
+        case XKB_KEY_ISO_Level3_Shift:
+        case XKB_KEY_Caps_Lock:
+        case XKB_KEY_Num_Lock:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
                const char *utf8, bool pressed) {
     if (!pressed) return;
@@ -2955,7 +3251,7 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
     if (ui->show_help) {
         if (sym == XKB_KEY_Escape ||
             config_match_keybinding(ui->cfg, mods, sym) == ACT_TOGGLE_HELP) {
-            ui->show_help = false;
+            toggle_help_modal(ui, false);
             wayland_request_redraw(ui->wl);
         }
         return;
@@ -2967,6 +3263,9 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
             wayland_request_redraw(ui->wl);
             return;
         }
+        if (!is_modifier_keysym(sym)) {
+            ui->ctx_menu.open = false;
+        }
     }
 
     /* Cycle FocusZone on Tab / Shift+Tab */
@@ -2974,39 +3273,40 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
         (mods & ~(TT_MOD_SHIFT)) == 0) {
         bool rev = (sym == XKB_KEY_ISO_Left_Tab) || ((mods & TT_MOD_SHIFT) != 0);
         ui->search_sel_all = false;
-        if (rev) {
-            ui->focus_zone = (FocusZone)(((int)ui->focus_zone + 2) % 3);
-        } else {
-            ui->focus_zone = (FocusZone)(((int)ui->focus_zone + 1) % 3);
-        }
+        FocusZone next_z = rev ? (FocusZone)(((int)ui->focus_zone + 2) % 3)
+                               : (FocusZone)(((int)ui->focus_zone + 1) % 3);
+        set_focus_zone(ui, next_z);
         wayland_request_redraw(ui->wl);
         return;
     }
 
     if (ui->focus_zone == FOCUS_SEARCH) {
         if (sym == XKB_KEY_Escape) {
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             wayland_request_redraw(ui->wl);
             return;
         }
         if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
-            ui->focus_zone = FOCUS_LIST;
+            ime_commit_preedit_locally(ui);
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             if (ui->cbs.on_search) ui->cbs.on_search(ui->user_ctx, ui->search_buf, ui->filter);
             wayland_request_redraw(ui->wl);
             return;
         }
         if (sym == XKB_KEY_Down && (mods == 0) && ui->list.count > 0) {
-            ui->focus_zone = FOCUS_LIST;
             ui->search_sel_all = false;
+            set_focus_zone(ui, FOCUS_LIST);
             if (ui->selected_idx < 0) select_list_row(ui, 0);
             wayland_request_redraw(ui->wl);
             return;
         }
         if ((mods & TT_MOD_CTRL) && (sym == XKB_KEY_a || sym == XKB_KEY_A)) {
-            ui->search_sel_all = true;
+            ime_commit_preedit_locally(ui);
+            ui->search_sel_all = (ui->search_len > 0);
             ui->search_cursor = ui->search_len;
+            ime_sync_surrounding(ui, true);
             wayland_request_redraw(ui->wl);
             return;
         }
@@ -3014,7 +3314,21 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
             if (ui->search_len > 0) wayland_clipboard_copy(ui->wl, ui->search_buf);
             return;
         }
+        if ((mods & TT_MOD_CTRL) && (sym == XKB_KEY_x || sym == XKB_KEY_X)) {
+            ime_commit_preedit_locally(ui);
+            if (ui->search_len > 0) {
+                wayland_clipboard_copy(ui->wl, ui->search_buf);
+                ui->search_len = 0;
+                ui->search_cursor = 0;
+                ui->search_buf[0] = '\0';
+                ui->search_sel_all = false;
+                ime_sync_surrounding(ui, true);
+                wayland_request_redraw(ui->wl);
+            }
+            return;
+        }
         if ((mods & TT_MOD_CTRL) && (sym == XKB_KEY_v || sym == XKB_KEY_V)) {
+            ime_clear_preedit(ui);
             char *pasted = wayland_clipboard_paste(ui->wl);
             if (pasted) {
                 for (char *p = pasted; *p; p++) {
@@ -3022,11 +3336,13 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
                 }
                 search_insert_utf8(ui, pasted);
                 free(pasted);
+                ime_sync_surrounding(ui, true);
                 wayland_request_redraw(ui->wl);
             }
             return;
         }
         if ((mods & TT_MOD_CTRL) && (sym == XKB_KEY_u || sym == XKB_KEY_U)) {
+            ime_clear_preedit(ui);
             if (ui->search_sel_all) {
                 ui->search_len = 0;
                 ui->search_cursor = 0;
@@ -3038,12 +3354,53 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
                 ui->search_len -= ui->search_cursor;
                 ui->search_cursor = 0;
             }
+            ime_sync_surrounding(ui, true);
+            wayland_request_redraw(ui->wl);
+            return;
+        }
+        if ((mods & TT_MOD_CTRL) && (sym == XKB_KEY_k || sym == XKB_KEY_K)) {
+            ime_clear_preedit(ui);
+            if (ui->search_sel_all) {
+                ui->search_len = 0;
+                ui->search_cursor = 0;
+                ui->search_buf[0] = '\0';
+                ui->search_sel_all = false;
+            } else if (ui->search_cursor < ui->search_len) {
+                ui->search_len = ui->search_cursor;
+                ui->search_buf[ui->search_len] = '\0';
+            }
+            ime_sync_surrounding(ui, true);
             wayland_request_redraw(ui->wl);
             return;
         }
         if (((mods & TT_MOD_CTRL) && sym == XKB_KEY_BackSpace) ||
             ((mods & TT_MOD_CTRL) && (sym == XKB_KEY_w || sym == XKB_KEY_W))) {
+            ime_clear_preedit(ui);
             search_delete_prev_word(ui);
+            ime_sync_surrounding(ui, true);
+            wayland_request_redraw(ui->wl);
+            return;
+        }
+        if ((mods & TT_MOD_CTRL) && sym == XKB_KEY_Delete) {
+            ime_clear_preedit(ui);
+            search_delete_next_word(ui);
+            ime_sync_surrounding(ui, true);
+            wayland_request_redraw(ui->wl);
+            return;
+        }
+        if ((mods & TT_MOD_CTRL) && sym == XKB_KEY_Left) {
+            ime_commit_preedit_locally(ui);
+            ui->search_sel_all = false;
+            ui->search_cursor = search_prev_word_pos(ui);
+            ime_sync_surrounding(ui, true);
+            wayland_request_redraw(ui->wl);
+            return;
+        }
+        if ((mods & TT_MOD_CTRL) && sym == XKB_KEY_Right) {
+            ime_commit_preedit_locally(ui);
+            ui->search_sel_all = false;
+            ui->search_cursor = search_next_word_pos(ui);
+            ime_sync_surrounding(ui, true);
             wayland_request_redraw(ui->wl);
             return;
         }
@@ -3068,6 +3425,7 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
                 ui->search_len -= (ui->search_cursor - prev);
                 ui->search_cursor = prev;
             }
+            ime_sync_surrounding(ui, true);
             wayland_request_redraw(ui->wl);
             return;
         }
@@ -3083,36 +3441,42 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
                         ui->search_len - next + 1);
                 ui->search_len -= (next - ui->search_cursor);
             }
+            ime_sync_surrounding(ui, true);
             wayland_request_redraw(ui->wl);
             return;
         }
         if (sym == XKB_KEY_Left) {
             ui->search_sel_all = false;
             ui->search_cursor = utf8_prev_char(ui->search_buf, ui->search_cursor);
+            ime_sync_surrounding(ui, true);
             wayland_request_redraw(ui->wl);
             return;
         }
         if (sym == XKB_KEY_Right) {
             ui->search_sel_all = false;
             ui->search_cursor = utf8_next_char(ui->search_buf, ui->search_cursor, ui->search_len);
+            ime_sync_surrounding(ui, true);
             wayland_request_redraw(ui->wl);
             return;
         }
         if (sym == XKB_KEY_Home) {
             ui->search_sel_all = false;
             ui->search_cursor = 0;
+            ime_sync_surrounding(ui, true);
             wayland_request_redraw(ui->wl);
             return;
         }
         if (sym == XKB_KEY_End) {
             ui->search_sel_all = false;
             ui->search_cursor = ui->search_len;
+            ime_sync_surrounding(ui, true);
             wayland_request_redraw(ui->wl);
             return;
         }
         if (utf8 && utf8[0] && (unsigned char)utf8[0] >= 0x20 && utf8[0] != 0x7f &&
             (mods & (TT_MOD_CTRL | TT_MOD_ALT | TT_MOD_SUPER)) == 0) {
             search_insert_utf8(ui, utf8);
+            ime_sync_surrounding(ui, true);
             wayland_request_redraw(ui->wl);
             return;
         }
@@ -3130,8 +3494,8 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
         compute_layout(ui, &L);
         double page_step = L.desc_area.h > 40.0 ? L.desc_area.h * 0.85 : 160.0;
         double line_step = ui->cfg->font_size * 2.5;
-        if (sym == XKB_KEY_Up || sym == XKB_KEY_k) scroll_desc(ui, -line_step);
-        else if (sym == XKB_KEY_Down || sym == XKB_KEY_j) scroll_desc(ui, line_step);
+        if (sym == XKB_KEY_Up || sym == XKB_KEY_k || sym == XKB_KEY_K) scroll_desc(ui, -line_step);
+        else if (sym == XKB_KEY_Down || sym == XKB_KEY_j || sym == XKB_KEY_J) scroll_desc(ui, line_step);
         else if (sym == XKB_KEY_Page_Up) scroll_desc(ui, -page_step);
         else if (sym == XKB_KEY_Page_Down) scroll_desc(ui, page_step);
         else if (sym == XKB_KEY_Home) scroll_desc(ui, -ui->desc_max_scroll - 1.0);
@@ -3139,13 +3503,13 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
         return;
     }
 
-    if (((mods & TT_MOD_SHIFT) && sym == XKB_KEY_Up) || sym == XKB_KEY_K) {
+    if ((mods & TT_MOD_SHIFT) && (sym == XKB_KEY_Up || sym == XKB_KEY_K || sym == XKB_KEY_k)) {
         scroll_desc(ui, -ui->cfg->font_size * 3.0);
-    } else if (((mods & TT_MOD_SHIFT) && sym == XKB_KEY_Down) || sym == XKB_KEY_J) {
+    } else if ((mods & TT_MOD_SHIFT) && (sym == XKB_KEY_Down || sym == XKB_KEY_J || sym == XKB_KEY_j)) {
         scroll_desc(ui, ui->cfg->font_size * 3.0);
-    } else if (sym == XKB_KEY_Up || sym == XKB_KEY_k) {
+    } else if (sym == XKB_KEY_Up || sym == XKB_KEY_k || sym == XKB_KEY_K) {
         move_selection(ui, -1);
-    } else if (sym == XKB_KEY_Down || sym == XKB_KEY_j) {
+    } else if (sym == XKB_KEY_Down || sym == XKB_KEY_j || sym == XKB_KEY_J) {
         move_selection(ui, 1);
     } else if (sym == XKB_KEY_Page_Up) {
         move_selection(ui, -8);

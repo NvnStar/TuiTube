@@ -928,6 +928,10 @@ static void wl_tramp_key(void *ctx, uint32_t mods, xkb_keysym_t sym, const char 
     AppState *app = ctx;
     if (app->ui) ui_on_key(app->ui, mods, sym, utf8, pressed);
 }
+static void wl_tramp_ime(void *ctx, const WaylandImeEvent *ev) {
+    AppState *app = ctx;
+    if (app->ui) ui_on_ime(app->ui, ev);
+}
 
 int main(int argc, char **argv) {
     const char *cli_config_dir = NULL;
@@ -983,6 +987,7 @@ int main(int argc, char **argv) {
         .on_pointer_axis = wl_tramp_axis,
         .on_pointer_leave = wl_tramp_leave,
         .on_key = wl_tramp_key,
+        .on_ime = wl_tramp_ime,
     };
 
     char err[256] = {0};
