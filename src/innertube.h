@@ -8,12 +8,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define INNERTUBE_CHAN_VIDEOS_PARAMS  "EgZ2aWRlb3PyBgQKAjoA"
+#define INNERTUBE_CHAN_STREAMS_PARAMS "EgdzdHJlYW1z8gYECgJ6AA=="
+
 typedef enum {
     SORT_RELEVANCE = 0,
     SORT_UPLOAD_DATE = 1,
     SORT_VIEW_COUNT = 2,
     SORT_RATING = 3
 } SearchSort;
+
+#define INNERTUBE_CHAN_VIDEOS_PARAMS  "EgZ2aWRlb3PyBgQKAjoA"
+#define INNERTUBE_CHAN_STREAMS_PARAMS "EgdzdHJlYW1z8gYECgJ6AA=="
 
 typedef enum {
     TYPE_ALL = 0,
@@ -28,6 +34,9 @@ typedef struct {
     bool live_only;
 } SearchFilter;
 
+#define INNERTUBE_CHAN_VIDEOS_PARAMS  "EgZ2aWRlb3PyBgQKAjoA"
+#define INNERTUBE_CHAN_STREAMS_PARAMS "EgdzdHJlYW1z8gYECgJ6AA=="
+
 typedef enum {
     URL_NONE = 0,
     URL_VIDEO,
@@ -40,6 +49,7 @@ typedef struct {
     ParsedUrlKind kind;
     char id[128];
     char resolved_url[256];
+    bool prefer_live_tab;
 } ParsedUrl;
 
 bool innertube_encode_search_params(SearchFilter filter, char *out, size_t out_cap);
@@ -64,6 +74,9 @@ bool innertube_search(CURL *curl, const char *query, SearchFilter filter,
 bool innertube_browse(CURL *curl, const char *browse_id, const char *params,
                       const char *continuation, MediaList *out_list,
                       char *err_buf, size_t err_cap);
+bool innertube_browse_channel(CURL *curl, const char *channel_id, bool live_tab,
+                              const char *continuation, bool hide_members_only,
+                              MediaList *out_list, char *err_buf, size_t err_cap);
 bool innertube_next(CURL *curl, const char *video_id, const char *continuation,
                     MediaItem *out_details, MediaList *out_recommended,
                     char *err_buf, size_t err_cap);
@@ -71,7 +84,8 @@ bool innertube_resolve_url(CURL *curl, const char *url, ParsedUrl *out,
                            char *err_buf, size_t err_cap);
 bool innertube_fetch_feed(CURL *curl, const FavoriteList *favs, bool use_rss,
                           int max_per_channel, int64_t max_age_sec, int64_t now_epoch,
-                          MediaList *out_list, HttpPool *pool, uint64_t gen,
+                          bool hide_members_only, MediaList *out_list,
+                          HttpPool *pool, uint64_t gen,
                           char *err_buf, size_t err_cap);
 
 #endif

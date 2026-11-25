@@ -39,6 +39,7 @@ typedef enum {
     ACT_NONE = 0,
     ACT_QUIT,
     ACT_PLAY_VIDEO,
+    ACT_DOWNLOAD_VIDEO,
     ACT_VIEW_USER_VIDEOS,
     ACT_VIEW_RECOMMENDED_VIDEOS,
     ACT_NEXT_PAGE,
@@ -98,6 +99,8 @@ typedef struct {
     int64_t max_feed_age_sec;
     bool allow_hdr;
     bool all_codecs;
+    bool hide_members_only;
+    char *download_dir;
 
     KeyBinding *key_bindings;
     size_t key_binding_count;
@@ -123,6 +126,7 @@ bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir);
 bool config_apply_theme(TuiTubeConfig *cfg, const char *theme_name);
 double config_effective_ui_scale(const TuiTubeConfig *cfg);
 char *config_resolve_asset_path(const TuiTubeConfig *cfg, const char *rel_or_abs);
+char *config_resolve_download_dir(const TuiTubeConfig *cfg);
 void config_free(TuiTubeConfig *cfg);
 
 #endif

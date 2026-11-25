@@ -63,6 +63,11 @@ static void sync_ui_nav(AppState *app) {
     ui_set_nav_state(app->ui,
                      app->has_view ? view_mode_to_ui_kind(app->view_mode) : UI_VIEW_NONE,
                      nav_stack_can_pop(&app->nav_stack));
+    bool is_chan = app->has_view && app->view_mode == MODE_BROWSE &&
+                   app->last_browse_id && strncmp(app->last_browse_id, "UC", 2) == 0;
+    bool is_live_tab = is_chan && app->last_browse_params &&
+                       strncmp(app->last_browse_params, "EgdzdHJlYW1z", 12) == 0;
+    ui_set_channel_tabs(app->ui, is_chan, is_live_tab);
 }
 
 static void push_current_nav(AppState *app) {
@@ -100,6 +105,7 @@ typedef struct {
     SearchFilter filter;
     char *continuation;
     bool append;
+    bool hide_members_only;
 } SearchJobReq;
 
 typedef struct {
@@ -134,6 +140,9 @@ static void *run_search_job(CURL *curl, void *arg, uint64_t gen, HttpPool *pool)
     res->list.heading = tt_strdup("Search Results");
     res->ok = innertube_search(curl, req->query, req->filter, req->continuation,
                                &res->list, res->error, sizeof(res->error));
+    if (res->ok && req->hide_members_only) {
+        media_list_filter_members_only(&res->list);
+    }
     return res;
 }
 
@@ -143,6 +152,7 @@ typedef struct {
     char *continuation;
     char *heading;
     bool append;
+    bool hide_members_only;
 } BrowseJobReq;
 
 static void free_browse_req(void *p) {
@@ -163,8 +173,18 @@ static void *run_browse_job(CURL *curl, void *arg, uint64_t gen, HttpPool *pool)
     media_list_init(&res->list);
     res->append = req->append;
     if (req->heading) res->list.heading = tt_strdup(req->heading);
-    res->ok = innertube_browse(curl, req->browse_id, req->params, req->continuation,
-                               &res->list, res->error, sizeof(res->error));
+    if (req->browse_id && strncmp(req->browse_id, "UC", 2) == 0) {
+        bool live_tab = req->params && strncmp(req->params, "EgdzdHJlYW1z", 12) == 0;
+        res->ok = innertube_browse_channel(curl, req->browse_id, live_tab,
+                                           req->continuation, req->hide_members_only,
+                                           &res->list, res->error, sizeof(res->error));
+    } else {
+        res->ok = innertube_browse(curl, req->browse_id, req->params, req->continuation,
+                                   &res->list, res->error, sizeof(res->error));
+        if (res->ok && req->hide_members_only) {
+            media_list_filter_members_only(&res->list);
+        }
+    }
     if (!res->list.heading) res->list.heading = tt_strdup("Browse");
     return res;
 }
@@ -174,6 +194,7 @@ typedef struct {
     char *continuation;
     bool load_list;
     bool append;
+    bool hide_members_only;
 } NextJobReq;
 
 typedef struct {
@@ -214,11 +235,16 @@ static void *run_next_job(CURL *curl, void *arg, uint64_t gen, HttpPool *pool) {
                              req->continuation ? NULL : &res->details,
                              req->load_list ? &res->recommended : NULL,
                              res->error, sizeof(res->error));
+    if (res->ok && req->load_list && req->hide_members_only) {
+        media_list_filter_members_only(&res->recommended);
+    }
     return res;
 }
 
 typedef struct {
     char *url;
+    bool prefer_live_tab;
+    bool hide_members_only;
 } ResolveJobReq;
 
 typedef struct {
@@ -249,13 +275,20 @@ static void *run_resolve_job(CURL *curl, void *arg, uint64_t gen, HttpPool *pool
     if (!res) return NULL;
     media_list_init(&res->list);
     res->ok = innertube_resolve_url(curl, req->url, &res->parsed, res->error, sizeof(res->error));
+    if (res->ok && req->prefer_live_tab && res->parsed.kind == URL_CHANNEL) {
+        res->parsed.prefer_live_tab = true;
+    }
     if (res->ok && res->parsed.kind == URL_CHANNEL) {
-        res->ok = innertube_browse(curl, res->parsed.id, "EgZ2aWRlb3PyBgQKAjoA", NULL,
-                                   &res->list, res->error, sizeof(res->error));
+        res->ok = innertube_browse_channel(curl, res->parsed.id, res->parsed.prefer_live_tab,
+                                           NULL, req->hide_members_only,
+                                           &res->list, res->error, sizeof(res->error));
     } else if (res->ok && res->parsed.kind == URL_PLAYLIST) {
         char *vl = tt_asprintf("VL%s", res->parsed.id);
         res->ok = innertube_browse(curl, vl, NULL, NULL,
                                    &res->list, res->error, sizeof(res->error));
+        if (res->ok && req->hide_members_only) {
+            media_list_filter_members_only(&res->list);
+        }
         free(vl);
     }
     return res;
@@ -266,6 +299,7 @@ typedef struct {
     bool use_rss;
     int max_per_ch;
     int64_t max_age_sec;
+    bool hide_members_only;
 } FeedJobReq;
 
 static void free_feed_req(void *p) {
@@ -282,8 +316,8 @@ static void *run_feed_job(CURL *curl, void *arg, uint64_t gen, HttpPool *pool) {
     media_list_init(&res->list);
     res->ok = innertube_fetch_feed(curl, &req->favs_copy, req->use_rss,
                                    req->max_per_ch, req->max_age_sec,
-                                   (int64_t)time(NULL), &res->list,
-                                   pool, gen, res->error, sizeof(res->error));
+                                   (int64_t)time(NULL), req->hide_members_only,
+                                   &res->list, pool, gen, res->error, sizeof(res->error));
     return res;
 }
 
@@ -354,40 +388,52 @@ static uint64_t bump_list_gen(AppState *app) {
 static void submit_browse(AppState *app, const char *browse_id, const char *params,
                           const char *continuation, const char *heading,
                           bool append, bool push_nav) {
-    if (!append && push_nav) push_current_nav(app);
-    uint64_t gen = bump_list_gen(app);
-    app->view_mode = MODE_BROWSE;
-    app->has_view = true;
-    if (!append) {
-        free(app->last_browse_id); app->last_browse_id = tt_strdup(browse_id);
-        free(app->last_browse_params); app->last_browse_params = tt_strdup(params);
-        free(app->last_heading); app->last_heading = tt_strdup(heading);
-        ui_set_error(app->ui, NULL);
-        ui_set_busy(app->ui, true);
-    }
-    sync_ui_nav(app);
-
     BrowseJobReq *req = calloc(1, sizeof(BrowseJobReq));
     req->browse_id = tt_strdup(browse_id);
     req->params = tt_strdup(params);
     req->continuation = tt_strdup(continuation);
     req->heading = tt_strdup(heading);
     req->append = append;
+    req->hide_members_only = app->cfg.hide_members_only;
+
+    if (!append && push_nav) push_current_nav(app);
+    uint64_t gen = bump_list_gen(app);
+    app->view_mode = MODE_BROWSE;
+    app->has_view = true;
+    if (!append) {
+        free(app->last_browse_id); app->last_browse_id = tt_strdup(req->browse_id);
+        free(app->last_browse_params); app->last_browse_params = tt_strdup(req->params);
+        free(app->last_heading); app->last_heading = tt_strdup(req->heading);
+        ui_set_error(app->ui, NULL);
+        ui_set_busy(app->ui, true);
+    }
+    sync_ui_nav(app);
+
     ui_set_status(app->ui, append ? "Loading more..." : "Loading %s...",
-                  heading ? heading : "list");
+                  req->heading ? req->heading : "list");
     http_pool_submit(app->pool, JOB_BROWSE, gen, req, run_browse_job, free_browse_req, free_list_res);
 }
 
 static void submit_next(AppState *app, const char *video_id, const char *continuation,
                         bool load_list, bool append, bool push_nav) {
+    NextJobReq *req = calloc(1, sizeof(NextJobReq));
+    req->video_id = tt_strdup(video_id);
+    req->continuation = tt_strdup(continuation);
+    req->load_list = load_list;
+    req->append = append;
+    req->hide_members_only = app->cfg.hide_members_only;
+
     if (load_list && !append && push_nav) push_current_nav(app);
     uint64_t gen = load_list ? bump_list_gen(app) : ++app->detail_gen;
+    if (!load_list) {
+        http_pool_set_active_detail_gen(app->pool, gen);
+    }
     if (load_list) {
         app->view_mode = MODE_NEXT;
         app->has_view = true;
         if (!append) {
             free(app->last_next_video_id);
-            app->last_next_video_id = tt_strdup(video_id);
+            app->last_next_video_id = tt_strdup(req->video_id);
             free(app->last_heading);
             app->last_heading = tt_strdup("Recommended");
             ui_set_error(app->ui, NULL);
@@ -397,12 +443,19 @@ static void submit_next(AppState *app, const char *video_id, const char *continu
         ui_set_status(app->ui, "Loading recommended videos...");
     }
 
-    NextJobReq *req = calloc(1, sizeof(NextJobReq));
-    req->video_id = tt_strdup(video_id);
-    req->continuation = tt_strdup(continuation);
-    req->load_list = load_list;
-    req->append = append;
-    http_pool_submit(app->pool, JOB_NEXT, gen, req, run_next_job, free_next_req, free_next_res);
+    http_pool_submit(app->pool, load_list ? JOB_NEXT : JOB_DETAIL, gen, req,
+                     run_next_job, free_next_req, free_next_res);
+}
+
+static void sync_selected_item_details(AppState *app) {
+    if (!app || !app->ui) return;
+    const MediaItem *sel = ui_get_selected_item(app->ui);
+    if (sel && sel->kind == ITEM_VIDEO && sel->id[0] && !sel->details_loaded) {
+        submit_next(app, sel->id, NULL, false, false, false);
+    } else {
+        app->detail_gen++;
+        http_pool_set_active_detail_gen(app->pool, app->detail_gen);
+    }
 }
 
 static void run_search_query(AppState *app, const char *query, SearchFilter filter, bool push_nav) {
@@ -422,14 +475,17 @@ static void run_search_query(AppState *app, const char *query, SearchFilter filt
             free(vl);
             return;
         } else if (parsed.kind == URL_CHANNEL) {
-            submit_browse(app, parsed.id, "EgZ2aWRlb3PyBgQKAjoA", NULL, "Channel Videos", false, push_nav);
+            submit_browse(app, parsed.id,
+                          parsed.prefer_live_tab ? INNERTUBE_CHAN_STREAMS_PARAMS : INNERTUBE_CHAN_VIDEOS_PARAMS,
+                          NULL, "Channel Videos", false, push_nav);
             return;
         } else if (parsed.kind == URL_HANDLE) {
+            char *qcopy = tt_strdup(query);
             if (push_nav) push_current_nav(app);
             uint64_t gen = bump_list_gen(app);
             app->view_mode = MODE_SEARCH;
             app->has_view = true;
-            free(app->last_query); app->last_query = tt_strdup(query);
+            free(app->last_query); app->last_query = qcopy;
             app->last_filter = filter;
             free(app->last_heading); app->last_heading = tt_strdup(parsed.id);
             ui_set_error(app->ui, NULL);
@@ -437,6 +493,8 @@ static void run_search_query(AppState *app, const char *query, SearchFilter filt
             sync_ui_nav(app);
             ResolveJobReq *req = calloc(1, sizeof(ResolveJobReq));
             req->url = tt_strdup(parsed.resolved_url);
+            req->prefer_live_tab = parsed.prefer_live_tab;
+            req->hide_members_only = app->cfg.hide_members_only;
             ui_set_status(app->ui, "Resolving %s...", parsed.id);
             http_pool_submit(app->pool, JOB_RESOLVE_URL, gen, req,
                              run_resolve_job, free_resolve_req, free_resolve_res);
@@ -444,21 +502,23 @@ static void run_search_query(AppState *app, const char *query, SearchFilter filt
         }
     }
 
+    SearchJobReq *req = calloc(1, sizeof(SearchJobReq));
+    req->query = tt_strdup(query);
+    req->filter = filter;
+    req->hide_members_only = app->cfg.hide_members_only;
+
     if (push_nav) push_current_nav(app);
     uint64_t gen = bump_list_gen(app);
     app->view_mode = MODE_SEARCH;
     app->has_view = true;
-    free(app->last_query); app->last_query = tt_strdup(query);
+    free(app->last_query); app->last_query = tt_strdup(req->query);
     app->last_filter = filter;
     free(app->last_heading); app->last_heading = tt_strdup("Search Results");
     ui_set_error(app->ui, NULL);
     ui_set_busy(app->ui, true);
     sync_ui_nav(app);
 
-    SearchJobReq *req = calloc(1, sizeof(SearchJobReq));
-    req->query = tt_strdup(query);
-    req->filter = filter;
-    ui_set_status(app->ui, "Searching: %s...", query);
+    ui_set_status(app->ui, "Searching: %s...", req->query ? req->query : "");
     http_pool_submit(app->pool, JOB_SEARCH, gen, req, run_search_job, free_search_req, free_list_res);
 }
 
@@ -481,6 +541,7 @@ static void cb_next_page(void *ctx) {
         req->filter = app->last_filter;
         req->continuation = tt_strdup(cur->continuation_token);
         req->append = true;
+        req->hide_members_only = app->cfg.hide_members_only;
         ui_set_status(app->ui, "Loading next page...");
         http_pool_submit(app->pool, JOB_SEARCH, gen, req, run_search_job, free_search_req, free_list_res);
     } else if (app->view_mode == MODE_BROWSE) {
@@ -522,6 +583,7 @@ static void cb_show_favorites(void *ctx) {
     }
     ui_set_list(app->ui, &ml, false);
     sync_ui_nav(app);
+    sync_selected_item_details(app);
     ui_set_status(app->ui, "Favorites (%zu items)", app->favs.count);
 }
 
@@ -548,6 +610,7 @@ static void run_feed_internal(AppState *app, bool push_nav) {
     req->use_rss = app->cfg.feed_use_rss;
     req->max_per_ch = app->cfg.max_feed_videos_per_channel;
     req->max_age_sec = app->cfg.max_feed_age_sec;
+    req->hide_members_only = app->cfg.hide_members_only;
 
     ui_set_status(app->ui, "loading feed... (%zu items left)", app->favs.count);
     http_pool_submit(app->pool, JOB_FEED, gen, req, run_feed_job, free_feed_req, free_list_res);
@@ -588,6 +651,7 @@ static void cb_show_history(void *ctx) {
     }
     ui_set_list(app->ui, &ml, false);
     sync_ui_nav(app);
+    sync_selected_item_details(app);
     ui_set_status(app->ui, "History (%zu videos)", app->history.count);
 }
 
@@ -598,6 +662,9 @@ static void cb_select_item(void *ctx, size_t index) {
     const MediaItem *it = &ml->items[index];
     if (it->kind == ITEM_VIDEO && it->id[0]) {
         submit_next(app, it->id, NULL, false, false, false);
+    } else {
+        app->detail_gen++;
+        http_pool_set_active_detail_gen(app->pool, app->detail_gen);
     }
 }
 
@@ -626,11 +693,29 @@ static void cb_activate_item(void *ctx, size_t index) {
             ui_set_status(app->ui, "%s", err);
         }
     } else if (it->kind == ITEM_CHANNEL) {
-        submit_browse(app, it->id, "EgZ2aWRlb3PyBgQKAjoA", NULL, it->title, false, true);
+        submit_browse(app, it->id, INNERTUBE_CHAN_VIDEOS_PARAMS, NULL, it->title, false, true);
     } else if (it->kind == ITEM_PLAYLIST) {
         char *vl = (strncmp(it->id, "VL", 2) == 0) ? tt_strdup(it->id) : tt_asprintf("VL%s", it->id);
         submit_browse(app, vl, NULL, NULL, it->title, false, true);
         free(vl);
+    }
+}
+
+static void cb_download_video(void *ctx) {
+    AppState *app = ctx;
+    const MediaItem *it = ui_get_detail_item(app->ui);
+    if (!it || it->kind != ITEM_VIDEO || !it->id[0]) {
+        ui_set_status(app->ui, "Select a video to download");
+        return;
+    }
+    char dir[PATH_MAX] = {0};
+    char err[256] = {0};
+    if (player_download_start(&app->cfg, it, dir, sizeof(dir), err, sizeof(err))) {
+        ui_set_status(app->ui, "Downloading to %s: %s",
+                      dir, (it->title && it->title[0]) ? it->title : it->id);
+        wayland_request_redraw(app->wl);
+    } else {
+        ui_set_status(app->ui, "%s", err[0] ? err : "Failed to start download");
     }
 }
 
@@ -644,7 +729,17 @@ static void cb_view_channel(void *ctx) {
         ui_set_status(app->ui, "No channel ID available for this item");
         return;
     }
-    submit_browse(app, cid, "EgZ2aWRlb3PyBgQKAjoA", NULL, name ? name : "Channel", false, true);
+    submit_browse(app, cid, INNERTUBE_CHAN_VIDEOS_PARAMS, NULL, name ? name : "Channel", false, true);
+}
+
+static void cb_switch_channel_tab(void *ctx, bool live_tab) {
+    AppState *app = ctx;
+    if (!app || app->view_mode != MODE_BROWSE || !app->last_browse_id || !app->last_browse_id[0]) {
+        return;
+    }
+    submit_browse(app, app->last_browse_id,
+                  live_tab ? INNERTUBE_CHAN_STREAMS_PARAMS : INNERTUBE_CHAN_VIDEOS_PARAMS,
+                  NULL, app->last_heading, false, true);
 }
 
 static void cb_view_recommended(void *ctx) {
@@ -681,12 +776,7 @@ static void cb_navigate_back(void *ctx) {
     ui_set_busy(app->ui, false);
     ui_restore_list_state(app->ui, &entry.list, entry.selected_idx, entry.scroll_y);
     sync_ui_nav(app);
-
-    const MediaItem *sel = ui_get_selected_item(app->ui);
-    if (sel && sel->kind == ITEM_VIDEO && (!sel->description || !sel->description[0])) {
-        ssize_t idx = ui_get_selected_index(app->ui);
-        if (idx >= 0) cb_select_item(app, (size_t)idx);
-    }
+    sync_selected_item_details(app);
 
     const MediaList *cur = ui_get_list(app->ui);
     ui_set_status(app->ui, "Back to %s",
@@ -802,6 +892,9 @@ static void process_async_results(AppState *app) {
                 if (lr->ok) {
                     ui_set_error(app->ui, NULL);
                     ui_set_list(app->ui, &lr->list, lr->append);
+                    if (!lr->append) {
+                        sync_selected_item_details(app);
+                    }
                     ui_set_status(app->ui, "Loaded %zu items", ui_get_list(app->ui)->count);
                 } else {
                     const char *emsg = lr->error[0] ? lr->error : "Request failed";
@@ -811,10 +904,16 @@ static void process_async_results(AppState *app) {
                         media_list_init(&empty);
                         empty.heading = tt_strdup(app->last_heading ? app->last_heading : "Error");
                         ui_set_list(app->ui, &empty, false);
+                        sync_selected_item_details(app);
                         ui_set_error(app->ui, emsg);
                     }
                     ui_set_status(app->ui, "%s", emsg);
                 }
+            }
+        } else if (res.job_type == JOB_DETAIL) {
+            NextJobRes *nr = res.data;
+            if (nr && res.request_gen == app->detail_gen && nr->ok && nr->details.id[0]) {
+                ui_set_detail_item(app->ui, &nr->details);
             }
         } else if (res.job_type == JOB_NEXT) {
             NextJobRes *nr = res.data;
@@ -837,6 +936,7 @@ static void process_async_results(AppState *app) {
                             media_list_init(&empty);
                             empty.heading = tt_strdup("Recommended");
                             ui_set_list(app->ui, &empty, false);
+                            sync_selected_item_details(app);
                             ui_set_error(app->ui, emsg);
                         }
                         ui_set_status(app->ui, "%s", emsg);
@@ -862,10 +962,13 @@ static void process_async_results(AppState *app) {
                         app->last_browse_id = tt_strdup(rr->parsed.id);
                         free(app->last_browse_params);
                         app->last_browse_params = (rr->parsed.kind == URL_CHANNEL)
-                                                      ? tt_strdup("EgZ2aWRlb3PyBgQKAjoA")
+                                                      ? tt_strdup(rr->parsed.prefer_live_tab
+                                                                      ? INNERTUBE_CHAN_STREAMS_PARAMS
+                                                                      : INNERTUBE_CHAN_VIDEOS_PARAMS)
                                                       : NULL;
                         ui_set_list(app->ui, &rr->list, false);
                         sync_ui_nav(app);
+                        sync_selected_item_details(app);
                         ui_set_status(app->ui, "Loaded %zu items", ui_get_list(app->ui)->count);
                     }
                 } else {
@@ -875,12 +978,34 @@ static void process_async_results(AppState *app) {
                     media_list_init(&empty);
                     empty.heading = tt_strdup(app->last_heading ? app->last_heading : "Error");
                     ui_set_list(app->ui, &empty, false);
+                    sync_selected_item_details(app);
                     ui_set_error(app->ui, emsg);
                     ui_set_status(app->ui, "%s", emsg);
                 }
             }
         }
         http_result_free(&res);
+    }
+}
+
+static void poll_downloads(AppState *app) {
+    if (player_poll_download_progress()) {
+        wayland_request_redraw(app->wl);
+    }
+    DownloadEvent ev;
+    while (player_poll_download_event(&ev)) {
+        if (ev.ok) {
+            if (ev.saved_path[0]) {
+                ui_set_status(app->ui, "Saved: %s", ev.saved_path);
+            } else {
+                ui_set_status(app->ui, "Download complete: %s",
+                              ev.title[0] ? ev.title : ev.video_id);
+            }
+        } else {
+            ui_set_status(app->ui, "Download failed (code %d): %s",
+                          ev.exit_code, ev.title[0] ? ev.title : ev.video_id);
+        }
+        wayland_request_redraw(app->wl);
     }
 }
 
@@ -1011,6 +1136,7 @@ int main(int argc, char **argv) {
         .on_show_history = cb_show_history,
         .on_select_item = cb_select_item,
         .on_activate_item = cb_activate_item,
+        .on_download_video = cb_download_video,
         .on_view_channel = cb_view_channel,
         .on_view_recommended = cb_view_recommended,
         .on_toggle_favorite = cb_toggle_favorite,
@@ -1018,6 +1144,7 @@ int main(int argc, char **argv) {
         .on_request_thumb = cb_request_thumb,
         .on_navigate_back = cb_navigate_back,
         .on_retry = cb_retry,
+        .on_switch_channel_tab = cb_switch_channel_tab,
     };
 
     app.ui = ui_create(&app.cfg, app.wl, app.thumbs, &app.favs, &app.history, &ui_cbs, &app);
@@ -1037,6 +1164,7 @@ int main(int argc, char **argv) {
 
     int notify_fd = http_pool_notify_fd(app.pool);
     while (!g_sig_stop && !wayland_should_quit(app.wl)) {
+        poll_downloads(&app);
         wayland_render_if_needed(app.wl);
         bool extra_ready = false;
         int pr = wayland_poll_once(app.wl, notify_fd, 250, &extra_ready);
@@ -1044,6 +1172,7 @@ int main(int argc, char **argv) {
         if (extra_ready) {
             process_async_results(&app);
         }
+        poll_downloads(&app);
     }
 
     ui_destroy(app.ui);

@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "player.h"
 #include "util.h"
 #include "xdg-shell-client-protocol.h"
 
@@ -44,6 +45,7 @@ typedef enum {
     ICON_HISTORY,
     ICON_HELP,
     ICON_PLAY,
+    ICON_DOWNLOAD,
     ICON_CHANNEL,
     ICON_SPARKLE,
     ICON_COPY,
@@ -69,6 +71,8 @@ typedef enum {
     HIT_BTN_SORT,
     HIT_BTN_TYPE,
     HIT_BTN_LIVE,
+    HIT_BTN_CHAN_VIDEOS,
+    HIT_BTN_CHAN_LIVE,
     HIT_BTN_NEXT_PAGE,
     HIT_BTN_RETRY,
     HIT_SPLITTER,
@@ -78,6 +82,7 @@ typedef enum {
     HIT_DETAIL_THUMB,
     HIT_DETAIL_AUTHOR,
     HIT_ACT_PLAY,
+    HIT_ACT_DOWNLOAD,
     HIT_ACT_CHANNEL,
     HIT_ACT_RECOMMENDED,
     HIT_ACT_FAVORITE,
@@ -93,6 +98,7 @@ typedef enum {
 
 typedef enum {
     CTX_ACT_PLAY = 0,
+    CTX_ACT_DOWNLOAD,
     CTX_ACT_CHANNEL,
     CTX_ACT_RECOMMENDED,
     CTX_ACT_FAVORITE,
@@ -105,10 +111,10 @@ typedef struct {
     bool open;
     double x;
     double y;
-    CtxAction actions[7];
-    char labels[7][48];
-    UiIcon icons[7];
-    Rect item_rects[7];
+    CtxAction actions[8];
+    char labels[8][48];
+    UiIcon icons[8];
+    Rect item_rects[8];
     Rect box;
     size_t count;
     ssize_t hover_idx;
@@ -122,12 +128,12 @@ typedef struct {
     Rect btn_back, search_box, btn_search_clear;
     Rect btn_go, btn_filters, btn_feed, btn_favs, btn_history, btn_help;
     Rect filter_bar, btn_sort, btn_type, btn_live;
-    Rect left_pane, left_header, btn_next_page, list_area, scrollbar;
+    Rect left_pane, left_header, btn_chan_videos, btn_chan_live, btn_next_page, list_area, scrollbar;
     Rect btn_retry;
     Rect splitter;
     Rect right_pane;
     Rect detail_thumb, detail_author;
-    Rect act_play, act_channel, act_recommended, act_fav, act_copy;
+    Rect act_play, act_download, act_channel, act_recommended, act_fav, act_copy;
     Rect desc_area, desc_scrollbar;
     Rect status_bar;
     Rect help_modal_box, help_close_btn;
@@ -167,6 +173,8 @@ struct UiState {
 
     UiViewKind view_kind;
     bool can_go_back;
+    bool show_channel_tabs;
+    bool channel_live_tab;
     bool busy;
     char error_text[256];
 
@@ -309,6 +317,7 @@ static void draw_text_line(cairo_t *cr, const UiState *ui, const char *text,
     set_cairo_color(cr, col, alpha_mult);
     cairo_move_to(cr, x, ty);
     pango_cairo_show_layout(cr, layout);
+    cairo_new_path(cr);
     g_object_unref(layout);
 }
 
@@ -316,6 +325,7 @@ static void draw_icon(cairo_t *cr, UiIcon icon, Rect box, ColorRGBA col, double 
     if (icon == ICON_NONE || box.w <= 1.0 || box.h <= 1.0) return;
 
     cairo_save(cr);
+    cairo_new_path(cr);
     cairo_translate(cr, box.x, box.y);
     cairo_scale(cr, box.w / 16.0, box.h / 16.0);
     set_cairo_color(cr, col, alpha);
@@ -333,6 +343,7 @@ static void draw_icon(cairo_t *cr, UiIcon icon, Rect box, ColorRGBA col, double 
             cairo_stroke(cr);
             break;
         case ICON_SEARCH:
+            cairo_new_sub_path(cr);
             cairo_arc(cr, 7.0, 7.0, 4.5, 0.0, 2.0 * M_PI);
             cairo_move_to(cr, 10.3, 10.3);
             cairo_line_to(cr, 13.8, 13.8);
@@ -355,6 +366,7 @@ static void draw_icon(cairo_t *cr, UiIcon icon, Rect box, ColorRGBA col, double 
             cairo_stroke(cr);
             break;
         case ICON_RSS:
+            cairo_new_sub_path(cr);
             cairo_arc(cr, 4.0, 12.0, 1.3, 0.0, 2.0 * M_PI);
             cairo_fill(cr);
             cairo_new_sub_path(cr);
@@ -380,6 +392,7 @@ static void draw_icon(cairo_t *cr, UiIcon icon, Rect box, ColorRGBA col, double 
             break;
         }
         case ICON_HISTORY:
+            cairo_new_sub_path(cr);
             cairo_arc(cr, 8.3, 8.0, 5.5, -2.5, 2.5);
             cairo_stroke(cr);
             cairo_move_to(cr, 2.5, 3.8);
@@ -392,11 +405,14 @@ static void draw_icon(cairo_t *cr, UiIcon icon, Rect box, ColorRGBA col, double 
             cairo_stroke(cr);
             break;
         case ICON_HELP:
+            cairo_new_sub_path(cr);
             cairo_arc(cr, 8.0, 8.0, 6.2, 0.0, 2.0 * M_PI);
             cairo_stroke(cr);
+            cairo_new_sub_path(cr);
             cairo_arc(cr, 8.0, 6.3, 1.9, M_PI, 0.35);
             cairo_line_to(cr, 8.0, 9.4);
             cairo_stroke(cr);
+            cairo_new_sub_path(cr);
             cairo_arc(cr, 8.0, 11.7, 0.8, 0.0, 2.0 * M_PI);
             cairo_fill(cr);
             break;
@@ -407,9 +423,23 @@ static void draw_icon(cairo_t *cr, UiIcon icon, Rect box, ColorRGBA col, double 
             cairo_close_path(cr);
             cairo_fill(cr);
             break;
+        case ICON_DOWNLOAD:
+            cairo_move_to(cr, 8.0, 2.5);
+            cairo_line_to(cr, 8.0, 10.5);
+            cairo_move_to(cr, 4.8, 7.5);
+            cairo_line_to(cr, 8.0, 10.8);
+            cairo_line_to(cr, 11.2, 7.5);
+            cairo_move_to(cr, 3.0, 11.5);
+            cairo_line_to(cr, 3.0, 13.5);
+            cairo_line_to(cr, 13.0, 13.5);
+            cairo_line_to(cr, 13.0, 11.5);
+            cairo_stroke(cr);
+            break;
         case ICON_CHANNEL:
+            cairo_new_sub_path(cr);
             cairo_arc(cr, 8.0, 5.2, 2.7, 0.0, 2.0 * M_PI);
             cairo_stroke(cr);
+            cairo_new_sub_path(cr);
             cairo_arc(cr, 8.0, 14.5, 5.2, M_PI * 1.15, M_PI * 1.85);
             cairo_stroke(cr);
             break;
@@ -436,6 +466,7 @@ static void draw_icon(cairo_t *cr, UiIcon icon, Rect box, ColorRGBA col, double 
             cairo_stroke(cr);
             break;
         case ICON_RETRY:
+            cairo_new_sub_path(cr);
             cairo_arc(cr, 8.0, 8.0, 5.2, -0.4, 1.5 * M_PI);
             cairo_stroke(cr);
             cairo_move_to(cr, 8.0, 1.4);
@@ -454,6 +485,58 @@ static void draw_icon(cairo_t *cr, UiIcon icon, Rect box, ColorRGBA col, double 
     }
 
     cairo_restore(cr);
+}
+
+static void draw_download_progress_button(cairo_t *cr, const UiState *ui, Rect r,
+                                          const char *label, double progress) {
+    if (r.w <= 1.0 || r.h <= 1.0) return;
+    const Theme *t = &ui->cfg->theme;
+    ThemePair tp = t->elem_normal;
+
+    /* 1. Base button background */
+    draw_rounded_rect(cr, r, 6.0);
+    set_cairo_color(cr, tp.bg, 1.0);
+    cairo_fill(cr);
+
+    /* 2. Crisp bottom progress track + fill clipped to button corners */
+    double track_h = 3.0;
+    cairo_save(cr);
+    draw_rounded_rect(cr, r, 6.0);
+    cairo_clip(cr);
+    set_cairo_color(cr, t->base.bg, 0.75);
+    cairo_rectangle(cr, r.x, r.y + r.h - track_h, r.w, track_h);
+    cairo_fill(cr);
+    if (progress >= 0.0 && progress <= 1.0) {
+        double fw = r.w * progress;
+        if (fw > 0.5) {
+            set_cairo_color(cr, t->elem_selected.bg, 1.0);
+            cairo_rectangle(cr, r.x, r.y + r.h - track_h, fw, track_h);
+            cairo_fill(cr);
+        }
+    }
+    cairo_restore(cr);
+
+    /* 3. Crisp accent border */
+    draw_rounded_rect(cr, r, 6.0);
+    set_cairo_color(cr, t->elem_selected.bg, 0.65);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+
+    /* 4. Icon and label centered cleanly above the bottom track */
+    double content_h = r.h - track_h;
+    double icon_sz = fmin(content_h - 8.0, fmax(13.0, ui->cfg->font_size * 1.05));
+    double tw = 0.0;
+    measure_text_size(ui, label, 0.92, PANGO_WEIGHT_BOLD, &tw, NULL);
+    double gap = 6.0;
+    double total = icon_sz + gap + tw;
+    if (total > r.w - 12.0) total = r.w - 12.0;
+    double sx = r.x + (r.w - total) * 0.5;
+    Rect ib = {sx, r.y + (content_h - icon_sz) * 0.5, icon_sz, icon_sz};
+    draw_icon(cr, ICON_DOWNLOAD, ib, tp.fg, 1.0);
+    double tx = sx + icon_sz + gap;
+    double avail = (r.x + r.w - 6.0) - tx;
+    draw_text_line(cr, ui, label, tx, r.y, avail, content_h,
+                   tp.fg, 1.0, 0.92, true, PANGO_ALIGN_LEFT, true);
 }
 
 static void draw_button_ex(cairo_t *cr, const UiState *ui, Rect r,
@@ -648,10 +731,20 @@ static void compute_layout(const UiState *ui, Layout *L) {
     L->left_pane = (Rect){0, y, lw, body_h};
     double hdr_h = fmax(32.0, align4(ui->cfg->font_size * 2.1));
     L->left_header = (Rect){0, y, lw, hdr_h};
+    double hdr_right = lw - SP_SM;
     if (ui->list.continuation_token && ui->list.continuation_token[0]) {
         double nw = measure_btn_width(ui, false, "Next Page", 76.0);
-        if (nw > lw * 0.48) nw = lw * 0.48;
-        L->btn_next_page = (Rect){lw - nw - SP_SM, y + 3.0, nw, hdr_h - 6.0};
+        if (nw > lw * 0.42) nw = lw * 0.42;
+        L->btn_next_page = (Rect){hdr_right - nw, y + 3.0, nw, hdr_h - 6.0};
+        hdr_right = L->btn_next_page.x - SP_XS;
+    }
+    if (ui->show_channel_tabs) {
+        double vw = measure_btn_width(ui, false, "Videos", 54.0);
+        double lvw = measure_btn_width(ui, false, "Live", 44.0);
+        if (vw + SP_XS + lvw < lw - 60.0) {
+            L->btn_chan_live = (Rect){hdr_right - lvw, y + 3.0, lvw, hdr_h - 6.0};
+            L->btn_chan_videos = (Rect){L->btn_chan_live.x - SP_XS - vw, y + 3.0, vw, hdr_h - 6.0};
+        }
     }
 
     double sb_bar_w = 12.0;
@@ -674,7 +767,7 @@ static void compute_layout(const UiState *ui, Layout *L) {
 
     if (ui->show_help) {
         double mw = fmin(540.0, W - 40.0);
-        double mh = fmin(520.0, H - 40.0);
+        double mh = fmin(548.0, H - 40.0);
         if (mw < 260.0) mw = fmax(200.0, W - 16.0);
         if (mh < 220.0) mh = fmax(180.0, H - 16.0);
         L->help_modal_box = (Rect){(W - mw) * 0.5, (H - mh) * 0.5, mw, mh};
@@ -689,6 +782,7 @@ static void compute_layout(const UiState *ui, Layout *L) {
         L->detail_thumb = prev.detail_thumb;
         L->detail_author = prev.detail_author;
         L->act_play = prev.act_play;
+        L->act_download = prev.act_download;
         L->act_channel = prev.act_channel;
         L->act_recommended = prev.act_recommended;
         L->act_fav = prev.act_fav;
@@ -981,19 +1075,63 @@ void ui_set_list(UiState *ui, MediaList *new_list, bool append) {
     wayland_request_redraw(ui->wl);
 }
 
+static void replace_if_nonempty(char **dst, const char *src) {
+    if (src && src[0]) {
+        free(*dst);
+        *dst = tt_strdup(src);
+    }
+}
+
+static void merge_media_details(MediaItem *dst, const MediaItem *src) {
+    if (!dst || !src) return;
+    replace_if_nonempty(&dst->title, src->title);
+    replace_if_nonempty(&dst->author, src->author);
+    replace_if_nonempty(&dst->author_id, src->author_id);
+    replace_if_nonempty(&dst->view_count_text, src->view_count_text);
+    replace_if_nonempty(&dst->published_text, src->published_text);
+    replace_if_nonempty(&dst->description, src->description);
+    if ((!dst->duration_text || !dst->duration_text[0]) && src->duration_text && src->duration_text[0]) {
+        free(dst->duration_text);
+        dst->duration_text = tt_strdup(src->duration_text);
+    }
+    if ((!dst->thumbnail_url || !dst->thumbnail_url[0]) && src->thumbnail_url && src->thumbnail_url[0]) {
+        free(dst->thumbnail_url);
+        dst->thumbnail_url = tt_strdup(src->thumbnail_url);
+    }
+    dst->is_live = dst->is_live || src->is_live;
+    dst->is_members_only = dst->is_members_only || src->is_members_only;
+    dst->details_loaded = true;
+}
+
 void ui_set_detail_item(UiState *ui, const MediaItem *detail) {
     if (!ui || !detail) return;
-    media_item_free_fields(&ui->detail_item);
-    media_item_copy(&ui->detail_item, detail);
-    ui->has_detail_item = true;
-    ui->desc_scroll_y = 0.0;
-
-    if (ui->selected_idx >= 0 && (size_t)ui->selected_idx < ui->list.count &&
-        strcmp(ui->list.items[ui->selected_idx].id, detail->id) == 0) {
-        MediaItem *sel = &ui->list.items[ui->selected_idx];
-        if (!sel->author_id && detail->author_id) sel->author_id = tt_strdup(detail->author_id);
-        if (!sel->description && detail->description) sel->description = tt_strdup(detail->description);
+    bool sel_matches = (ui->selected_idx >= 0 && (size_t)ui->selected_idx < ui->list.count &&
+                        strcmp(ui->list.items[ui->selected_idx].id, detail->id) == 0);
+    if (ui->view_kind != UI_VIEW_NEXT && !sel_matches) {
+        return;
     }
+
+    if (sel_matches) {
+        MediaItem *sel = &ui->list.items[ui->selected_idx];
+        merge_media_details(sel, detail);
+        if (!ui->has_detail_item || strcmp(ui->detail_item.id, detail->id) != 0) {
+            media_item_free_fields(&ui->detail_item);
+            media_item_copy(&ui->detail_item, sel);
+            ui->has_detail_item = true;
+        } else {
+            merge_media_details(&ui->detail_item, detail);
+        }
+    } else {
+        if (!ui->has_detail_item || strcmp(ui->detail_item.id, detail->id) != 0) {
+            media_item_free_fields(&ui->detail_item);
+            media_item_copy(&ui->detail_item, detail);
+            ui->has_detail_item = true;
+        } else {
+            merge_media_details(&ui->detail_item, detail);
+        }
+        ui->detail_item.details_loaded = true;
+    }
+    ui->desc_scroll_y = 0.0;
     wayland_request_redraw(ui->wl);
 }
 
@@ -1028,6 +1166,13 @@ void ui_set_nav_state(UiState *ui, UiViewKind view_kind, bool can_go_back) {
     if (!ui) return;
     ui->view_kind = view_kind;
     ui->can_go_back = can_go_back;
+    wayland_request_redraw(ui->wl);
+}
+
+void ui_set_channel_tabs(UiState *ui, bool show_tabs, bool live_tab) {
+    if (!ui) return;
+    ui->show_channel_tabs = show_tabs;
+    ui->channel_live_tab = live_tab;
     wayland_request_redraw(ui->wl);
 }
 
@@ -1169,7 +1314,7 @@ static Rect desc_scrollbar_thumb_rect(const UiState *ui, Rect track) {
 }
 
 static void compute_right_action_rects(const UiState *ui, const Layout *L, const MediaItem *item,
-                                       double top_y, Rect *play_r, Rect *chan_r,
+                                       double top_y, Rect *play_r, Rect *dl_r, Rect *chan_r,
                                        Rect *rec_r, Rect *fav_r, Rect *copy_r, double *out_next_y) {
     double rx = L->right_pane.x + SP_LG;
     double rw = L->right_pane.w - SP_LG * 2.0;
@@ -1182,6 +1327,26 @@ static void compute_right_action_rects(const UiState *ui, const Layout *L, const
     double w_play = measure_btn_width(ui, true, play_lbl, 76.0);
     *play_r = (Rect){x, y, w_play, bh};
     x += w_play + gap;
+
+    if (item->kind == ITEM_VIDEO) {
+        double dl_prog = -1.0;
+        bool dl_active = player_get_download_progress(item->id, &dl_prog);
+        double w_dl = 0.0;
+        if (dl_active) {
+            double icon_sz = fmax(13.0, ui->cfg->font_size * 1.05);
+            double tw_dl = 0.0;
+            measure_text_size(ui, "Downloading 100%", 0.92, PANGO_WEIGHT_BOLD, &tw_dl, NULL);
+            w_dl = align4(18.0 + icon_sz + 6.0 + tw_dl);
+            if (w_dl < 136.0) w_dl = 136.0;
+        } else {
+            w_dl = measure_btn_width(ui, true, "Download", 94.0);
+        }
+        if (x + w_dl > rx + rw) { x = rx; y += bh + gap; }
+        *dl_r = (Rect){x, y, w_dl, bh};
+        x += w_dl + gap;
+    } else {
+        *dl_r = (Rect){0};
+    }
 
     if (item->kind == ITEM_CHANNEL || (item->author_id && item->author_id[0])) {
         double w_ch = measure_btn_width(ui, true, "Channel", 88.0);
@@ -1246,6 +1411,7 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
     L->detail_thumb = (Rect){0};
     L->detail_author = (Rect){0};
     L->act_play = (Rect){0};
+    L->act_download = (Rect){0};
     L->act_channel = (Rect){0};
     L->act_recommended = (Rect){0};
     L->act_fav = (Rect){0};
@@ -1337,6 +1503,7 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
         double diam = thumb_hot ? 44.0 : 36.0;
         double cx = thumb_box.x + thumb_box.w * 0.5;
         double cy = thumb_box.y + thumb_box.h * 0.5;
+        cairo_new_sub_path(cr);
         cairo_arc(cr, cx, cy, diam * 0.5, 0.0, 2.0 * M_PI);
         cairo_set_source_rgba(cr, 0.05, 0.06, 0.09, thumb_hot ? 0.86 : 0.72);
         cairo_fill_preserve(cr);
@@ -1368,6 +1535,7 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
         set_cairo_color(cr, t->text_normal.fg, 1.0);
         cairo_move_to(cr, rp.x + pad, y);
         pango_cairo_show_layout(cr, tl);
+        cairo_new_path(cr);
         int pw = 0, ph = 0;
         pango_layout_get_pixel_size(tl, &pw, &ph);
         g_object_unref(tl);
@@ -1438,13 +1606,32 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
     /* Action buttons */
     double desc_y = y;
     compute_right_action_rects(ui, L, item, y,
-                               &L->act_play, &L->act_channel,
+                               &L->act_play, &L->act_download, &L->act_channel,
                                &L->act_recommended, &L->act_fav,
                                &L->act_copy, &desc_y);
 
     draw_button_ex(cr, ui, L->act_play, ICON_PLAY,
                    item->kind == ITEM_VIDEO ? "Play" : "Open",
                    HIT_ACT_PLAY, false, true, true);
+    if (L->act_download.w > 0) {
+        double dl_prog = -1.0;
+        bool dl_active = player_get_download_progress(item->id, &dl_prog);
+        if (dl_active) {
+            char dl_lbl[32];
+            if (dl_prog >= 0.0) {
+                int pct = (int)lround(dl_prog * 100.0);
+                if (pct < 0) pct = 0;
+                if (pct > 100) pct = 100;
+                snprintf(dl_lbl, sizeof(dl_lbl), "Downloading %d%%", pct);
+            } else {
+                snprintf(dl_lbl, sizeof(dl_lbl), "Downloading...");
+            }
+            draw_download_progress_button(cr, ui, L->act_download, dl_lbl, dl_prog);
+        } else {
+            draw_button_ex(cr, ui, L->act_download, ICON_DOWNLOAD,
+                           "Download", HIT_ACT_DOWNLOAD, false, true, false);
+        }
+    }
     if (L->act_channel.w > 0) {
         draw_button_ex(cr, ui, L->act_channel, ICON_CHANNEL, "Channel",
                        HIT_ACT_CHANNEL, false, true, false);
@@ -1502,6 +1689,7 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
             set_cairo_color(cr, t->text_normal.fg, 0.92);
             cairo_move_to(cr, L->desc_area.x, L->desc_area.y - ui->desc_scroll_y);
             pango_cairo_show_layout(cr, dl);
+            cairo_new_path(cr);
             cairo_restore(cr);
             g_object_unref(dl);
 
@@ -1644,6 +1832,7 @@ static void render_search_box(UiState *ui, cairo_t *cr, const Layout *L) {
     set_cairo_color(cr, t->text_normal.fg, is_placeholder ? 0.50 : 1.0);
     cairo_move_to(cr, tx, ty);
     pango_cairo_show_layout(cr, pl);
+    cairo_new_path(cr);
 
     if (ui->ime_preedit_len > 0 && preedit_end > preedit_start) {
         PangoRectangle p1, p2;
@@ -1726,6 +1915,7 @@ static void render_empty_or_error_list(UiState *ui, cairo_t *cr, const Layout *L
         set_cairo_color(cr, t->base.fg, 0.9);
         cairo_move_to(cr, la.x + SP_XL, cy + 4.0);
         pango_cairo_show_layout(cr, el);
+        cairo_new_path(cr);
         g_object_unref(el);
 
         draw_button_ex(cr, ui, L->btn_retry, ICON_RETRY, "Retry",
@@ -1803,6 +1993,12 @@ static void build_ctx_menu(UiState *ui, const MediaItem *item, double x, double 
     snprintf(m->labels[c], sizeof(m->labels[c]), "%s",
              item->kind == ITEM_VIDEO ? "Play Video" : "Open");
     m->icons[c++] = ICON_PLAY;
+
+    if (item->kind == ITEM_VIDEO) {
+        m->actions[c] = CTX_ACT_DOWNLOAD;
+        snprintf(m->labels[c], sizeof(m->labels[c]), "Download Video");
+        m->icons[c++] = ICON_DOWNLOAD;
+    }
 
     if (item->kind == ITEM_CHANNEL || (item->author_id && item->author_id[0])) {
         m->actions[c] = CTX_ACT_CHANNEL;
@@ -1951,6 +2147,7 @@ static void render_help_modal(const UiState *ui, cairo_t *cr, const Layout *L) {
     static const struct HelpRow rows[] = {
         {ACT_FOCUS_SEARCH_INPUT, "/", "Focus search bar"},
         {ACT_PLAY_VIDEO, "Enter", "Play video / Open channel or playlist"},
+        {ACT_DOWNLOAD_VIDEO, "Ctrl+S", "Download selected video"},
         {ACT_NAV_BACK, "Alt+Left", "Navigate back in history"},
         {ACT_SHOW_FEED, "Ctrl+R", "Open Subscription Feed"},
         {ACT_SHOW_FAVORITES, "Ctrl+F", "Open Favorites"},
@@ -2048,6 +2245,7 @@ void ui_on_render(void *ctx, cairo_t *cr, int width, int height) {
                            ui->filter.type != TYPE_ALL ||
                            ui->filter.live_only);
     if (!ui->show_filters && filters_active) {
+        cairo_new_sub_path(cr);
         cairo_arc(cr, L.btn_filters.x + L.btn_filters.w - 6.0, L.btn_filters.y + 6.0,
                   2.5, 0.0, 2.0 * M_PI);
         set_cairo_color(cr, t->elem_selected.bg, 1.0);
@@ -2087,11 +2285,22 @@ void ui_on_render(void *ctx, cairo_t *cr, int width, int height) {
     cairo_fill(cr);
 
     const char *hdr = (ui->list.heading && ui->list.heading[0]) ? ui->list.heading : "Results";
-    double hdr_text_w = L.btn_next_page.w > 0
-                        ? (L.left_header.w - L.btn_next_page.w - SP_LG - SP_SM)
-                        : (L.left_header.w - SP_LG);
+    double hdr_right_edge = L.left_header.x + L.left_header.w - SP_SM;
+    if (L.btn_chan_videos.w > 0) {
+        hdr_right_edge = L.btn_chan_videos.x - SP_SM;
+    } else if (L.btn_next_page.w > 0) {
+        hdr_right_edge = L.btn_next_page.x - SP_SM;
+    }
+    double hdr_text_w = hdr_right_edge - (L.left_header.x + SP_SM);
+    if (hdr_text_w < 0.0) hdr_text_w = 0.0;
     draw_text_line(cr, ui, hdr, L.left_header.x + SP_SM, L.left_header.y, hdr_text_w, L.left_header.h,
                    t->elem_normal.fg, 1.0, 0.95, true, PANGO_ALIGN_LEFT, true);
+    if (L.btn_chan_videos.w > 0) {
+        draw_button_ex(cr, ui, L.btn_chan_videos, ICON_NONE, "Videos",
+                       HIT_BTN_CHAN_VIDEOS, !ui->channel_live_tab, true, false);
+        draw_button_ex(cr, ui, L.btn_chan_live, ICON_NONE, "Live",
+                       HIT_BTN_CHAN_LIVE, ui->channel_live_tab, true, false);
+    }
     if (L.btn_next_page.w > 0) {
         draw_button_ex(cr, ui, L.btn_next_page, ICON_NONE,
                        ui->loading_more ? "Loading..." : "Next Page",
@@ -2203,6 +2412,7 @@ void ui_on_render(void *ctx, cairo_t *cr, int width, int height) {
                     set_cairo_color(cr, rp.fg, dim);
                     cairo_move_to(cr, tx, ty);
                     pango_cairo_show_layout(cr, tl);
+                    cairo_new_path(cr);
                     int pw = 0, ph = 0;
                     pango_layout_get_pixel_size(tl, &pw, &ph);
                     g_object_unref(tl);
@@ -2300,7 +2510,48 @@ void ui_on_render(void *ctx, cairo_t *cr, int width, int height) {
                        t->elem_normal.fg, 0.78, 0.85, false, PANGO_ALIGN_RIGHT, true);
     }
 
-    double status_w = st.w - rw_info - SP_LG - SP_SM;
+    double dl_prog = -1.0;
+    size_t dl_cnt = player_get_active_download_summary(&dl_prog, NULL, 0);
+    double dl_block_w = 0.0;
+    if (dl_cnt > 0 && st.w - rw_info > 260.0) {
+        char dl_txt[48];
+        if (dl_prog >= 0.0) {
+            int pct = (int)lround(dl_prog * 100.0);
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+            if (dl_cnt > 1) snprintf(dl_txt, sizeof(dl_txt), "DL %d%% (%zu)", pct, dl_cnt);
+            else snprintf(dl_txt, sizeof(dl_txt), "DL %d%%", pct);
+        } else {
+            if (dl_cnt > 1) snprintf(dl_txt, sizeof(dl_txt), "DL... (%zu)", dl_cnt);
+            else snprintf(dl_txt, sizeof(dl_txt), "DL...");
+        }
+        double tw_dl = 0.0;
+        measure_text_size(ui, dl_txt, 0.85, PANGO_WEIGHT_SEMIBOLD, &tw_dl, NULL);
+        double bar_w = 88.0;
+        double bar_h = 8.0;
+        dl_block_w = bar_w + SP_XS + tw_dl + SP_MD;
+        double dx = st.w - rw_info - SP_SM - dl_block_w;
+        Rect bar_r = {dx, st.y + (st.h - bar_h) * 0.5, bar_w, bar_h};
+        draw_rounded_rect(cr, bar_r, 4.0);
+        set_cairo_color(cr, t->base.bg, 1.0);
+        cairo_fill_preserve(cr);
+        set_cairo_color(cr, t->base.fg, 0.25);
+        cairo_set_line_width(cr, 1.0);
+        cairo_stroke(cr);
+        if (dl_prog >= 0.0 && dl_prog <= 1.0) {
+            Rect fill_r = {bar_r.x, bar_r.y, bar_r.w * dl_prog, bar_r.h};
+            if (fill_r.w > 1.0) {
+                draw_rounded_rect(cr, fill_r, 4.0);
+                set_cairo_color(cr, t->elem_selected.bg, 1.0);
+                cairo_fill(cr);
+            }
+        }
+        draw_text_line(cr, ui, dl_txt, bar_r.x + bar_w + SP_XS, st.y,
+                       tw_dl + SP_XS, st.h, t->elem_normal.fg, 0.92, 0.85,
+                       true, PANGO_ALIGN_LEFT, true);
+    }
+
+    double status_w = st.w - rw_info - dl_block_w - SP_LG - SP_SM;
     if (status_w > 40.0) {
         draw_text_line(cr, ui, ui->status_text, SP_MD, st.y, status_w, st.h,
                        t->elem_normal.fg, 0.92, 0.88, false, PANGO_ALIGN_LEFT, true);
@@ -2364,6 +2615,8 @@ static HitId hit_test(UiState *ui, const Layout *L, double x, double y) {
         if (pt_in_rect(x, y, L->btn_type)) return HIT_BTN_TYPE;
         if (pt_in_rect(x, y, L->btn_live)) return HIT_BTN_LIVE;
     }
+    if (pt_in_rect(x, y, L->btn_chan_videos)) return HIT_BTN_CHAN_VIDEOS;
+    if (pt_in_rect(x, y, L->btn_chan_live)) return HIT_BTN_CHAN_LIVE;
     if (pt_in_rect(x, y, L->btn_next_page)) return HIT_BTN_NEXT_PAGE;
     if (pt_in_rect(x, y, L->btn_retry)) return HIT_BTN_RETRY;
     if (pt_in_rect(x, y, L->splitter)) return HIT_SPLITTER;
@@ -2385,6 +2638,7 @@ static HitId hit_test(UiState *ui, const Layout *L, double x, double y) {
         if (pt_in_rect(x, y, L->detail_thumb)) return HIT_DETAIL_THUMB;
         if (pt_in_rect(x, y, L->detail_author)) return HIT_DETAIL_AUTHOR;
         if (pt_in_rect(x, y, L->act_play)) return HIT_ACT_PLAY;
+        if (pt_in_rect(x, y, L->act_download)) return HIT_ACT_DOWNLOAD;
         if (pt_in_rect(x, y, L->act_channel)) return HIT_ACT_CHANNEL;
         if (pt_in_rect(x, y, L->act_recommended)) return HIT_ACT_RECOMMENDED;
         if (pt_in_rect(x, y, L->act_fav)) return HIT_ACT_FAVORITE;
@@ -2449,6 +2703,8 @@ static TtCursorShape cursor_for_hit(const UiState *ui, HitId h) {
         case HIT_BTN_SORT:
         case HIT_BTN_TYPE:
         case HIT_BTN_LIVE:
+        case HIT_BTN_CHAN_VIDEOS:
+        case HIT_BTN_CHAN_LIVE:
         case HIT_BTN_NEXT_PAGE:
         case HIT_BTN_RETRY:
         case HIT_LIST_ITEM:
@@ -2462,6 +2718,11 @@ static TtCursorShape cursor_for_hit(const UiState *ui, HitId h) {
         case HIT_CTX_ITEM:
         case HIT_HELP_CLOSE:
             return TT_CURSOR_POINTER;
+        case HIT_ACT_DOWNLOAD: {
+            const MediaItem *it = ui_get_detail_item(ui);
+            bool dl = (it && it->kind == ITEM_VIDEO && player_is_downloading(it->id));
+            return dl ? TT_CURSOR_DEFAULT : TT_CURSOR_POINTER;
+        }
         default:
             return TT_CURSOR_DEFAULT;
     }
@@ -2583,9 +2844,13 @@ static void select_list_row(UiState *ui, size_t idx) {
     if (idx >= ui->list.count) return;
     bool changed = ((ssize_t)idx != ui->selected_idx);
     ui->selected_idx = (ssize_t)idx;
+    const MediaItem *it = &ui->list.items[idx];
     if (changed) {
         sync_detail_from_selection(ui);
-        if (ui->cbs.on_select_item) ui->cbs.on_select_item(ui->user_ctx, idx);
+    }
+    if ((changed || (it->kind == ITEM_VIDEO && !it->details_loaded)) &&
+        ui->cbs.on_select_item) {
+        ui->cbs.on_select_item(ui->user_ctx, idx);
     }
 }
 
@@ -2595,6 +2860,9 @@ static void execute_ctx_action(UiState *ui, CtxAction act) {
             if (ui->selected_idx >= 0 && ui->cbs.on_activate_item) {
                 ui->cbs.on_activate_item(ui->user_ctx, (size_t)ui->selected_idx);
             }
+            break;
+        case CTX_ACT_DOWNLOAD:
+            if (ui->cbs.on_download_video) ui->cbs.on_download_video(ui->user_ctx);
             break;
         case CTX_ACT_CHANNEL:
             if (ui->cbs.on_view_channel) ui->cbs.on_view_channel(ui->user_ctx);
@@ -2841,6 +3109,12 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
             ui->filter.live_only = !ui->filter.live_only;
             trigger_filter_search_if_active(ui);
             break;
+        case HIT_BTN_CHAN_VIDEOS:
+            if (ui->cbs.on_switch_channel_tab) ui->cbs.on_switch_channel_tab(ui->user_ctx, false);
+            break;
+        case HIT_BTN_CHAN_LIVE:
+            if (ui->cbs.on_switch_channel_tab) ui->cbs.on_switch_channel_tab(ui->user_ctx, true);
+            break;
         case HIT_BTN_NEXT_PAGE:
             if (!ui->loading_more && ui->cbs.on_next_page) {
                 ui->loading_more = true;
@@ -2889,6 +3163,9 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
             if (ui->selected_idx >= 0 && ui->cbs.on_activate_item) {
                 ui->cbs.on_activate_item(ui->user_ctx, (size_t)ui->selected_idx);
             }
+            break;
+        case HIT_ACT_DOWNLOAD:
+            if (ui->cbs.on_download_video) ui->cbs.on_download_video(ui->user_ctx);
             break;
         case HIT_DETAIL_AUTHOR:
         case HIT_ACT_CHANNEL:
@@ -3026,6 +3303,9 @@ static void execute_action(UiState *ui, KeyAction act) {
             if (ui->selected_idx >= 0 && ui->cbs.on_activate_item) {
                 ui->cbs.on_activate_item(ui->user_ctx, (size_t)ui->selected_idx);
             }
+            break;
+        case ACT_DOWNLOAD_VIDEO:
+            if (ui->cbs.on_download_video) ui->cbs.on_download_video(ui->user_ctx);
             break;
         case ACT_VIEW_USER_VIDEOS:
             if (ui->cbs.on_view_channel) ui->cbs.on_view_channel(ui->user_ctx);

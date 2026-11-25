@@ -147,6 +147,7 @@ KeyAction config_action_from_string(const char *s) {
     static const struct { const char *name; KeyAction act; } map[] = {
         {"quit", ACT_QUIT},
         {"play_video", ACT_PLAY_VIDEO},
+        {"download_video", ACT_DOWNLOAD_VIDEO},
         {"view_user_videos", ACT_VIEW_USER_VIDEOS},
         {"view_recommended_videos", ACT_VIEW_RECOMMENDED_VIDEOS},
         {"next_page", ACT_NEXT_PAGE},
@@ -364,6 +365,7 @@ static void add_default_keybindings(TuiTubeConfig *cfg) {
     add_keybinding(cfg, ACT_FOCUS_SEARCH_INPUT, TT_MOD_CTRL, XKB_KEY_L);
     add_keybinding(cfg, ACT_FOCUS_SEARCH_INPUT, 0,           XKB_KEY_slash);
     add_keybinding(cfg, ACT_PLAY_VIDEO,         0,           XKB_KEY_Return);
+    add_keybinding(cfg, ACT_DOWNLOAD_VIDEO,     TT_MOD_CTRL, XKB_KEY_S);
     add_keybinding(cfg, ACT_SHOW_FAVORITES,     TT_MOD_CTRL, XKB_KEY_F);
     add_keybinding(cfg, ACT_SHOW_FEED,          TT_MOD_CTRL, XKB_KEY_R);
     add_keybinding(cfg, ACT_SHOW_HISTORY,       TT_MOD_CTRL, XKB_KEY_H);
@@ -408,6 +410,8 @@ void config_init_defaults(TuiTubeConfig *cfg) {
     tt_parse_age_seconds(cfg->max_feed_age, &cfg->max_feed_age_sec);
     cfg->allow_hdr = false;
     cfg->all_codecs = false;
+    cfg->hide_members_only = false;
+    cfg->download_dir = tt_strdup("");
     add_default_keybindings(cfg);
     theme_init_builtin(&cfg->theme, "dark");
 }
@@ -422,6 +426,34 @@ double config_effective_ui_scale(const TuiTubeConfig *cfg) {
 char *config_resolve_asset_path(const TuiTubeConfig *cfg, const char *rel_or_abs) {
     if (!cfg || !rel_or_abs || !rel_or_abs[0]) return NULL;
     return tt_path_join(cfg->config_dir, rel_or_abs);
+}
+
+char *config_resolve_download_dir(const TuiTubeConfig *cfg) {
+    const char *env_home = getenv("HOME");
+    const char *home = (env_home && env_home[0]) ? env_home : "/tmp";
+
+    if (cfg && cfg->download_dir && cfg->download_dir[0]) {
+        if (strcmp(cfg->download_dir, "~") == 0) {
+            return tt_strdup(home);
+        }
+        if (strncmp(cfg->download_dir, "~/", 2) == 0) {
+            return tt_path_join(home, cfg->download_dir + 2);
+        }
+        if (cfg->download_dir[0] == '/') {
+            return tt_strdup(cfg->download_dir);
+        }
+        return tt_path_join(cfg->config_dir, cfg->download_dir);
+    }
+
+    if (cfg && cfg->portable_mode) {
+        return tt_path_join(cfg->config_dir, "downloads");
+    }
+
+    const char *xdg_dl = getenv("XDG_DOWNLOAD_DIR");
+    if (xdg_dl && xdg_dl[0] == '/') {
+        return tt_strdup(xdg_dl);
+    }
+    return tt_path_join(home, "Downloads");
 }
 
 bool config_apply_theme(TuiTubeConfig *cfg, const char *theme_name) {
@@ -530,6 +562,12 @@ bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
     read_bool_field(root, "feed_use_rss", &cfg->feed_use_rss);
     read_bool_field(root, "allow_hdr", &cfg->allow_hdr);
     read_bool_field(root, "all_codecs", &cfg->all_codecs);
+    if (yyjson_obj_get(root, "hide_members_only")) {
+        read_bool_field(root, "hide_members_only", &cfg->hide_members_only);
+    } else {
+        read_bool_field(root, "hide_member_videos", &cfg->hide_members_only);
+    }
+    replace_str_field(root, "download_dir", &cfg->download_dir);
 
     v = yyjson_obj_get(root, "max_feed_videos_per_channel");
     if (v && yyjson_is_num(v)) {
@@ -582,6 +620,7 @@ void config_free(TuiTubeConfig *cfg) {
     free(cfg->theme_path);
     free(cfg->mascot);
     free(cfg->max_feed_age);
+    free(cfg->download_dir);
     free(cfg->key_bindings);
     memset(cfg, 0, sizeof(*cfg));
 }

@@ -30,8 +30,10 @@ bool innertube_encode_search_params(SearchFilter filter, char *out, size_t out_c
         case SORT_UPLOAD_DATE: sort_val = 2; break;
         case SORT_VIEW_COUNT:  sort_val = 3; break;
     }
-    buf[n++] = 0x08; /* field 1, varint */
-    buf[n++] = sort_val;
+    if (filter.sort != SORT_RELEVANCE || (filter.type == TYPE_ALL && !filter.live_only)) {
+        buf[n++] = 0x08; /* field 1, varint */
+        buf[n++] = sort_val;
+    }
 
     if (filter.type != TYPE_ALL || filter.live_only) {
         uint8_t sub[8];
@@ -64,6 +66,15 @@ static void copy_id_token(const char *src, char *dst, size_t cap) {
         i++;
     }
     dst[i] = '\0';
+}
+
+static bool has_path_seg(const char *p, const char *seg) {
+    if (!p || !seg) return false;
+    size_t slen = strlen(seg);
+    if (strncmp(p, seg, slen) != 0) return false;
+    char next = p[slen];
+    return next == '\0' || next == '/' || next == '?' || next == '#' ||
+           isspace((unsigned char)next);
 }
 
 bool innertube_parse_input_url(const char *input, ParsedUrl *out) {
@@ -146,6 +157,10 @@ bool innertube_parse_input_url(const char *input, ParsedUrl *out) {
     if (strncmp(p, "channel/", 8) == 0) {
         copy_id_token(p + 8, out->id, sizeof(out->id));
         if (out->id[0]) {
+            const char *after = p + 8 + strlen(out->id);
+            if (has_path_seg(after, "/streams") || has_path_seg(after, "/live")) {
+                out->prefer_live_tab = true;
+            }
             out->kind = URL_CHANNEL;
             return true;
         }
@@ -155,9 +170,20 @@ bool innertube_parse_input_url(const char *input, ParsedUrl *out) {
     if (p[0] == '@') {
         copy_id_token(p, out->id, sizeof(out->id));
         if (out->id[1] != '\0') {
+            const char *after = p + strlen(out->id);
             out->kind = URL_HANDLE;
-            snprintf(out->resolved_url, sizeof(out->resolved_url),
-                     "https://www.youtube.com/%s", out->id);
+            if (has_path_seg(after, "/streams")) {
+                out->prefer_live_tab = true;
+                snprintf(out->resolved_url, sizeof(out->resolved_url),
+                         "https://www.youtube.com/%s", out->id);
+            } else if (has_path_seg(after, "/live")) {
+                out->prefer_live_tab = true;
+                snprintf(out->resolved_url, sizeof(out->resolved_url),
+                         "https://www.youtube.com/%s/live", out->id);
+            } else {
+                snprintf(out->resolved_url, sizeof(out->resolved_url),
+                         "https://www.youtube.com/%s", out->id);
+            }
             return true;
         }
         return false;
@@ -228,25 +254,121 @@ static char *extract_thumb(yyjson_val *obj) {
     return NULL;
 }
 
-static bool has_live_badge(yyjson_val *badges) {
-    if (!badges || !yyjson_is_arr(badges)) return false;
-    size_t idx, max;
-    yyjson_val *b;
-    yyjson_arr_foreach(badges, idx, max, b) {
-        yyjson_val *mr = yyjson_obj_get(b, "metadataBadgeRenderer");
-        if (!mr) continue;
-        yyjson_val *style = yyjson_obj_get(mr, "style");
-        if (style && yyjson_is_str(style) &&
-            strstr(yyjson_get_str(style), "LIVE") != NULL) {
-            return true;
-        }
-        yyjson_val *lbl = yyjson_obj_get(mr, "label");
-        if (lbl && yyjson_is_str(lbl) &&
-            tt_strcasecmp(yyjson_get_str(lbl), "LIVE") == 0) {
-            return true;
+static bool check_live_badge_obj(yyjson_val *obj) {
+    if (!obj || !yyjson_is_obj(obj)) return false;
+    yyjson_val *style = yyjson_obj_get(obj, "style");
+    if (!style) style = yyjson_obj_get(obj, "badgeStyle");
+    if (style && yyjson_is_str(style) &&
+        strstr(yyjson_get_str(style), "LIVE") != NULL) {
+        return true;
+    }
+    static const char *const txt_keys[] = {"label", "text", "badgeText"};
+    for (size_t i = 0; i < 3; i++) {
+        yyjson_val *tv = yyjson_obj_get(obj, txt_keys[i]);
+        if (tv) {
+            char *s = extract_text(tv);
+            bool match = (s && tt_strcasecmp(s, "LIVE") == 0);
+            free(s);
+            if (match) return true;
         }
     }
     return false;
+}
+
+static bool has_live_badge(yyjson_val *badges) {
+    if (!badges || !yyjson_is_arr(badges)) return false;
+    static const char *const keys[] = {
+        "metadataBadgeRenderer",
+        "liveBadgeRenderer",
+        "metadataBadgeViewModel",
+        "badgeViewModel"
+    };
+    size_t idx, max;
+    yyjson_val *b;
+    yyjson_arr_foreach(badges, idx, max, b) {
+        if (!b || !yyjson_is_obj(b)) continue;
+        for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+            if (check_live_badge_obj(yyjson_obj_get(b, keys[k]))) return true;
+        }
+    }
+    return false;
+}
+
+static bool check_members_only_badge_obj(yyjson_val *obj) {
+    if (!obj || !yyjson_is_obj(obj)) return false;
+    yyjson_val *style = yyjson_obj_get(obj, "style");
+    if (!style) style = yyjson_obj_get(obj, "badgeStyle");
+    if (style && yyjson_is_str(style) &&
+        strstr(yyjson_get_str(style), "MEMBERS_ONLY") != NULL) {
+        return true;
+    }
+    static const char *const txt_keys[] = {
+        "label", "text", "badgeText", "tooltip", "iconTooltip"
+    };
+    for (size_t i = 0; i < sizeof(txt_keys) / sizeof(txt_keys[0]); i++) {
+        yyjson_val *tv = yyjson_obj_get(obj, txt_keys[i]);
+        if (tv) {
+            char *s = extract_text(tv);
+            bool match = (s && tt_strcasestr(s, "members only") != NULL);
+            free(s);
+            if (match) return true;
+        }
+    }
+    yyjson_val *acc = yyjson_obj_get(obj, "accessibilityData");
+    if (!acc) {
+        yyjson_val *outer_acc = yyjson_obj_get(obj, "accessibility");
+        acc = outer_acc ? yyjson_obj_get(outer_acc, "accessibilityData") : NULL;
+    }
+    yyjson_val *albl = acc ? yyjson_obj_get(acc, "label") : NULL;
+    if (albl && yyjson_is_str(albl) &&
+        tt_strcasestr(yyjson_get_str(albl), "members only") != NULL) {
+        return true;
+    }
+    return false;
+}
+
+static bool has_members_only_badge(yyjson_val *badges) {
+    if (!badges || !yyjson_is_arr(badges)) return false;
+    static const char *const keys[] = {
+        "metadataBadgeRenderer",
+        "metadataBadgeViewModel",
+        "badgeViewModel"
+    };
+    size_t idx, max;
+    yyjson_val *b;
+    yyjson_arr_foreach(badges, idx, max, b) {
+        if (!b || !yyjson_is_obj(b)) continue;
+        for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+            if (check_members_only_badge_obj(yyjson_obj_get(b, keys[k]))) return true;
+        }
+    }
+    return false;
+}
+
+static void parse_thumbnail_overlays(yyjson_val *overlays, MediaItem *it) {
+    if (!overlays || !yyjson_is_arr(overlays)) return;
+    size_t idx, max;
+    yyjson_val *ov;
+    yyjson_arr_foreach(overlays, idx, max, ov) {
+        yyjson_val *tsr = yyjson_obj_get(ov, "thumbnailOverlayTimeStatusRenderer");
+        if (!tsr || !yyjson_is_obj(tsr)) continue;
+        yyjson_val *st = yyjson_obj_get(tsr, "style");
+        const char *st_str = (st && yyjson_is_str(st)) ? yyjson_get_str(st) : NULL;
+        if (st_str && strcmp(st_str, "LIVE") == 0) {
+            it->is_live = true;
+        }
+        if (!it->duration_text) {
+            char *t = extract_text(yyjson_obj_get(tsr, "text"));
+            if (t && t[0]) {
+                it->duration_text = t;
+            } else {
+                free(t);
+                if (st_str && strcmp(st_str, "UPCOMING") == 0) {
+                    it->duration_text = tt_strdup("UPCOMING");
+                }
+            }
+        }
+    }
 }
 
 static void parse_video_renderer(yyjson_val *vr, MediaList *out_list) {
@@ -280,8 +402,24 @@ static void parse_video_renderer(yyjson_val *vr, MediaList *out_list) {
     if (!vc) vc = yyjson_obj_get(vr, "viewCountText");
     it.view_count_text = extract_text(vc);
     it.published_text = extract_text(yyjson_obj_get(vr, "publishedTimeText"));
-    it.is_live = has_live_badge(yyjson_obj_get(vr, "badges"));
-    if (!it.duration_text && it.is_live) {
+    yyjson_val *vbadges = yyjson_obj_get(vr, "badges");
+    it.is_live = has_live_badge(vbadges);
+    it.is_members_only = has_members_only_badge(vbadges);
+    parse_thumbnail_overlays(yyjson_obj_get(vr, "thumbnailOverlays"), &it);
+    if (!it.duration_text && it.view_count_text &&
+        tt_strcasestr(it.view_count_text, "watching") != NULL) {
+        it.is_live = true;
+    }
+    it.description = extract_text(yyjson_obj_get(vr, "descriptionSnippet"));
+    if (!it.description) {
+        yyjson_val *dms = yyjson_obj_get(vr, "detailedMetadataSnippets");
+        yyjson_val *d0 = (dms && yyjson_is_arr(dms)) ? yyjson_arr_get(dms, 0) : NULL;
+        if (d0) {
+            it.description = extract_text(yyjson_obj_get(d0, "snippetText"));
+        }
+    }
+    if (it.is_live && (!it.duration_text || !it.duration_text[0])) {
+        free(it.duration_text);
         it.duration_text = tt_strdup("LIVE");
     }
     it.thumbnail_url = extract_thumb(yyjson_obj_get(vr, "thumbnail"));
@@ -361,6 +499,14 @@ static void parse_playlist_video_renderer(yyjson_val *pvr, MediaList *out_list) 
     }
 
     it.duration_text = extract_text(yyjson_obj_get(pvr, "lengthText"));
+    yyjson_val *pbadges = yyjson_obj_get(pvr, "badges");
+    it.is_live = has_live_badge(pbadges);
+    it.is_members_only = has_members_only_badge(pbadges);
+    parse_thumbnail_overlays(yyjson_obj_get(pvr, "thumbnailOverlays"), &it);
+    if (it.is_live && (!it.duration_text || !it.duration_text[0])) {
+        free(it.duration_text);
+        it.duration_text = tt_strdup("LIVE");
+    }
     it.thumbnail_url = extract_thumb(yyjson_obj_get(pvr, "thumbnail"));
     if (!it.thumbnail_url && it.id[0]) {
         it.thumbnail_url = tt_asprintf("https://i.ytimg.com/vi/%s/mqdefault.jpg", it.id);
@@ -368,6 +514,37 @@ static void parse_playlist_video_renderer(yyjson_val *pvr, MediaList *out_list) 
 
     if (!media_list_append_move(out_list, &it)) {
         media_item_free_fields(&it);
+    }
+}
+
+static void process_lockup_overlay_badges(yyjson_val *badges, MediaItem *it) {
+    if (!badges || !yyjson_is_arr(badges)) return;
+    size_t bidx, bmax;
+    yyjson_val *belem;
+    yyjson_arr_foreach(badges, bidx, bmax, belem) {
+        yyjson_val *tbvm = yyjson_obj_get(belem, "thumbnailBadgeViewModel");
+        if (!tbvm || !yyjson_is_obj(tbvm)) continue;
+        yyjson_val *bs = yyjson_obj_get(tbvm, "badgeStyle");
+        if (bs && yyjson_is_str(bs)) {
+            const char *bss = yyjson_get_str(bs);
+            if (strstr(bss, "LIVE") != NULL) it->is_live = true;
+            if (strstr(bss, "MEMBERS_ONLY") != NULL) it->is_members_only = true;
+        }
+        char *btxt = extract_text(yyjson_obj_get(tbvm, "text"));
+        if (btxt) {
+            if (tt_strcasecmp(btxt, "LIVE") == 0) {
+                it->is_live = true;
+                if (!it->duration_text) it->duration_text = btxt;
+                else free(btxt);
+            } else if (tt_strcasestr(btxt, "members only") != NULL) {
+                it->is_members_only = true;
+                free(btxt);
+            } else if (!it->duration_text) {
+                it->duration_text = btxt;
+            } else {
+                free(btxt);
+            }
+        }
     }
 }
 
@@ -388,7 +565,8 @@ static void parse_lockup_view_model(yyjson_val *lvm, MediaList *out_list) {
     yyjson_val *be = ic ? yyjson_obj_get(ic, "browseEndpoint") : NULL;
 
     MediaItem it = {0};
-    if (strcmp(ct, "LOCKUP_CONTENT_TYPE_PLAYLIST") == 0) {
+    if (strcmp(ct, "LOCKUP_CONTENT_TYPE_PLAYLIST") == 0 ||
+        strcmp(ct, "LOCKUP_CONTENT_TYPE_PODCAST") == 0) {
         it.kind = ITEM_PLAYLIST;
     } else if (strcmp(ct, "LOCKUP_CONTENT_TYPE_CHANNEL") == 0) {
         it.kind = ITEM_CHANNEL;
@@ -427,6 +605,23 @@ static void parse_lockup_view_model(yyjson_val *lvm, MediaList *out_list) {
     yyjson_val *lm = meta ? yyjson_obj_get(meta, "lockupMetadataViewModel") : NULL;
     if (lm) {
         it.title = extract_text(yyjson_obj_get(lm, "title"));
+
+        yyjson_val *lmb = yyjson_obj_get(lm, "badges");
+        if (has_live_badge(lmb)) it.is_live = true;
+        if (has_members_only_badge(lmb)) it.is_members_only = true;
+
+        yyjson_val *limg = yyjson_obj_get(lm, "image");
+        yyjson_val *davm = limg ? yyjson_obj_get(limg, "decoratedAvatarViewModel") : NULL;
+        yyjson_val *drc = davm ? yyjson_obj_get(davm, "rendererContext") : NULL;
+        yyjson_val *dcc = drc ? yyjson_obj_get(drc, "commandContext") : NULL;
+        yyjson_val *dontap = dcc ? yyjson_obj_get(dcc, "onTap") : NULL;
+        yyjson_val *dic = dontap ? yyjson_obj_get(dontap, "innertubeCommand") : NULL;
+        yyjson_val *dbe = dic ? yyjson_obj_get(dic, "browseEndpoint") : NULL;
+        yyjson_val *dbid = dbe ? yyjson_obj_get(dbe, "browseId") : NULL;
+        if (dbid && yyjson_is_str(dbid) && strncmp(yyjson_get_str(dbid), "UC", 2) == 0) {
+            it.author_id = tt_strdup(yyjson_get_str(dbid));
+        }
+
         yyjson_val *sub_meta = yyjson_obj_get(lm, "metadata");
         yyjson_val *cmeta = sub_meta ? yyjson_obj_get(sub_meta, "contentMetadataViewModel") : NULL;
         yyjson_val *rows = cmeta ? yyjson_obj_get(cmeta, "metadataRows") : NULL;
@@ -434,21 +629,58 @@ static void parse_lockup_view_model(yyjson_val *lvm, MediaList *out_list) {
             size_t ridx, rmax;
             yyjson_val *row;
             yyjson_arr_foreach(rows, ridx, rmax, row) {
+                yyjson_val *rbadges = yyjson_obj_get(row, "badges");
+                if (has_live_badge(rbadges)) it.is_live = true;
+                if (has_members_only_badge(rbadges)) it.is_members_only = true;
+
                 yyjson_val *parts = yyjson_obj_get(row, "metadataParts");
                 if (!parts || !yyjson_is_arr(parts)) continue;
                 size_t pidx, pmax;
                 yyjson_val *part;
                 yyjson_arr_foreach(parts, pidx, pmax, part) {
-                    char *txt = extract_text(yyjson_obj_get(part, "text"));
+                    yyjson_val *ptxt_obj = yyjson_obj_get(part, "text");
+                    char *txt = extract_text(ptxt_obj);
                     if (!txt) continue;
-                    if (!it.author) {
+
+                    const char *part_bid = NULL;
+                    if (ptxt_obj && yyjson_is_obj(ptxt_obj)) {
+                        yyjson_val *cruns = yyjson_obj_get(ptxt_obj, "commandRuns");
+                        yyjson_val *cr0 = (cruns && yyjson_is_arr(cruns)) ? yyjson_arr_get(cruns, 0) : NULL;
+                        yyjson_val *pontap = cr0 ? yyjson_obj_get(cr0, "onTap") : NULL;
+                        yyjson_val *pic = pontap ? yyjson_obj_get(pontap, "innertubeCommand") : NULL;
+                        yyjson_val *pbe = pic ? yyjson_obj_get(pic, "browseEndpoint") : NULL;
+                        yyjson_val *pbid = pbe ? yyjson_obj_get(pbe, "browseId") : NULL;
+                        if (pbid && yyjson_is_str(pbid) && strncmp(yyjson_get_str(pbid), "UC", 2) == 0) {
+                            part_bid = yyjson_get_str(pbid);
+                        }
+                    }
+
+                    if (part_bid) {
+                        free(it.author);
                         it.author = txt;
-                    } else if (!it.view_count_text) {
-                        it.view_count_text = txt;
-                    } else if (!it.published_text) {
-                        it.published_text = txt;
+                        free(it.author_id);
+                        it.author_id = tt_strdup(part_bid);
                     } else {
-                        free(txt);
+                        bool looks_metric =
+                            tt_strcasestr(txt, "views") != NULL ||
+                            tt_strcasestr(txt, "watching") != NULL ||
+                            tt_strcasestr(txt, "waiting") != NULL ||
+                            tt_strcasestr(txt, "ago") != NULL ||
+                            tt_strcasestr(txt, "streamed") != NULL ||
+                            tt_strcasestr(txt, "scheduled") != NULL ||
+                            tt_strcasestr(txt, "premiere") != NULL;
+                        if (!it.author && !looks_metric) {
+                            it.author = txt;
+                        } else if (!it.view_count_text) {
+                            it.view_count_text = txt;
+                            if (tt_strcasestr(txt, "watching") != NULL && !it.duration_text) {
+                                it.is_live = true;
+                            }
+                        } else if (!it.published_text) {
+                            it.published_text = txt;
+                        } else {
+                            free(txt);
+                        }
                     }
                 }
             }
@@ -470,19 +702,22 @@ static void parse_lockup_view_model(yyjson_val *lvm, MediaList *out_list) {
                 size_t oidx, omax;
                 yyjson_val *ov;
                 yyjson_arr_foreach(overlays, oidx, omax, ov) {
+                    yyjson_val *tbovm = yyjson_obj_get(ov, "thumbnailBottomOverlayViewModel");
+                    if (tbovm) {
+                        process_lockup_overlay_badges(yyjson_obj_get(tbovm, "badges"), &it);
+                    }
                     yyjson_val *bvm = yyjson_obj_get(ov, "thumbnailOverlayBadgeViewModel");
-                    yyjson_val *badges = bvm ? yyjson_obj_get(bvm, "thumbnailBadges") : NULL;
-                    yyjson_val *b0 = (badges && yyjson_is_arr(badges)) ? yyjson_arr_get(badges, 0) : NULL;
-                    yyjson_val *tbvm = b0 ? yyjson_obj_get(b0, "thumbnailBadgeViewModel") : NULL;
-                    if (tbvm && !it.duration_text) {
-                        it.duration_text = extract_text(yyjson_obj_get(tbvm, "text"));
-                        if (it.duration_text && tt_strcasecmp(it.duration_text, "LIVE") == 0) {
-                            it.is_live = true;
-                        }
+                    if (bvm) {
+                        process_lockup_overlay_badges(yyjson_obj_get(bvm, "thumbnailBadges"), &it);
                     }
                 }
             }
         }
+    }
+
+    if (it.is_live && (!it.duration_text || !it.duration_text[0])) {
+        free(it.duration_text);
+        it.duration_text = tt_strdup("LIVE");
     }
 
     if (!it.thumbnail_url && it.kind == ITEM_VIDEO && it.id[0]) {
@@ -501,6 +736,17 @@ static void extract_continuation_token(yyjson_val *cir, MediaList *out_list) {
     yyjson_val *tok = cmd ? yyjson_obj_get(cmd, "token") : NULL;
     if (tok && yyjson_is_str(tok)) {
         out_list->continuation_token = tt_strdup(yyjson_get_str(tok));
+    }
+}
+
+static void parse_item_container(yyjson_val *item, MediaList *out_list);
+
+static void parse_container_array(yyjson_val *arr, MediaList *out_list) {
+    if (!arr || !yyjson_is_arr(arr)) return;
+    size_t idx, max;
+    yyjson_val *sub;
+    yyjson_arr_foreach(arr, idx, max, sub) {
+        parse_item_container(sub, out_list);
     }
 }
 
@@ -540,43 +786,63 @@ static void parse_item_container(yyjson_val *item, MediaList *out_list) {
         return;
     }
 
-    yyjson_val *isr = yyjson_obj_get(item, "itemSectionRenderer");
-    if (isr) {
-        yyjson_val *contents = yyjson_obj_get(isr, "contents");
-        if (contents && yyjson_is_arr(contents)) {
-            size_t idx, max;
-            yyjson_val *sub;
-            yyjson_arr_foreach(contents, idx, max, sub) {
-                parse_item_container(sub, out_list);
-            }
-        }
+    yyjson_val *rsec = yyjson_obj_get(item, "richSectionRenderer");
+    if (rsec) {
+        parse_item_container(yyjson_obj_get(rsec, "content"), out_list);
         return;
     }
 
-    yyjson_val *pvlr = yyjson_obj_get(item, "playlistVideoListRenderer");
-    if (pvlr) {
-        yyjson_val *contents = yyjson_obj_get(pvlr, "contents");
-        if (contents && yyjson_is_arr(contents)) {
-            size_t idx, max;
-            yyjson_val *sub;
-            yyjson_arr_foreach(contents, idx, max, sub) {
-                parse_item_container(sub, out_list);
-            }
-        }
+    yyjson_val *sr = yyjson_obj_get(item, "shelfRenderer");
+    if (sr) {
+        parse_item_container(yyjson_obj_get(sr, "content"), out_list);
         return;
     }
 
-    yyjson_val *gr = yyjson_obj_get(item, "gridRenderer");
-    if (gr) {
-        yyjson_val *items = yyjson_obj_get(gr, "items");
-        if (items && yyjson_is_arr(items)) {
-            size_t idx, max;
-            yyjson_val *sub;
-            yyjson_arr_foreach(items, idx, max, sub) {
-                parse_item_container(sub, out_list);
-            }
+    static const struct { const char *obj_key; const char *arr_key; } list_containers[] = {
+        {"itemSectionRenderer", "contents"},
+        {"playlistVideoListRenderer", "contents"},
+        {"richShelfRenderer", "contents"},
+        {"gridRenderer", "items"},
+        {"verticalListRenderer", "items"},
+        {"expandedShelfContentsRenderer", "items"},
+        {"horizontalListRenderer", "items"},
+    };
+    for (size_t i = 0; i < sizeof(list_containers) / sizeof(list_containers[0]); i++) {
+        yyjson_val *sub = yyjson_obj_get(item, list_containers[i].obj_key);
+        if (sub) {
+            parse_container_array(yyjson_obj_get(sub, list_containers[i].arr_key), out_list);
+            return;
         }
-        return;
+    }
+}
+
+static void extract_legacy_continuation(yyjson_val *obj, MediaList *out_list) {
+    if (!obj || !yyjson_is_obj(obj) || out_list->continuation_token) return;
+    yyjson_val *conts = yyjson_obj_get(obj, "continuations");
+    if (!conts || !yyjson_is_arr(conts)) return;
+    yyjson_val *c0 = yyjson_arr_get(conts, 0);
+    yyjson_val *ncd = c0 ? yyjson_obj_get(c0, "nextContinuationData") : NULL;
+    yyjson_val *tok = ncd ? yyjson_obj_get(ncd, "continuation") : NULL;
+    if (tok && yyjson_is_str(tok)) {
+        out_list->continuation_token = tt_strdup(yyjson_get_str(tok));
+    }
+}
+
+static void parse_continuation_contents(yyjson_val *cc, MediaList *out_list) {
+    if (!cc || !yyjson_is_obj(cc)) return;
+    static const struct { const char *key; const char *arr_key; } cont_map[] = {
+        {"sectionListContinuation", "contents"},
+        {"itemSectionContinuation", "contents"},
+        {"playlistVideoListContinuation", "contents"},
+        {"richGridContinuation", "contents"},
+        {"gridContinuation", "items"},
+    };
+    for (size_t i = 0; i < sizeof(cont_map) / sizeof(cont_map[0]); i++) {
+        yyjson_val *sub = yyjson_obj_get(cc, cont_map[i].key);
+        if (sub && yyjson_is_obj(sub)) {
+            parse_container_array(yyjson_obj_get(sub, cont_map[i].arr_key), out_list);
+            extract_legacy_continuation(sub, out_list);
+        }
     }
 }
 
@@ -621,6 +887,7 @@ bool innertube_parse_search_json(const char *json, size_t len, MediaList *out_li
         }
     }
 
+    parse_continuation_contents(yyjson_obj_get(root, "continuationContents"), out_list);
     parse_continuation_array(yyjson_obj_get(root, "onResponseReceivedCommands"), out_list);
     yyjson_doc_free(doc);
     return true;
@@ -645,7 +912,16 @@ bool innertube_parse_browse_json(const char *json, size_t len, MediaList *out_li
             yyjson_val *ph = yyjson_obj_get(header, "pageHeaderRenderer");
             yyjson_val *plh = yyjson_obj_get(header, "playlistHeaderRenderer");
             if (c4) out_list->heading = extract_text(yyjson_obj_get(c4, "title"));
-            else if (ph) out_list->heading = extract_text(yyjson_obj_get(ph, "pageTitle"));
+            else if (ph) {
+                out_list->heading = extract_text(yyjson_obj_get(ph, "pageTitle"));
+                if (!out_list->heading) {
+                    yyjson_val *phc = yyjson_obj_get(ph, "content");
+                    yyjson_val *phvm = phc ? yyjson_obj_get(phc, "pageHeaderViewModel") : NULL;
+                    yyjson_val *pht = phvm ? yyjson_obj_get(phvm, "title") : NULL;
+                    yyjson_val *dtvm = pht ? yyjson_obj_get(pht, "dynamicTextViewModel") : NULL;
+                    if (dtvm) out_list->heading = extract_text(yyjson_obj_get(dtvm, "text"));
+                }
+            }
             else if (plh) out_list->heading = extract_text(yyjson_obj_get(plh, "title"));
         }
         if (!out_list->heading) {
@@ -700,6 +976,7 @@ bool innertube_parse_browse_json(const char *json, size_t len, MediaList *out_li
     }
 
     parse_continuation_array(yyjson_obj_get(root, "onResponseReceivedActions"), out_list);
+    parse_continuation_contents(yyjson_obj_get(root, "continuationContents"), out_list);
     parse_continuation_array(yyjson_obj_get(root, "onResponseReceivedCommands"), out_list);
     yyjson_doc_free(doc);
     return true;
@@ -722,6 +999,7 @@ bool innertube_parse_next_json(const char *json, size_t len, const char *video_i
     if (out_details) {
         memset(out_details, 0, sizeof(*out_details));
         out_details->kind = ITEM_VIDEO;
+        out_details->details_loaded = true;
         if (video_id) snprintf(out_details->id, sizeof(out_details->id), "%s", video_id);
 
         yyjson_val *res = watch ? yyjson_obj_get(watch, "results") : NULL;
@@ -753,8 +1031,16 @@ bool innertube_parse_next_json(const char *json, size_t len, const char *video_i
                 if (vsi) {
                     yyjson_val *ad = yyjson_obj_get(vsi, "attributedDescription");
                     out_details->description = extract_text(ad);
+                    if (out_details->description && !out_details->description[0]) {
+                        free(out_details->description);
+                        out_details->description = NULL;
+                    }
                     if (!out_details->description) {
                         out_details->description = extract_text(yyjson_obj_get(vsi, "description"));
+                        if (out_details->description && !out_details->description[0]) {
+                            free(out_details->description);
+                            out_details->description = NULL;
+                        }
                     }
                     yyjson_val *owner = yyjson_obj_get(vsi, "owner");
                     yyjson_val *vor = owner ? yyjson_obj_get(owner, "videoOwnerRenderer") : NULL;
@@ -768,6 +1054,73 @@ bool innertube_parse_next_json(const char *json, size_t len, const char *video_i
                         yyjson_val *bid = be ? yyjson_obj_get(be, "browseId") : NULL;
                         if (bid && yyjson_is_str(bid)) {
                             out_details->author_id = tt_strdup(yyjson_get_str(bid));
+                        }
+                    }
+                }
+            }
+        }
+
+        if (out_details->description && !out_details->description[0]) {
+            free(out_details->description);
+            out_details->description = NULL;
+        }
+
+        yyjson_val *eps = yyjson_obj_get(root, "engagementPanels");
+        if (eps && yyjson_is_arr(eps)) {
+            size_t pidx, pmax;
+            yyjson_val *ep;
+            yyjson_arr_foreach(eps, pidx, pmax, ep) {
+                yyjson_val *epslr = yyjson_obj_get(ep, "engagementPanelSectionListRenderer");
+                yyjson_val *epc = epslr ? yyjson_obj_get(epslr, "content") : NULL;
+                yyjson_val *sdcr = epc ? yyjson_obj_get(epc, "structuredDescriptionContentRenderer") : NULL;
+                yyjson_val *sitems = sdcr ? yyjson_obj_get(sdcr, "items") : NULL;
+                if (!sitems || !yyjson_is_arr(sitems)) continue;
+                size_t iidx, imax;
+                yyjson_val *sitem;
+                yyjson_arr_foreach(sitems, iidx, imax, sitem) {
+                    yyjson_val *evdb = yyjson_obj_get(sitem, "expandableVideoDescriptionBodyRenderer");
+                    if (evdb && (!out_details->description || !out_details->description[0])) {
+                        free(out_details->description);
+                        out_details->description =
+                            extract_text(yyjson_obj_get(evdb, "attributedDescriptionBodyText"));
+                        if (!out_details->description || !out_details->description[0]) {
+                            free(out_details->description);
+                            out_details->description =
+                                extract_text(yyjson_obj_get(evdb, "descriptionBodyText"));
+                        }
+                        if (out_details->description && !out_details->description[0]) {
+                            free(out_details->description);
+                            out_details->description = NULL;
+                        }
+                    }
+                    yyjson_val *vdhr = yyjson_obj_get(sitem, "videoDescriptionHeaderRenderer");
+                    if (vdhr) {
+                        if (!out_details->title || !out_details->title[0]) {
+                            free(out_details->title);
+                            out_details->title = extract_text(yyjson_obj_get(vdhr, "title"));
+                        }
+                        if (!out_details->author || !out_details->author[0]) {
+                            free(out_details->author);
+                            out_details->author = extract_text(yyjson_obj_get(vdhr, "channel"));
+                        }
+                        if (!out_details->author_id || !out_details->author_id[0]) {
+                            yyjson_val *cnav = yyjson_obj_get(vdhr, "channelNavigationEndpoint");
+                            yyjson_val *cbe = cnav ? yyjson_obj_get(cnav, "browseEndpoint") : NULL;
+                            yyjson_val *cbid = cbe ? yyjson_obj_get(cbe, "browseId") : NULL;
+                            if (cbid && yyjson_is_str(cbid)) {
+                                free(out_details->author_id);
+                                out_details->author_id = tt_strdup(yyjson_get_str(cbid));
+                            }
+                        }
+                        if (!out_details->published_text || !out_details->published_text[0]) {
+                            free(out_details->published_text);
+                            out_details->published_text =
+                                extract_text(yyjson_obj_get(vdhr, "publishDate"));
+                        }
+                        if (!out_details->view_count_text || !out_details->view_count_text[0]) {
+                            free(out_details->view_count_text);
+                            out_details->view_count_text =
+                                extract_text(yyjson_obj_get(vdhr, "views"));
                         }
                     }
                 }
@@ -818,6 +1171,11 @@ bool innertube_parse_resolve_url_json(const char *json, size_t len, ParsedUrl *o
             } else {
                 out->kind = URL_CHANNEL;
                 snprintf(out->id, sizeof(out->id), "%s", s);
+                yyjson_val *bp = yyjson_obj_get(be, "params");
+                if (bp && yyjson_is_str(bp) &&
+                    strncmp(yyjson_get_str(bp), "EgdzdHJlYW1z", 12) == 0) {
+                    out->prefer_live_tab = true;
+                }
             }
             ok = true;
         }
@@ -886,6 +1244,23 @@ bool innertube_parse_ytdlp_json(const char *json, size_t len, MediaList *out_lis
         yyjson_val *vc = yyjson_obj_get(e, "view_count");
         if (vc && yyjson_is_num(vc)) {
             it.view_count_text = tt_asprintf("%lld views", (long long)yyjson_get_sint(vc));
+        }
+
+        yyjson_val *avail = yyjson_obj_get(e, "availability");
+        if (avail && yyjson_is_str(avail) &&
+            strcmp(yyjson_get_str(avail), "subscriber_only") == 0) {
+            it.is_members_only = true;
+        }
+
+        yyjson_val *ls = yyjson_obj_get(e, "live_status");
+        yyjson_val *il = yyjson_obj_get(e, "is_live");
+        if ((ls && yyjson_is_str(ls) && strcmp(yyjson_get_str(ls), "is_live") == 0) ||
+            (il && yyjson_is_bool(il) && yyjson_get_bool(il))) {
+            it.is_live = true;
+            if (!it.duration_text || !it.duration_text[0]) {
+                free(it.duration_text);
+                it.duration_text = tt_strdup("LIVE");
+            }
         }
 
         it.thumbnail_url = tt_asprintf("https://i.ytimg.com/vi/%s/mqdefault.jpg", it.id);
@@ -1180,7 +1555,9 @@ bool innertube_search(CURL *curl, const char *query, SearchFilter filter,
         http_response_free(&resp);
     }
 
-    if ((!ok || out_list->count == 0) && (!continuation || !continuation[0]) && query && query[0]) {
+    if ((!continuation || !continuation[0]) && query && query[0] &&
+        (!ok || (out_list->count == 0 && filter.sort == SORT_RELEVANCE &&
+                 filter.type == TYPE_ALL && !filter.live_only))) {
         if (search_ytdlp_fallback(query, out_list)) {
             if (err_buf && err_cap) err_buf[0] = '\0';
             return true;
@@ -1214,7 +1591,137 @@ bool innertube_browse(CURL *curl, const char *browse_id, const char *params,
 
     bool ok = innertube_parse_browse_json(resp.data, resp.len, out_list, err_buf, err_cap);
     http_response_free(&resp);
+
+    if ((!continuation || !continuation[0]) && ok && out_list->count == 0 &&
+        out_list->continuation_token && out_list->continuation_token[0]) {
+        char *follow_tok = out_list->continuation_token;
+        out_list->continuation_token = NULL;
+        yyjson_mut_doc *fdoc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *froot = yyjson_mut_obj(fdoc);
+        yyjson_mut_doc_set_root(fdoc, froot);
+        add_innertube_context(fdoc, froot);
+        yyjson_mut_obj_add_str(fdoc, froot, "continuation", follow_tok);
+        free(follow_tok);
+
+        HttpResponse fresp;
+        if (innertube_post(curl, "browse", fdoc, &fresp, err_buf, err_cap)) {
+            ok = innertube_parse_browse_json(fresp.data, fresp.len, out_list, err_buf, err_cap);
+            http_response_free(&fresp);
+        }
+        yyjson_mut_doc_free(fdoc);
+    }
+
+    if (ok && browse_id && strncmp(browse_id, "UC", 2) == 0) {
+        if (!out_list->source_id) {
+            out_list->source_id = tt_strdup(browse_id);
+        }
+        for (size_t i = 0; i < out_list->count; i++) {
+            MediaItem *it = &out_list->items[i];
+            if (it->kind != ITEM_VIDEO) continue;
+            if (!it->author_id || !it->author_id[0]) {
+                free(it->author_id);
+                it->author_id = tt_strdup(browse_id);
+            }
+            if ((!it->author || !it->author[0]) && out_list->heading && out_list->heading[0]) {
+                free(it->author);
+                it->author = tt_strdup(out_list->heading);
+            }
+        }
+    }
     return ok;
+}
+
+bool innertube_browse_channel(CURL *curl, const char *channel_id, bool live_tab,
+                              const char *continuation, bool hide_members_only,
+                              MediaList *out_list, char *err_buf, size_t err_cap) {
+    if (!out_list) return false;
+    if ((continuation && continuation[0]) || live_tab) {
+        const char *params = live_tab ? INNERTUBE_CHAN_STREAMS_PARAMS : INNERTUBE_CHAN_VIDEOS_PARAMS;
+        bool ok = innertube_browse(curl, channel_id, params, continuation,
+                                   out_list, err_buf, err_cap);
+        if (ok && hide_members_only) {
+            media_list_filter_members_only(out_list);
+        }
+        return ok;
+    }
+
+    MediaList vid_list, stm_list;
+    media_list_init(&vid_list);
+    media_list_init(&stm_list);
+
+    char stm_err[256] = {0};
+    bool vid_ok = innertube_browse(curl, channel_id, INNERTUBE_CHAN_VIDEOS_PARAMS,
+                                   NULL, &vid_list, err_buf, err_cap);
+    bool stm_ok = innertube_browse(curl, channel_id, INNERTUBE_CHAN_STREAMS_PARAMS,
+                                   NULL, &stm_list, stm_err, sizeof(stm_err));
+
+    if (!vid_ok && !stm_ok) {
+        if (err_buf && err_cap && !err_buf[0] && stm_err[0]) {
+            snprintf(err_buf, err_cap, "%s", stm_err);
+        }
+        media_list_free(&vid_list);
+        media_list_free(&stm_list);
+        return false;
+    }
+
+    if (hide_members_only) {
+        media_list_filter_members_only(&vid_list);
+        media_list_filter_members_only(&stm_list);
+    }
+
+    if (vid_list.count == 0 && stm_list.count > 0) {
+        char *saved_heading = out_list->heading;
+        out_list->heading = NULL;
+        free(out_list->continuation_token);
+        free(out_list->source_id);
+        *out_list = stm_list;
+        memset(&stm_list, 0, sizeof(stm_list));
+        if (!out_list->heading && saved_heading) {
+            out_list->heading = saved_heading;
+        } else {
+            free(saved_heading);
+        }
+        media_list_free(&vid_list);
+        if (err_buf && err_cap) err_buf[0] = '\0';
+        return true;
+    }
+
+    if (!out_list->heading) {
+        if (vid_list.heading && vid_list.heading[0]) {
+            out_list->heading = tt_strdup(vid_list.heading);
+        } else if (stm_list.heading && stm_list.heading[0]) {
+            out_list->heading = tt_strdup(stm_list.heading);
+        }
+    }
+    if (!out_list->continuation_token && vid_list.continuation_token) {
+        out_list->continuation_token = tt_strdup(vid_list.continuation_token);
+    }
+    if (!out_list->source_id && channel_id && channel_id[0]) {
+        out_list->source_id = tt_strdup(channel_id);
+    }
+
+    for (size_t i = 0; i < stm_list.count; i++) {
+        if (stm_list.items[i].is_live) {
+            media_list_append_copy(out_list, &stm_list.items[i]);
+        }
+    }
+    for (size_t i = 0; i < vid_list.count; i++) {
+        bool dup = false;
+        for (size_t j = 0; j < out_list->count; j++) {
+            if (strcmp(out_list->items[j].id, vid_list.items[i].id) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            media_list_append_copy(out_list, &vid_list.items[i]);
+        }
+    }
+
+    media_list_free(&vid_list);
+    media_list_free(&stm_list);
+    if (err_buf && err_cap) err_buf[0] = '\0';
+    return true;
 }
 
 bool innertube_next(CURL *curl, const char *video_id, const char *continuation,
@@ -1245,6 +1752,9 @@ bool innertube_next(CURL *curl, const char *video_id, const char *continuation,
 bool innertube_resolve_url(CURL *curl, const char *url, ParsedUrl *out,
                            char *err_buf, size_t err_cap) {
     if (!url || !out) return false;
+    ParsedUrl in_url;
+    bool url_prefers_live = innertube_parse_input_url(url, &in_url) && in_url.prefer_live_tab;
+
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
@@ -1258,6 +1768,9 @@ bool innertube_resolve_url(CURL *curl, const char *url, ParsedUrl *out,
 
     bool ok = innertube_parse_resolve_url_json(resp.data, resp.len, out);
     http_response_free(&resp);
+    if (ok && url_prefers_live && out->kind == URL_CHANNEL) {
+        out->prefer_live_tab = true;
+    }
     if (!ok && err_buf && err_cap) {
         snprintf(err_buf, err_cap, "Could not resolve YouTube URL");
     }
@@ -1266,7 +1779,8 @@ bool innertube_resolve_url(CURL *curl, const char *url, ParsedUrl *out,
 
 bool innertube_fetch_feed(CURL *curl, const FavoriteList *favs, bool use_rss,
                           int max_per_channel, int64_t max_age_sec, int64_t now_epoch,
-                          MediaList *out_list, HttpPool *pool, uint64_t gen,
+                          bool hide_members_only, MediaList *out_list,
+                          HttpPool *pool, uint64_t gen,
                           char *err_buf, size_t err_cap) {
     if (!favs || !out_list) return false;
     out_list->heading = tt_strdup("Feed");
@@ -1283,14 +1797,14 @@ bool innertube_fetch_feed(CURL *curl, const FavoriteList *favs, bool use_rss,
 
         const FavoriteItem *fav = &favs->items[i];
         if (use_rss) {
-            char plist_id[72];
-            if (fav->kind == ITEM_CHANNEL && strncmp(fav->id, "UC", 2) == 0) {
-                snprintf(plist_id, sizeof(plist_id), "UU%s", fav->id + 2);
-            } else {
-                snprintf(plist_id, sizeof(plist_id), "%s", fav->id);
-            }
             char url[256];
-            snprintf(url, sizeof(url), "https://www.youtube.com/feeds/videos.xml?playlist_id=%s", plist_id);
+            if (fav->kind == ITEM_CHANNEL && strncmp(fav->id, "UC", 2) == 0) {
+                snprintf(url, sizeof(url),
+                         "https://www.youtube.com/feeds/videos.xml?channel_id=%s", fav->id);
+            } else {
+                snprintf(url, sizeof(url),
+                         "https://www.youtube.com/feeds/videos.xml?playlist_id=%s", fav->id);
+            }
             HttpResponse resp;
             if (http_get(curl, url, INNERTUBE_MAX_JSON, &resp)) {
                 if (resp.status_code >= 200 && resp.status_code < 300 && resp.data) {
@@ -1302,22 +1816,59 @@ bool innertube_fetch_feed(CURL *curl, const FavoriteList *favs, bool use_rss,
         } else {
             MediaList ch_list;
             media_list_init(&ch_list);
-            char browse_id[72];
-            const char *params = NULL;
             if (fav->kind == ITEM_CHANNEL) {
-                snprintf(browse_id, sizeof(browse_id), "%s", fav->id);
-                params = "EgZ2aWRlb3PyBgQKAjoA";
-            } else if (strncmp(fav->id, "VL", 2) == 0) {
-                snprintf(browse_id, sizeof(browse_id), "%s", fav->id);
+                MediaList stm_list;
+                media_list_init(&stm_list);
+                char stm_err[256] = {0};
+                bool vid_ok = innertube_browse(curl, fav->id, INNERTUBE_CHAN_VIDEOS_PARAMS,
+                                               NULL, &ch_list, err_buf, err_cap);
+                bool stm_ok = innertube_browse(curl, fav->id, INNERTUBE_CHAN_STREAMS_PARAMS,
+                                               NULL, &stm_list, stm_err, sizeof(stm_err));
+                if (hide_members_only) {
+                    media_list_filter_members_only(&ch_list);
+                    media_list_filter_members_only(&stm_list);
+                }
+                size_t limit = (max_per_channel > 0)
+                                   ? (size_t)max_per_channel
+                                   : (ch_list.count + stm_list.count);
+                size_t added = 0;
+                if (stm_ok) {
+                    for (size_t j = 0; j < stm_list.count && added < limit; j++) {
+                        if (stm_list.items[j].is_live) {
+                            media_list_append_copy(out_list, &stm_list.items[j]);
+                            added++;
+                        }
+                    }
+                }
+                if (vid_ok) {
+                    for (size_t j = 0; j < ch_list.count && added < limit; j++) {
+                        media_list_append_copy(out_list, &ch_list.items[j]);
+                        added++;
+                    }
+                }
+                if (stm_ok && added < limit) {
+                    for (size_t j = 0; j < stm_list.count && added < limit; j++) {
+                        if (!stm_list.items[j].is_live) {
+                            media_list_append_copy(out_list, &stm_list.items[j]);
+                            added++;
+                        }
+                    }
+                }
+                media_list_free(&stm_list);
             } else {
-                snprintf(browse_id, sizeof(browse_id), "VL%s", fav->id);
-            }
-
-            if (innertube_browse(curl, browse_id, params, NULL, &ch_list, err_buf, err_cap)) {
-                size_t limit = (max_per_channel > 0) ? (size_t)max_per_channel : ch_list.count;
-                if (limit > ch_list.count) limit = ch_list.count;
-                for (size_t j = 0; j < limit; j++) {
-                    media_list_append_copy(out_list, &ch_list.items[j]);
+                char browse_id[72];
+                if (strncmp(fav->id, "VL", 2) == 0) {
+                    snprintf(browse_id, sizeof(browse_id), "%s", fav->id);
+                } else {
+                    snprintf(browse_id, sizeof(browse_id), "VL%s", fav->id);
+                }
+                if (innertube_browse(curl, browse_id, NULL, NULL, &ch_list, err_buf, err_cap)) {
+                    if (hide_members_only) media_list_filter_members_only(&ch_list);
+                    size_t limit = (max_per_channel > 0) ? (size_t)max_per_channel : ch_list.count;
+                    if (limit > ch_list.count) limit = ch_list.count;
+                    for (size_t j = 0; j < limit; j++) {
+                        media_list_append_copy(out_list, &ch_list.items[j]);
+                    }
                 }
             }
             media_list_free(&ch_list);

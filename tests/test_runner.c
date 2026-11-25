@@ -1,4 +1,5 @@
 #include "config.h"
+#include "http.h"
 #include "image.h"
 #include "innertube.h"
 #include "model.h"
@@ -6,6 +7,7 @@
 #include "util.h"
 
 #include <assert.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +91,14 @@ static void test_search_params_encoding(void) {
     /* [0x08, 0x01, 0x12, 0x04, 0x10, 0x02, 0x40, 0x01] */
     assert(innertube_encode_search_params((SearchFilter){SORT_RATING, TYPE_CHANNEL, true}, buf, sizeof(buf)));
     assert(strlen(buf) > 4);
+
+    /* SORT_RELEVANCE with live_only omits 0x08,0x00 -> "EgJAAQ==" */
+    assert(innertube_encode_search_params((SearchFilter){SORT_RELEVANCE, TYPE_ALL, true}, buf, sizeof(buf)));
+    assert(strcmp(buf, "EgJAAQ==") == 0);
+
+    /* SORT_RELEVANCE with TYPE_VIDEO + live_only -> "EgQQAUAB" */
+    assert(innertube_encode_search_params((SearchFilter){SORT_RELEVANCE, TYPE_VIDEO, true}, buf, sizeof(buf)));
+    assert(strcmp(buf, "EgQQAUAB") == 0);
 }
 
 static void test_url_parsing(void) {
@@ -111,10 +121,36 @@ static void test_url_parsing(void) {
 
     assert(innertube_parse_input_url("https://www.youtube.com/channel/UCabcdef123456", &u));
     assert(u.kind == URL_CHANNEL && strcmp(u.id, "UCabcdef123456") == 0);
+    assert(!u.prefer_live_tab);
+
+    assert(innertube_parse_input_url("https://www.youtube.com/channel/UCabcdef123456/streams", &u));
+    assert(u.kind == URL_CHANNEL && strcmp(u.id, "UCabcdef123456") == 0);
+    assert(u.prefer_live_tab);
+
+    assert(innertube_parse_input_url("https://www.youtube.com/channel/UCabcdef123456/live", &u));
+    assert(u.kind == URL_CHANNEL && strcmp(u.id, "UCabcdef123456") == 0);
+    assert(u.prefer_live_tab);
 
     assert(innertube_parse_input_url("https://www.youtube.com/@BocchiTheRock", &u));
     assert(u.kind == URL_HANDLE && strcmp(u.id, "@BocchiTheRock") == 0);
+    assert(!u.prefer_live_tab);
     assert(strcmp(u.resolved_url, "https://www.youtube.com/@BocchiTheRock") == 0);
+
+    assert(innertube_parse_input_url("https://www.youtube.com/@BocchiTheRock/streams", &u));
+    assert(u.kind == URL_HANDLE && strcmp(u.id, "@BocchiTheRock") == 0);
+    assert(u.prefer_live_tab);
+    assert(strcmp(u.resolved_url, "https://www.youtube.com/@BocchiTheRock") == 0);
+
+    assert(innertube_parse_input_url("https://www.youtube.com/@BocchiTheRock/live", &u));
+    assert(u.kind == URL_HANDLE && strcmp(u.id, "@BocchiTheRock") == 0);
+    assert(u.prefer_live_tab);
+    assert(strcmp(u.resolved_url, "https://www.youtube.com/@BocchiTheRock/live") == 0);
+
+    const char *res_json =
+        "{\"endpoint\":{\"browseEndpoint\":{\"browseId\":\"UCstreamChan\",\"params\":\"EgdzdHJlYW1z8gYECgJ6AA==\"}}}";
+    assert(innertube_parse_resolve_url_json(res_json, strlen(res_json), &u));
+    assert(u.kind == URL_CHANNEL && strcmp(u.id, "UCstreamChan") == 0);
+    assert(u.prefer_live_tab);
 
     assert(!innertube_parse_input_url("c programming wayland tutorial", &u));
     assert(u.kind == URL_NONE);
@@ -295,12 +331,13 @@ static void test_rss_and_feed_filtering(void) {
 }
 
 static void test_config_theme_and_keybindings(void) {
-    /* Load sample custom theme directly (has trailing comma!) */
+    /* Load sample custom theme directly (has comments & trailing comma!) */
     Theme custom_theme;
     theme_init_builtin(&custom_theme, "yuuka");
     assert(theme_load_file(&custom_theme, "examples/sample_theme.json"));
-    assert(custom_theme.base.fg.r == 92 && custom_theme.base.fg.g == 59 && custom_theme.base.fg.b == 72);
-    assert(custom_theme.base.bg.r == 217 && custom_theme.base.bg.g == 136 && custom_theme.base.bg.b == 155);
+    assert(custom_theme.base.fg.r == 156 && custom_theme.base.fg.g == 178 && custom_theme.base.fg.b == 168);
+    assert(custom_theme.base.bg.r == 16 && custom_theme.base.bg.g == 24 && custom_theme.base.bg.b == 21);
+    assert(theme_contrast_ratio(custom_theme.text_normal.fg, custom_theme.text_normal.bg) >= 4.5);
 
     /* Temporary config directory */
     char tmpdir[] = "/tmp/tuitube_test_cfg_XXXXXX";
@@ -563,6 +600,275 @@ static void test_nav_stack_push_pop_and_eviction(void) {
     nav_stack_free(&ns);
 }
 
+typedef struct {
+    int id;
+    int *ran_flag;
+} PoolTestArg;
+
+static void *pool_test_work(CURL *curl, void *arg, uint64_t gen, HttpPool *pool) {
+    (void)curl;
+    (void)gen;
+    (void)pool;
+    PoolTestArg *a = arg;
+    if (a->ran_flag) *a->ran_flag = 1;
+    int *out = malloc(sizeof(int));
+    *out = a->id;
+    return out;
+}
+
+static void test_live_shelf_lockup_engagement_and_members_only(void) {
+    /* Shelves, richSection/richShelf, thumbnailOverlayTimeStatusRenderer, lockupViewModel live & channel-tab */
+    const char *search_json =
+        "{"
+        "  \"contents\": {\"twoColumnSearchResultsRenderer\": {\"primaryContents\": {\"sectionListRenderer\": {\"contents\": ["
+        "    {\"itemSectionRenderer\": {\"contents\": ["
+        "      {\"shelfRenderer\": {\"content\": {\"verticalListRenderer\": {\"items\": ["
+        "        {\"videoRenderer\": {"
+        "          \"videoId\": \"liveShelf01\","
+        "          \"title\": {\"simpleText\": \"Live In Shelf\"},"
+        "          \"ownerText\": {\"runs\": [{\"text\": \"Streamer A\", \"navigationEndpoint\": {\"browseEndpoint\": {\"browseId\": \"UCSTREAM1\"}}}]},"
+        "          \"shortViewCountText\": {\"simpleText\": \"4.2K watching\"},"
+        "          \"descriptionSnippet\": {\"runs\": [{\"text\": \"Snippet preview\"}]},"
+        "          \"thumbnailOverlays\": [{\"thumbnailOverlayTimeStatusRenderer\": {\"style\": \"LIVE\", \"text\": {\"simpleText\": \"LIVE\"}}}],"
+        "          \"badges\": [{\"metadataBadgeRenderer\": {\"style\": \"BADGE_STYLE_TYPE_MEMBERS_ONLY\"}}]"
+        "        }}"
+        "      ]}}}},"
+        "      {\"lockupViewModel\": {"
+        "        \"contentId\": \"liveLockup02\","
+        "        \"contentType\": \"LOCKUP_CONTENT_TYPE_VIDEO\","
+        "        \"metadata\": {\"lockupMetadataViewModel\": {"
+        "          \"title\": {\"content\": \"Modern Live Lockup\"},"
+        "          \"metadata\": {\"contentMetadataViewModel\": {\"metadataRows\": ["
+        "            {\"metadataParts\": [{\"text\": {\"content\": \"Ch Lockup\", \"commandRuns\": [{\"onTap\": {\"innertubeCommand\": {\"browseEndpoint\": {\"browseId\": \"UCLOCKUP1\"}}}}]}}]},"
+        "            {\"metadataParts\": [{\"text\": {\"content\": \"1.5K watching\"}}]}"
+        "          ]}}"
+        "        }},"
+        "        \"contentImage\": {\"thumbnailViewModel\": {"
+        "          \"overlays\": [{\"thumbnailBottomOverlayViewModel\": {\"badges\": [{\"thumbnailBadgeViewModel\": {\"badgeStyle\": \"THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE\", \"text\": \"LIVE\"}}]}}]"
+        "        }}"
+        "      }}"
+        "    ]}}"
+        "  ]}}}}"
+        "}";
+
+    MediaList ml;
+    media_list_init(&ml);
+    char err[128] = {0};
+    assert(innertube_parse_search_json(search_json, strlen(search_json), &ml, err, sizeof(err)));
+    assert(ml.count == 2);
+
+    assert(strcmp(ml.items[0].id, "liveShelf01") == 0);
+    assert(ml.items[0].is_live == true);
+    assert(ml.items[0].is_members_only == true);
+    assert(ml.items[0].details_loaded == false);
+    assert(ml.items[0].description && strcmp(ml.items[0].description, "Snippet preview") == 0);
+    assert(ml.items[0].duration_text && strcmp(ml.items[0].duration_text, "LIVE") == 0);
+
+    assert(strcmp(ml.items[1].id, "liveLockup02") == 0);
+    assert(ml.items[1].is_live == true);
+    assert(ml.items[1].author && strcmp(ml.items[1].author, "Ch Lockup") == 0);
+    assert(ml.items[1].author_id && strcmp(ml.items[1].author_id, "UCLOCKUP1") == 0);
+    assert(ml.items[1].duration_text && strcmp(ml.items[1].duration_text, "LIVE") == 0);
+
+    media_list_filter_members_only(&ml);
+    assert(ml.count == 1);
+    assert(strcmp(ml.items[0].id, "liveLockup02") == 0);
+    media_list_free(&ml);
+
+    /* Browse JSON: pageHeaderViewModel heading, richSectionRenderer/richShelfRenderer,
+       channel-tab lockupViewModel without author row, and continuationContents */
+    const char *browse_json =
+        "{"
+        "  \"header\": {\"pageHeaderRenderer\": {\"content\": {\"pageHeaderViewModel\": {\"title\": {\"dynamicTextViewModel\": {\"text\": {\"content\": \"Stream Channel\"}}}}}}},"
+        "  \"contents\": {\"twoColumnBrowseResultsRenderer\": {\"tabs\": [{\"tabRenderer\": {\"selected\": true, \"content\": {"
+        "    \"richGridRenderer\": {\"contents\": ["
+        "      {\"richSectionRenderer\": {\"content\": {\"richShelfRenderer\": {\"contents\": ["
+        "        {\"richItemRenderer\": {\"content\": {\"lockupViewModel\": {"
+        "          \"contentId\": \"chanStream01\","
+        "          \"contentType\": \"LOCKUP_CONTENT_TYPE_VIDEO\","
+        "          \"metadata\": {\"lockupMetadataViewModel\": {"
+        "            \"title\": {\"content\": \"Channel Tab Stream\"},"
+        "            \"badges\": [{\"badgeViewModel\": {\"badgeStyle\": \"BADGE_MEMBERS_ONLY\", \"badgeText\": \"Members only\"}}],"
+        "            \"metadata\": {\"contentMetadataViewModel\": {\"metadataRows\": ["
+        "              {\"metadataParts\": [{\"text\": {\"content\": \"4.2K watching\"}}, {\"text\": {\"content\": \"Streamed 2 days ago\"}}]}"
+        "            ]}}"
+        "          }},"
+        "          \"contentImage\": {\"thumbnailViewModel\": {"
+        "            \"overlays\": [{\"thumbnailBottomOverlayViewModel\": {\"badges\": [{\"thumbnailBadgeViewModel\": {\"badgeStyle\": \"THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE\", \"text\": \"LIVE\"}}]}}]"
+        "          }}"
+        "        }}}}"
+        "      ]}}}}"
+        "    ]}"
+        "  }}}]}},"
+        "  \"continuationContents\": {\"richGridContinuation\": {\"contents\": ["
+        "    {\"richItemRenderer\": {\"content\": {\"videoRenderer\": {\"videoId\": \"contVid01\", \"title\": {\"simpleText\": \"Cont Video\"}}}}}"
+        "  ], \"continuations\": [{\"nextContinuationData\": {\"continuation\": \"LEGACY_CONT_2\"}}]}}"
+        "}";
+    media_list_init(&ml);
+    assert(innertube_parse_browse_json(browse_json, strlen(browse_json), &ml, err, sizeof(err)));
+    assert(ml.heading && strcmp(ml.heading, "Stream Channel") == 0);
+    assert(ml.count == 2);
+    assert(strcmp(ml.items[0].id, "chanStream01") == 0);
+    assert(ml.items[0].author == NULL);
+    assert(ml.items[0].view_count_text && strcmp(ml.items[0].view_count_text, "4.2K watching") == 0);
+    assert(ml.items[0].is_live == true);
+    assert(ml.items[0].is_members_only == true);
+    assert(strcmp(ml.items[1].id, "contVid01") == 0);
+    assert(ml.continuation_token && strcmp(ml.continuation_token, "LEGACY_CONT_2") == 0);
+    media_list_free(&ml);
+
+    /* engagementPanels structured description extraction */
+    const char *next_eng_json =
+        "{"
+        "  \"contents\": {\"twoColumnWatchNextResults\": {\"results\": {\"results\": {\"contents\": ["
+        "    {\"videoPrimaryInfoRenderer\": {\"title\": {\"simpleText\": \"Eng Title\"}}},"
+        "    {\"videoSecondaryInfoRenderer\": {\"attributedDescription\": {\"content\": \"\"}}}"
+        "  ]}}}},"
+        "  \"engagementPanels\": [{\"engagementPanelSectionListRenderer\": {\"content\": {\"structuredDescriptionContentRenderer\": {\"items\": ["
+        "    {\"videoDescriptionHeaderRenderer\": {"
+        "      \"channel\": {\"simpleText\": \"Eng Channel\"},"
+        "      \"channelNavigationEndpoint\": {\"browseEndpoint\": {\"browseId\": \"UCENG999\"}},"
+        "      \"publishDate\": {\"simpleText\": \"Nov 26, 2026\"},"
+        "      \"views\": {\"simpleText\": \"999 views\"}"
+        "    }},"
+        "    {\"expandableVideoDescriptionBodyRenderer\": {\"attributedDescriptionBodyText\": {\"content\": \"Structured description body\"}}}"
+        "  ]}}}}]"
+        "}";
+    MediaItem det = {0};
+    assert(innertube_parse_next_json(next_eng_json, strlen(next_eng_json), "eng01", &det, NULL, err, sizeof(err)));
+    assert(det.details_loaded == true);
+    assert(det.description && strcmp(det.description, "Structured description body") == 0);
+    assert(det.author && strcmp(det.author, "Eng Channel") == 0);
+    assert(det.author_id && strcmp(det.author_id, "UCENG999") == 0);
+    assert(det.published_text && strcmp(det.published_text, "Nov 26, 2026") == 0);
+    assert(det.view_count_text && strcmp(det.view_count_text, "999 views") == 0);
+    media_item_free_fields(&det);
+
+    /* yt-dlp subscriber_only & is_live */
+    const char *ytdlp_json =
+        "{\"entries\": ["
+        "  {\"id\": \"yd1\", \"title\": \"Members\", \"availability\": \"subscriber_only\"},"
+        "  {\"id\": \"yd2\", \"title\": \"Live\", \"live_status\": \"is_live\"}"
+        "]}";
+    media_list_init(&ml);
+    assert(innertube_parse_ytdlp_json(ytdlp_json, strlen(ytdlp_json), &ml));
+    assert(ml.count == 2);
+    assert(ml.items[0].is_members_only == true);
+    assert(ml.items[1].is_members_only == false && ml.items[1].is_live == true);
+    assert(ml.items[1].duration_text && strcmp(ml.items[1].duration_text, "LIVE") == 0);
+    media_list_free(&ml);
+}
+
+static void test_http_pool_detail_gen_independence(void) {
+    HttpPool *pool = http_pool_create(1);
+    assert(pool != NULL);
+
+    http_pool_set_active_gen(pool, 10);
+    http_pool_set_active_detail_gen(pool, 1);
+
+    int ran_stale_search = 0;
+    int ran_stale_detail = 0;
+    int ran_valid_detail = 0;
+
+    PoolTestArg *a1 = calloc(1, sizeof(PoolTestArg));
+    a1->id = 101;
+    a1->ran_flag = &ran_stale_search;
+    PoolTestArg *a2 = calloc(1, sizeof(PoolTestArg));
+    a2->id = 102;
+    a2->ran_flag = &ran_stale_detail;
+    PoolTestArg *a3 = calloc(1, sizeof(PoolTestArg));
+    a3->id = 103;
+    a3->ran_flag = &ran_valid_detail;
+
+    assert(http_pool_submit(pool, JOB_SEARCH, 9, a1, pool_test_work, free, free));
+    assert(http_pool_submit(pool, JOB_DETAIL, 0, a2, pool_test_work, free, free));
+    assert(http_pool_submit(pool, JOB_DETAIL, 1, a3, pool_test_work, free, free));
+
+    int nfd = http_pool_notify_fd(pool);
+    bool got_valid = false;
+    for (int iter = 0; iter < 50 && !got_valid; iter++) {
+        struct pollfd pfd = {.fd = nfd, .events = POLLIN};
+        poll(&pfd, 1, 100);
+        http_pool_drain_notify(pool);
+        HttpResult res;
+        while (http_pool_pop_result(pool, &res)) {
+            if (res.kind == RES_JOB_DONE && res.job_type == JOB_DETAIL && res.request_gen == 1) {
+                assert(res.data != NULL && *(int *)res.data == 103);
+                got_valid = true;
+            }
+            http_result_free(&res);
+        }
+    }
+    assert(got_valid);
+    assert(ran_valid_detail == 1);
+    assert(ran_stale_search == 0);
+    assert(ran_stale_detail == 0);
+
+    http_pool_destroy(pool);
+}
+
+static void test_config_members_only_and_download(void) {
+    char tmpdir[] = "/tmp/tuitube_test_dl_XXXXXX";
+    assert(mkdtemp(tmpdir) != NULL);
+
+    char cfg_file[256];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+    const char *cfg_json =
+        "{\n"
+        "  \"hide_members_only\": true,\n"
+        "  \"download_dir\": \"~/MyVideos\"\n"
+        "}\n";
+    assert(tt_write_file_atomic(cfg_file, cfg_json, strlen(cfg_json)));
+
+    TuiTubeConfig cfg;
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.hide_members_only == true);
+    assert(cfg.download_dir && strcmp(cfg.download_dir, "~/MyVideos") == 0);
+
+    char *resolved = config_resolve_download_dir(&cfg);
+    assert(resolved != NULL);
+    assert(strstr(resolved, "/MyVideos") != NULL);
+    free(resolved);
+
+    assert(config_action_from_string("download_video") == ACT_DOWNLOAD_VIDEO);
+    assert(config_match_keybinding(&cfg, TT_MOD_CTRL, XKB_KEY_s) == ACT_DOWNLOAD_VIDEO);
+
+    char shortcut[32];
+    assert(config_format_action_shortcut(&cfg, ACT_DOWNLOAD_VIDEO, shortcut, sizeof(shortcut)));
+    assert(strcmp(shortcut, "Ctrl+S") == 0);
+
+    config_free(&cfg);
+
+    /* Alias "hide_member_videos" + relative download_dir */
+    const char *alias_json =
+        "{\n"
+        "  \"hide_member_videos\": true,\n"
+        "  \"download_dir\": \"saved\"\n"
+        "}\n";
+    assert(tt_write_file_atomic(cfg_file, alias_json, strlen(alias_json)));
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.hide_members_only == true);
+    resolved = config_resolve_download_dir(&cfg);
+    char expected_rel[PATH_MAX + 16];
+    snprintf(expected_rel, sizeof(expected_rel), "%s/saved", cfg.config_dir);
+    assert(resolved && strcmp(resolved, expected_rel) == 0);
+    free(resolved);
+    config_free(&cfg);
+
+    unlink(cfg_file);
+    rmdir(tmpdir);
+
+    /* Download progress template parsing */
+    double p = -1.0;
+    assert(player_parse_ytdlp_progress_line("TT_DL:524288:1048576:NA: 50.0%", &p));
+    assert(p > 0.49 && p < 0.51);
+    assert(player_parse_ytdlp_progress_line("TT_DL:250:NA:1000: 25.0%", &p));
+    assert(p > 0.24 && p < 0.26);
+    assert(player_parse_ytdlp_progress_line("TT_DL:NA:NA:NA: 73.5%", &p));
+    assert(p > 0.73 && p < 0.74);
+    assert(!player_parse_ytdlp_progress_line("other line", &p));
+}
+
 int main(void) {
     RUN_TEST(test_util_utf8_and_entities);
     RUN_TEST(test_search_params_encoding);
@@ -576,6 +882,9 @@ int main(void) {
     RUN_TEST(test_wcag_themes_and_default_dark);
     RUN_TEST(test_new_keybindings_and_formatting);
     RUN_TEST(test_nav_stack_push_pop_and_eviction);
+    RUN_TEST(test_live_shelf_lockup_engagement_and_members_only);
+    RUN_TEST(test_http_pool_detail_gen_independence);
+    RUN_TEST(test_config_members_only_and_download);
 
     printf("\nAll %d tests passed!\n", g_tests_run);
     return 0;

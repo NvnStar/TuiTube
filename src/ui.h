@@ -32,6 +32,7 @@ typedef struct {
     void (*on_show_history)(void *ctx);
     void (*on_select_item)(void *ctx, size_t index);
     void (*on_activate_item)(void *ctx, size_t index);
+    void (*on_download_video)(void *ctx);
     void (*on_view_channel)(void *ctx);
     void (*on_view_recommended)(void *ctx);
     void (*on_toggle_favorite)(void *ctx);
@@ -39,6 +40,7 @@ typedef struct {
     void (*on_request_thumb)(void *ctx, const char *key, const char *url);
     void (*on_navigate_back)(void *ctx);
     void (*on_retry)(void *ctx);
+    void (*on_switch_channel_tab)(void *ctx, bool live_tab);
 } UiCallbacks;
 
 UiState *ui_create(TuiTubeConfig *cfg, WaylandApp *wl, ThumbCache *thumbs,
@@ -56,6 +58,7 @@ void ui_mark_video_watched(UiState *ui, const char *video_id);
 void ui_on_thumb_loaded(UiState *ui, const char *key, cairo_surface_t *surf);
 void ui_set_loading_more(UiState *ui, bool loading);
 void ui_set_nav_state(UiState *ui, UiViewKind view_kind, bool can_go_back);
+void ui_set_channel_tabs(UiState *ui, bool show_tabs, bool live_tab);
 void ui_set_busy(UiState *ui, bool busy);
 void ui_set_error(UiState *ui, const char *err_msg);
 

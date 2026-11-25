@@ -42,6 +42,7 @@ struct HttpPool {
     pthread_cond_t cond;
     bool stop;
     uint64_t active_gen;
+    uint64_t active_detail_gen;
 
     QueuedJob jobs[HTTP_JOB_QUEUE_CAP];
     size_t job_count;
@@ -240,10 +241,17 @@ static void *worker_main(void *arg) {
         }
         pool->job_count--;
         uint64_t active_gen = pool->active_gen;
+        uint64_t active_detail_gen = pool->active_detail_gen;
         pthread_mutex_unlock(&pool->mu);
 
-        /* Skip already-superseded interactive or thumbnail jobs */
-        if (job.type != JOB_THUMBNAIL && job.request_gen < active_gen) {
+        /* Skip already-superseded jobs */
+        bool stale = false;
+        if (job.type == JOB_DETAIL) {
+            stale = (job.request_gen < active_detail_gen);
+        } else if (job.type != JOB_THUMBNAIL) {
+            stale = (job.request_gen < active_gen);
+        }
+        if (stale) {
             if (job.free_arg) job.free_arg(job.arg);
             continue;
         }
@@ -380,6 +388,21 @@ bool http_pool_submit(HttpPool *pool, HttpJobType type, uint64_t request_gen,
             }
         }
         if (!evicted) {
+            for (size_t i = 0; i < pool->job_count; i++) {
+                if (pool->jobs[i].type == JOB_DETAIL &&
+                    pool->jobs[i].request_gen < pool->active_detail_gen) {
+                    if (pool->jobs[i].free_arg) pool->jobs[i].free_arg(pool->jobs[i].arg);
+                    if (i + 1 < pool->job_count) {
+                        memmove(&pool->jobs[i], &pool->jobs[i + 1],
+                                (pool->job_count - i - 1) * sizeof(QueuedJob));
+                    }
+                    pool->job_count--;
+                    evicted = true;
+                    break;
+                }
+            }
+        }
+        if (!evicted) {
             pthread_mutex_unlock(&pool->mu);
             if (free_arg && arg) free_arg(arg);
             return false;
@@ -403,6 +426,13 @@ void http_pool_set_active_gen(HttpPool *pool, uint64_t gen) {
     if (!pool) return;
     pthread_mutex_lock(&pool->mu);
     pool->active_gen = gen;
+    pthread_mutex_unlock(&pool->mu);
+}
+
+void http_pool_set_active_detail_gen(HttpPool *pool, uint64_t gen) {
+    if (!pool) return;
+    pthread_mutex_lock(&pool->mu);
+    pool->active_detail_gen = gen;
     pthread_mutex_unlock(&pool->mu);
 }
 

@@ -17,6 +17,7 @@ typedef enum {
     JOB_SEARCH = 0,
     JOB_BROWSE,
     JOB_NEXT,
+    JOB_DETAIL,
     JOB_FEED,
     JOB_RESOLVE_URL,
     JOB_THUMBNAIL
@@ -60,6 +61,7 @@ bool http_pool_submit(HttpPool *pool, HttpJobType type, uint64_t request_gen,
                       HttpFreeFn free_arg, HttpFreeFn free_res);
 bool http_pool_should_cancel(HttpPool *pool, uint64_t request_gen);
 void http_pool_set_active_gen(HttpPool *pool, uint64_t gen);
+void http_pool_set_active_detail_gen(HttpPool *pool, uint64_t gen);
 void http_pool_post_progress(HttpPool *pool, HttpJobType type, uint64_t gen, const char *msg);
 bool http_pool_pop_result(HttpPool *pool, HttpResult *out);
 void http_result_free(HttpResult *res);

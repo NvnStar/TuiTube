@@ -34,7 +34,9 @@ bool media_item_copy(MediaItem *dst, const MediaItem *src) {
     dst->thumbnail_url = tt_strdup(src->thumbnail_url);
     dst->published_epoch = src->published_epoch;
     dst->is_live = src->is_live;
+    dst->is_members_only = src->is_members_only;
     dst->watched = src->watched;
+    dst->details_loaded = src->details_loaded;
     return true;
 }
 
@@ -86,6 +88,23 @@ bool media_list_append_copy(MediaList *list, const MediaItem *item) {
         return false;
     }
     return true;
+}
+
+void media_list_filter_members_only(MediaList *list) {
+    if (!list || list->count == 0) return;
+    size_t write_idx = 0;
+    for (size_t i = 0; i < list->count; i++) {
+        if (list->items[i].is_members_only) {
+            media_item_free_fields(&list->items[i]);
+        } else {
+            if (write_idx != i) {
+                list->items[write_idx] = list->items[i];
+                memset(&list->items[i], 0, sizeof(MediaItem));
+            }
+            write_idx++;
+        }
+    }
+    list->count = write_idx;
 }
 
 static void fav_item_free_fields(FavoriteItem *it) {

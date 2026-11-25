@@ -21,6 +21,8 @@
   "max_feed_age": "1 month",
   "allow_hdr": false,
   "all_codecs": false,
+  "hide_members_only": false,
+  "download_dir": "",
   "key_bindings": [
     {"action": "set_light_theme", "mod": "", "key": "F2"},
     {"action": "set_dark_theme", "mod": "", "key": "F3"},

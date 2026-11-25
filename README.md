@@ -7,7 +7,8 @@ No Electron, no GTK, no Qt — just `wayland-client`, `wl_shm` + Cairo/PangoCair
 ## Features
 
 - **Native Wayland GUI:** Double-buffered `wl_shm` rendering with `xdg-shell`, HiDPI scaling, server-side decorations (`xdg-decoration`) with automatic slim CSD fallback, `xkbcommon` keyboard + repeat, and Wayland clipboard copy/paste.
-- **YouTube Search & Browsing:** Direct InnerTube v1 (`search`, `browse`, `next`, `navigation/resolve_url`) with sort/type/live filters, pagination (`Next Page` + optional `infinite_scroll`), direct URL / `@handle` paste resolution, and an automatic `yt-dlp --flat-playlist` fallback for search.
+- **YouTube Search & Browsing:** Direct InnerTube v1 (`search`, `browse`, `next`, `navigation/resolve_url`) with sort/type/live filters, Channel `Videos` / `Live` tabs, pagination (`Next Page` + optional `infinite_scroll`), direct URL / `@handle` paste resolution (including `/streams` and `/live`), and an automatic `yt-dlp --flat-playlist` fallback for search.
+- **Video Downloading & Members-Only Filtering:** Non-blocking background `yt-dlp` video downloads via the Detail pane `Download` button, right-click `Download Video`, or `Ctrl+S` (configurable `"download_dir"`), plus `"hide_members_only"` in `tuitube.json` to filter channel-membership-only videos (note: YouTube's Atom RSS feeds lack membership metadata, so pair `"hide_members_only": true` with `"feed_use_rss": false` to filter Subscription Feed items as well).
 - **Subscriptions, Feed & History:** Channel/playlist favorites (`favlist.json`), chronological subscription Feed via YouTube Atom RSS (with InnerTube fallback, configurable `max_feed_videos_per_channel` and `max_feed_age`), and deduplicated watch history (`history.json`) with watched-video dimming.
 - **Fast Thumbnail Pipeline:** Priority 4-thread `libcurl` worker pool, `libjpeg`/`libpng` decoding, disk cache + 256-entry LRU Cairo surface cache.
 - **Customizable & Portable:** `ikatube`-compatible JSON config (`tuitube.json`), custom TTF/OTF fonts via Fontconfig, custom mascot image, built-in WCAG AA themes (`dark` default, `light`, `yuuka`) + custom theme JSON (supports comments & trailing commas), custom keybindings, and portable mode (`tuitube_portable_mode.txt`).
@@ -76,10 +77,11 @@ Default keybindings (when search input is not focused, or with modifiers):
 - `Ctrl+L` or `/` — Focus search input (`Escape` moves focus to list, `Ctrl+U` / `Ctrl+BackSpace` clear/delete word)
 - `Tab` / `Shift+Tab` — Cycle focus across Search, List, and Detail panes
 - `Enter` — Play selected video / open selected channel or playlist
+- `Ctrl+S` — Download selected video (`yt-dlp` into `download_dir`, default `$XDG_DOWNLOAD_DIR` / `~/Downloads`)
 - `Alt+Left` / `BackSpace` / Mouse Back — Navigate back in history
 - `Up` / `Down` / `j` / `k` / `PageUp` / `PageDown` / `Home` / `End` — Navigate list (or scroll description when Detail pane is focused)
 - `Shift+Up` / `Shift+Down` (`K` / `J`) — Scroll description while in list
-- `Right-Click` — Open item context menu (Play, Channel, Recommended, Favorite, Copy URL/Title/Description)
+- `Right-Click` — Open item context menu (Play, Download Video, Channel, Recommended, Favorite, Copy URL/Title/Description)
 - `F1` or `?` — Toggle keyboard & mouse shortcut overlay
 - `Ctrl+F` — Show Favorites
 - `Ctrl+R` — Show Subscription Feed
@@ -93,13 +95,13 @@ Default keybindings (when search input is not focused, or with modifiers):
 
 ## Credits & Acknowledgments
 
-If you enjoy TuiTube, please consider giving a star, thanks, or support to the upstream projects and authors that made it possible:
+If you enjoy TuiTube, please consider thanking or supporting the upstream projects and authors that made it possible:
 
-- **ikatube / ikatk** *(original UX inspiration)* — TuiTube's two-pane layout, portable mode convention, `tuitube.json` options, 8-value RGBA theme schema, and keybinding design are directly modeled on `ikatube` (`ikatube2-wl`) and its configuration reference. Thank you to the `ikatube` author for designing such a clean, no-nonsense YouTube desktop workflow!
-- **[mpv](https://mpv.io/)** & **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — Do the heavy lifting of stream extraction, adaptive muxing, and hardware-accelerated video playback. Please star `yt-dlp` and support the `mpv` developers!
-- **Core C Libraries:** [Wayland](https://wayland.freedesktop.org/), [libxkbcommon](https://xkbcommon.org/), [Cairo](https://www.cairographics.org/), [Pango](https://pango.gnome.org/), [Fontconfig](https://www.freedesktop.org/wiki/Software/fontconfig/), [libcurl](https://curl.se/libcurl/), [yyjson](https://github.com/ibireme/yyjson), [libjpeg-turbo](https://libjpeg-turbo.org/), and [libpng](http://www.libpng.org/pub/png/libpng.html).
+- **[ikatube](https://chino-chan.gitlab.io/programs.html#s2)** by **chino-chan** *(original UX inspiration)* — TuiTube's two-pane layout, portable mode convention (`ikatk` toolkit), `tuitube.json` options, 8-value RGBA theme schema, and keybinding design are inspired by `ikatube` (`ikatube2-wl`) and its configuration reference. Thank you to `chino-chan` for designing such a clean, no-nonsense YouTube desktop workflow!
+- **[mpv](https://mpv.io/)** ([GitHub](https://github.com/mpv-player/mpv)) & **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — Do the heavy lifting of stream extraction, adaptive muxing, downloads, and hardware-accelerated video playback. Please star `yt-dlp` and support the `mpv` developers!
+- **Core C Libraries:** [Wayland](https://wayland.freedesktop.org/), [libxkbcommon](https://xkbcommon.org/), [Cairo](https://www.cairographics.org/), [Pango](https://pango.gnome.org/), [Fontconfig](https://www.freedesktop.org/wiki/Software/fontconfig/), [libcurl](https://curl.se/libcurl/), [yyjson](https://github.com/ibireme/yyjson), [libjpeg-turbo](https://libjpeg-turbo.org/), and [libpng](https://www.libpng.org/pub/png/libpng.html).
 
-*How to show appreciation:* Star the upstream repositories (`yt-dlp`, `mpv-player/mpv`, `ibireme/yyjson`, and `ikatube`), report reproducible issues with logs/fixtures, and keep `yt-dlp` updated when YouTube changes player signatures.
+*How to show appreciation:* Star the open-source upstream repositories (`yt-dlp/yt-dlp`, `mpv-player/mpv`, `ibireme/yyjson`), check out `chino-chan`'s programs at [chino-chan.gitlab.io](https://chino-chan.gitlab.io/programs.html#s2), report reproducible issues with logs/fixtures, and keep `yt-dlp` updated when YouTube changes player signatures.
 
 ---
 

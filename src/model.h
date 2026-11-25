@@ -28,7 +28,9 @@ typedef struct {
     char *thumbnail_url;
     int64_t published_epoch;
     bool is_live;
+    bool is_members_only;
     bool watched;
+    bool details_loaded;
 } MediaItem;
 
 typedef struct {
@@ -98,6 +100,7 @@ void media_list_clear(MediaList *list);
 void media_list_free(MediaList *list);
 bool media_list_append_move(MediaList *list, MediaItem *item);
 bool media_list_append_copy(MediaList *list, const MediaItem *item);
+void media_list_filter_members_only(MediaList *list);
 
 void favlist_init(FavoriteList *fl);
 void favlist_free(FavoriteList *fl);
