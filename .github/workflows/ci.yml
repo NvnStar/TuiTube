@@ -15,10 +15,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config wayland-scanner wayland-protocols \
+            build-essential cmake git ca-certificates pkg-config \
+            libwayland-bin wayland-protocols \
             libwayland-dev libxkbcommon-dev libcairo2-dev libpango1.0-dev \
-            libfontconfig-dev libcurl4-openssl-dev libyyjson-dev \
+            libfontconfig-dev libcurl4-openssl-dev \
             libjpeg-dev libpng-dev
+          git clone --depth 1 https://github.com/ibireme/yyjson.git /tmp/yyjson
+          cmake -S /tmp/yyjson -B /tmp/yyjson/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build /tmp/yyjson/build -j"$(nproc)"
+          sudo cmake --install /tmp/yyjson/build
+          sudo ldconfig
+          rm -rf /tmp/yyjson
 
       - name: Lint
         run: make lint

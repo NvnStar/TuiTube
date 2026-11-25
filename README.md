@@ -34,9 +34,11 @@ sudo pacman -S gcc pkgconf wayland wayland-protocols libxkbcommon cairo pango fo
 
 **Debian / Ubuntu (24.04+):**
 ```bash
-sudo apt install build-essential pkg-config wayland-scanner wayland-protocols \
+sudo apt install build-essential pkg-config libwayland-bin wayland-protocols \
   libwayland-dev libxkbcommon-dev libcairo2-dev libpango1.0-dev libfontconfig-dev \
-  libcurl4-openssl-dev libyyjson-dev libjpeg-dev libpng-dev mpv yt-dlp wl-clipboard
+  libcurl4-openssl-dev libjpeg-dev libpng-dev mpv yt-dlp wl-clipboard
+# On Debian 13+ / Ubuntu 25.04+, also install libyyjson-dev;
+# on Ubuntu 24.04 LTS, build yyjson from https://github.com/ibireme/yyjson
 ```
 
 </details>
