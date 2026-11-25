@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config wayland-scanner wayland-protocols \
+            libwayland-dev libxkbcommon-dev libcairo2-dev libpango1.0-dev \
+            libfontconfig-dev libcurl4-openssl-dev libyyjson-dev \
+            libjpeg-dev libpng-dev
+
+      - name: Lint
+        run: make lint
+
+      - name: Build release & debug
+        run: make release && make debug
+
+      - name: Run unit tests (ASan/UBSan)
+        run: make test
+
+      - name: Smoke test CLI & reproducibility
+        run: |
+          ./tuitube --help
+          h1=$(sha256sum ./tuitube | awk '{print $1}')
+          make clean && make release
+          h2=$(sha256sum ./tuitube | awk '{print $1}')
+          test "$h1" = "$h2"

@@ -1,0 +1,18 @@
+# Build outputs
+build/
+tuitube
+tuitube-debug
+*.o
+*.tmp.*
+
+# Local reference assets & personalized agent workflow (not pushed to GitHub)
+.agent-personalized/
+ikatube/
+ikatube-config-ref.html
+
+# Local runtime cache/config if run in portable mode
+/cache/
+/favlist.json
+/history.json
+/tuitube.json
+/tuitube_portable_mode.txt

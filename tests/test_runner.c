@@ -1,0 +1,572 @@
+#include "config.h"
+#include "image.h"
+#include "innertube.h"
+#include "model.h"
+#include "player.h"
+#include "util.h"
+
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static int g_tests_run = 0;
+
+#define RUN_TEST(fn) do { \
+    printf("Running %-42s ... ", #fn); \
+    fflush(stdout); \
+    fn(); \
+    g_tests_run++; \
+    printf("PASS\n"); \
+} while (0)
+
+static void test_util_utf8_and_entities(void) {
+    /* UTF-8 boundary stepping: "A" (1B) + "é" (2B) + "あ" (3B) + "🎵" (4B) */
+    const char *s = "A\xC3\xA9\xE3\x81\x82\xF0\x9F\x8E\xB5";
+    size_t len = strlen(s);
+    assert(len == 10);
+
+    size_t p = 0;
+    p = utf8_next_char(s, p, len); assert(p == 1);
+    p = utf8_next_char(s, p, len); assert(p == 3);
+    p = utf8_next_char(s, p, len); assert(p == 6);
+    p = utf8_next_char(s, p, len); assert(p == 10);
+
+    p = utf8_prev_char(s, p); assert(p == 6);
+    p = utf8_prev_char(s, p); assert(p == 3);
+    p = utf8_prev_char(s, p); assert(p == 1);
+    p = utf8_prev_char(s, p); assert(p == 0);
+
+    assert(utf8_clamp_pos(s, 8, len) == 6);
+
+    char *unesc = tt_xml_unescape("Rock &amp; Roll &lt;3 &quot;Hi&quot; &#39;ok&#39; &#x2605;");
+    assert(unesc != NULL);
+    assert(strcmp(unesc, "Rock & Roll <3 \"Hi\" 'ok' \xE2\x98\x85") == 0);
+    free(unesc);
+
+    int64_t sec = 0;
+    assert(tt_parse_age_seconds("2 hours", &sec) && sec == 7200);
+    assert(tt_parse_age_seconds("1 week", &sec) && sec == 7 * 86400);
+    assert(tt_parse_age_seconds("3 months", &sec) && sec == 90 * 86400);
+    assert(tt_parse_age_seconds("1 year", &sec) && sec == 365 * 86400);
+    assert(!tt_parse_age_seconds("invalid", &sec));
+
+    int64_t ep = 0;
+    assert(tt_parse_iso8601_utc("2026-07-08T12:30:00+00:00", &ep));
+    int64_t ep_z = 0;
+    assert(tt_parse_iso8601_utc("2026-07-08T12:30:00Z", &ep_z));
+    assert(ep == ep_z && ep > 0);
+}
+
+static void test_search_params_encoding(void) {
+    char buf[64];
+
+    /* [0x08, 0x00] -> "CAA=" */
+    assert(innertube_encode_search_params((SearchFilter){SORT_RELEVANCE, TYPE_ALL, false}, buf, sizeof(buf)));
+    assert(strcmp(buf, "CAA=") == 0);
+
+    /* [0x08, 0x02, 0x12, 0x02, 0x10, 0x01] -> "CAISAhAB" */
+    assert(innertube_encode_search_params((SearchFilter){SORT_UPLOAD_DATE, TYPE_VIDEO, false}, buf, sizeof(buf)));
+    assert(strcmp(buf, "CAISAhAB") == 0);
+
+    /* [0x08, 0x03, 0x12, 0x02, 0x40, 0x01] -> "CAMSAnAB"? Let's verify:
+       0x08 0x03 0x12 -> 00001000 00000011 00010010 -> CA M S
+       0x02 0x40 0x01 -> 00000010 01000000 00000001 -> A k A B */
+    assert(innertube_encode_search_params((SearchFilter){SORT_VIEW_COUNT, TYPE_ALL, true}, buf, sizeof(buf)));
+    assert(strcmp(buf, "CAMSAkAB") == 0);
+
+    /* [0x08, 0x01, 0x12, 0x04, 0x10, 0x02, 0x40, 0x01] */
+    assert(innertube_encode_search_params((SearchFilter){SORT_RATING, TYPE_CHANNEL, true}, buf, sizeof(buf)));
+    assert(strlen(buf) > 4);
+}
+
+static void test_url_parsing(void) {
+    ParsedUrl u;
+
+    assert(innertube_parse_input_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42", &u));
+    assert(u.kind == URL_VIDEO && strcmp(u.id, "dQw4w9WgXcQ") == 0);
+
+    assert(innertube_parse_input_url("https://youtu.be/abc123XYZ_-?si=foo", &u));
+    assert(u.kind == URL_VIDEO && strcmp(u.id, "abc123XYZ_-") == 0);
+
+    assert(innertube_parse_input_url("https://youtube.com/shorts/shortVid123", &u));
+    assert(u.kind == URL_VIDEO && strcmp(u.id, "shortVid123") == 0);
+
+    assert(innertube_parse_input_url("https://m.youtube.com/live/liveVid4567", &u));
+    assert(u.kind == URL_VIDEO && strcmp(u.id, "liveVid4567") == 0);
+
+    assert(innertube_parse_input_url("https://www.youtube.com/playlist?list=PL1234567890", &u));
+    assert(u.kind == URL_PLAYLIST && strcmp(u.id, "PL1234567890") == 0);
+
+    assert(innertube_parse_input_url("https://www.youtube.com/channel/UCabcdef123456", &u));
+    assert(u.kind == URL_CHANNEL && strcmp(u.id, "UCabcdef123456") == 0);
+
+    assert(innertube_parse_input_url("https://www.youtube.com/@BocchiTheRock", &u));
+    assert(u.kind == URL_HANDLE && strcmp(u.id, "@BocchiTheRock") == 0);
+    assert(strcmp(u.resolved_url, "https://www.youtube.com/@BocchiTheRock") == 0);
+
+    assert(!innertube_parse_input_url("c programming wayland tutorial", &u));
+    assert(u.kind == URL_NONE);
+}
+
+static void test_innertube_search_browse_next_json(void) {
+    const char *search_json =
+        "{"
+        "  \"contents\": {\"twoColumnSearchResultsRenderer\": {\"primaryContents\": {\"sectionListRenderer\": {\"contents\": ["
+        "    {\"itemSectionRenderer\": {\"contents\": ["
+        "      {\"videoRenderer\": {"
+        "        \"videoId\": \"vid00000001\","
+        "        \"title\": {\"runs\": [{\"text\": \"Legacy Video\"}]},"
+        "        \"ownerText\": {\"runs\": [{\"text\": \"Ch One\", \"navigationEndpoint\": {\"browseEndpoint\": {\"browseId\": \"UC111\"}}}]},"
+        "        \"lengthText\": {\"simpleText\": \"12:34\"},"
+        "        \"shortViewCountText\": {\"simpleText\": \"10K views\"},"
+        "        \"publishedTimeText\": {\"simpleText\": \"2 days ago\"},"
+        "        \"badges\": [{\"metadataBadgeRenderer\": {\"style\": \"BADGE_STYLE_TYPE_LIVE_NOW\"}}]"
+        "      }},"
+        "      {\"channelRenderer\": {"
+        "        \"channelId\": \"UC2222222222\","
+        "        \"title\": {\"simpleText\": \"Channel Two\"},"
+        "        \"subscriberCountText\": {\"simpleText\": \"50K subscribers\"}"
+        "      }},"
+        "      {\"lockupViewModel\": {"
+        "        \"contentId\": \"PL999888\","
+        "        \"contentType\": \"LOCKUP_CONTENT_TYPE_PLAYLIST\","
+        "        \"metadata\": {\"lockupMetadataViewModel\": {"
+        "          \"title\": {\"content\": \"Modern Playlist Lockup\"},"
+        "          \"metadata\": {\"contentMetadataViewModel\": {\"metadataRows\": ["
+        "            {\"metadataParts\": [{\"text\": {\"content\": \"Creator X\"}}, {\"text\": {\"content\": \"25 videos\"}}]}"
+        "          ]}}"
+        "        }},"
+        "        \"contentImage\": {\"collectionThumbnailViewModel\": {\"primaryThumbnail\": {\"thumbnailViewModel\": {"
+        "          \"image\": {\"sources\": [{\"url\": \"//i.ytimg.com/vi/abc/mqdefault.jpg\"}]},"
+        "          \"overlays\": [{\"thumbnailOverlayBadgeViewModel\": {\"thumbnailBadges\": [{\"thumbnailBadgeViewModel\": {\"text\": \"25\"}}]}}]"
+        "        }}}}"
+        "      }}"
+        "    ]}},"
+        "    {\"continuationItemRenderer\": {\"continuationEndpoint\": {\"continuationCommand\": {\"token\": \"CONT_TOK_1\"}}}}"
+        "  ]}}}}"
+        "}";
+
+    MediaList ml;
+    media_list_init(&ml);
+    char err[128] = {0};
+    assert(innertube_parse_search_json(search_json, strlen(search_json), &ml, err, sizeof(err)));
+    assert(ml.count == 3);
+    assert(ml.items[0].kind == ITEM_VIDEO && strcmp(ml.items[0].id, "vid00000001") == 0);
+    assert(strcmp(ml.items[0].title, "Legacy Video") == 0);
+    assert(strcmp(ml.items[0].author_id, "UC111") == 0);
+    assert(ml.items[0].is_live == true);
+
+    assert(ml.items[1].kind == ITEM_CHANNEL && strcmp(ml.items[1].id, "UC2222222222") == 0);
+    assert(ml.items[2].kind == ITEM_PLAYLIST && strcmp(ml.items[2].id, "PL999888") == 0);
+    assert(strcmp(ml.items[2].title, "Modern Playlist Lockup") == 0);
+    assert(strcmp(ml.items[2].thumbnail_url, "https://i.ytimg.com/vi/abc/mqdefault.jpg") == 0);
+    assert(ml.continuation_token && strcmp(ml.continuation_token, "CONT_TOK_1") == 0);
+    media_list_free(&ml);
+
+    /* Continuation search JSON */
+    const char *cont_json =
+        "{\"onResponseReceivedCommands\": [{\"appendContinuationItemsAction\": {\"continuationItems\": ["
+        "  {\"videoRenderer\": {\"videoId\": \"vid00000002\", \"title\": {\"simpleText\": \"Page 2 Video\"}}}"
+        "]}}]}";
+    media_list_init(&ml);
+    assert(innertube_parse_search_json(cont_json, strlen(cont_json), &ml, err, sizeof(err)));
+    assert(ml.count == 1 && strcmp(ml.items[0].id, "vid00000002") == 0);
+    media_list_free(&ml);
+
+    /* Browse playlist JSON */
+    const char *browse_json =
+        "{"
+        "  \"header\": {\"playlistHeaderRenderer\": {\"title\": {\"simpleText\": \"My Fav Mix\"}}},"
+        "  \"contents\": {\"twoColumnBrowseResultsRenderer\": {\"tabs\": [{\"tabRenderer\": {\"selected\": true, \"content\": {"
+        "    \"sectionListRenderer\": {\"contents\": [{\"itemSectionRenderer\": {\"contents\": [{\"playlistVideoListRenderer\": {\"contents\": ["
+        "      {\"playlistVideoRenderer\": {\"videoId\": \"pv111\", \"title\": {\"runs\": [{\"text\": \"Track 1\"}]}, \"lengthText\": {\"simpleText\": \"3:45\"}}}"
+        "    ]}} ]}} ]}"
+        "  }}}]}}"
+        "}";
+    media_list_init(&ml);
+    assert(innertube_parse_browse_json(browse_json, strlen(browse_json), &ml, err, sizeof(err)));
+    assert(ml.heading && strcmp(ml.heading, "My Fav Mix") == 0);
+    assert(ml.count == 1 && strcmp(ml.items[0].id, "pv111") == 0);
+    media_list_free(&ml);
+
+    /* Next JSON */
+    const char *next_json =
+        "{"
+        "  \"contents\": {\"twoColumnWatchNextResults\": {"
+        "    \"results\": {\"results\": {\"contents\": ["
+        "      {\"videoPrimaryInfoRenderer\": {"
+        "        \"title\": {\"runs\": [{\"text\": \"Main Title\"}]},"
+        "        \"viewCount\": {\"videoViewCountRenderer\": {\"viewCount\": {\"simpleText\": \"1,234 views\"}}},"
+        "        \"dateText\": {\"simpleText\": \"Jul 8, 2026\"}"
+        "      }},"
+        "      {\"videoSecondaryInfoRenderer\": {"
+        "        \"owner\": {\"videoOwnerRenderer\": {\"title\": {\"runs\": [{\"text\": \"OwnerName\", \"navigationEndpoint\": {\"browseEndpoint\": {\"browseId\": \"UCOWNER\"}}}]}}},"
+        "        \"attributedDescription\": {\"content\": \"Full description text here.\"}"
+        "      }}"
+        "    ]}},"
+        "    \"secondaryResults\": {\"secondaryResults\": {\"results\": ["
+        "      {\"compactVideoRenderer\": {\"videoId\": \"rec01\", \"title\": {\"simpleText\": \"Rec One\"}}},"
+        "      {\"lockupViewModel\": {\"contentId\": \"rec02\", \"contentType\": \"LOCKUP_CONTENT_TYPE_VIDEO\", \"metadata\": {\"lockupMetadataViewModel\": {\"title\": {\"content\": \"Rec Two\"}}}}}"
+        "    ]}}"
+        "  }}"
+        "}";
+    MediaItem det = {0};
+    media_list_init(&ml);
+    assert(innertube_parse_next_json(next_json, strlen(next_json), "main01", &det, &ml, err, sizeof(err)));
+    assert(strcmp(det.title, "Main Title") == 0);
+    assert(strcmp(det.author, "OwnerName") == 0);
+    assert(strcmp(det.author_id, "UCOWNER") == 0);
+    assert(strcmp(det.description, "Full description text here.") == 0);
+    assert(ml.count == 2);
+    assert(strcmp(ml.items[0].id, "rec01") == 0);
+    assert(strcmp(ml.items[1].id, "rec02") == 0);
+    media_item_free_fields(&det);
+    media_list_free(&ml);
+}
+
+static void test_rss_and_feed_filtering(void) {
+    const char *xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<feed>"
+        "  <entry>"
+        "    <yt:videoId>newVid1</yt:videoId>"
+        "    <title>New &amp; Shiny &lt;1&gt;</title>"
+        "    <author><name>Ch&#39;s Name</name></author>"
+        "    <yt:channelId>UC_A</yt:channelId>"
+        "    <published>2026-07-08T10:00:00+00:00</published>"
+        "    <media:group>"
+        "      <media:description>Desc &quot;A&quot;</media:description>"
+        "      <media:thumbnail url=\"https://i.ytimg.com/vi/newVid1/hqdefault.jpg\"/>"
+        "      <media:community><media:statistics views=\"4200\"/></media:community>"
+        "    </media:group>"
+        "  </entry>"
+        "  <entry>"
+        "    <yt:videoId>oldVid2</yt:videoId>"
+        "    <title>Old Video</title>"
+        "    <author><name>Ch B</name></author>"
+        "    <yt:channelId>UC_B</yt:channelId>"
+        "    <published>2026-01-01T00:00:00+00:00</published>"
+        "  </entry>"
+        "  <entry>"
+        "    <yt:videoId>newerVid3</yt:videoId>"
+        "    <title>Newer Video</title>"
+        "    <author><name>Ch C</name></author>"
+        "    <yt:channelId>UC_C</yt:channelId>"
+        "    <published>2026-07-09T10:00:00+00:00</published>"
+        "  </entry>"
+        "  <entry>"
+        "    <yt:videoId>newVid1</yt:videoId>"
+        "    <title>Duplicate</title>"
+        "    <published>2026-07-08T10:00:00+00:00</published>"
+        "  </entry>"
+        "</feed>";
+
+    MediaList ml;
+    media_list_init(&ml);
+    assert(innertube_parse_rss_xml(xml, strlen(xml), &ml, 15));
+    assert(ml.count == 4);
+    assert(strcmp(ml.items[0].title, "New & Shiny <1>") == 0);
+    assert(strcmp(ml.items[0].author, "Ch's Name") == 0);
+    assert(strcmp(ml.items[0].description, "Desc \"A\"") == 0);
+    assert(strcmp(ml.items[0].view_count_text, "4200 views") == 0);
+
+    int64_t now_ep = 0;
+    assert(tt_parse_iso8601_utc("2026-07-10T00:00:00Z", &now_ep));
+    int64_t max_age = 0;
+    assert(tt_parse_age_seconds("1 month", &max_age));
+
+    innertube_filter_and_sort_feed(&ml, now_ep, max_age);
+    assert(ml.count == 2);
+    assert(strcmp(ml.items[0].id, "newerVid3") == 0);
+    assert(strcmp(ml.items[1].id, "newVid1") == 0);
+    media_list_free(&ml);
+}
+
+static void test_config_theme_and_keybindings(void) {
+    /* Load sample custom theme directly (has trailing comma!) */
+    Theme custom_theme;
+    theme_init_builtin(&custom_theme, "yuuka");
+    assert(theme_load_file(&custom_theme, "examples/sample_theme.json"));
+    assert(custom_theme.base.fg.r == 92 && custom_theme.base.fg.g == 59 && custom_theme.base.fg.b == 72);
+    assert(custom_theme.base.bg.r == 217 && custom_theme.base.bg.g == 136 && custom_theme.base.bg.b == 155);
+
+    /* Temporary config directory */
+    char tmpdir[] = "/tmp/tuitube_test_cfg_XXXXXX";
+    assert(mkdtemp(tmpdir) != NULL);
+
+    char cfg_file[256];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+    const char *cfg_json =
+        "{\n"
+        "  // comment allowed\n"
+        "  \"font_size\": 99,\n"
+        "  \"thumb_size\": 108,\n"
+        "  \"playlist_width\": 420,\n"
+        "  \"theme\": \"dark\",\n"
+        "  \"max_feed_age\": \"2 weeks\",\n"
+        "  \"key_bindings\": [\n"
+        "    {\"action\": \"set_light_theme\", \"mod\": \"\", \"key\": \"F2\"},\n"
+        "    {\"action\": \"clear_thumbnail_cache\", \"mod\": \"CTRL-ALT\", \"key\": \"C\"},\n"
+        "  ],\n"
+        "}\n";
+    assert(tt_write_file_atomic(cfg_file, cfg_json, strlen(cfg_json)));
+
+    TuiTubeConfig cfg;
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.font_size == 48); /* clamped */
+    assert(cfg.thumb_size == 108);
+    assert(cfg.playlist_width == 420);
+    assert(strcmp(cfg.theme_name, "dark") == 0);
+    assert(cfg.max_feed_age_sec == 14 * 86400);
+
+    assert(config_match_keybinding(&cfg, 0, XKB_KEY_F2) == ACT_SET_LIGHT_THEME);
+    assert(config_match_keybinding(&cfg, TT_MOD_CTRL | TT_MOD_ALT, XKB_KEY_c) == ACT_CLEAR_THUMBNAIL_CACHE);
+    assert(config_match_keybinding(&cfg, TT_MOD_CTRL, XKB_KEY_q) == ACT_QUIT);
+
+    config_free(&cfg);
+    unlink(cfg_file);
+    rmdir(tmpdir);
+}
+
+static void test_player_format_mapping(void) {
+    char out[512];
+
+    assert(player_map_video_format("1080p60", false, false, out, sizeof(out)));
+    assert(strstr(out, "height<=1080") != NULL);
+    assert(strstr(out, "fps<=60") != NULL);
+    assert(strstr(out, "[dynamic_range!=HDR]") != NULL);
+    assert(strstr(out, "[vcodec^=avc1]") != NULL);
+
+    assert(player_map_video_format("720p_vp9", true, false, out, sizeof(out)));
+    assert(strstr(out, "height<=720") != NULL);
+    assert(strstr(out, "fps<=30") != NULL);
+    assert(strstr(out, "dynamic_range") == NULL);
+    assert(strstr(out, "[vcodec^=vp9]") != NULL);
+
+    assert(player_map_video_format("2160p60_av1", false, true, out, sizeof(out)));
+    assert(strstr(out, "height<=2160") != NULL);
+    assert(strstr(out, "vcodec") == NULL);
+
+    assert(player_map_video_format("bestvideo[height<=480]/best", false, false, out, sizeof(out)));
+    assert(strcmp(out, "bestvideo[height<=480]/best") == 0);
+}
+
+static void test_model_favlist_and_history_persistence(void) {
+    /* Load favlist containing [null] entries cleanly */
+    char null_fav_path[] = "/tmp/tuitube_test_fav_null.json";
+    const char *null_json = "[\n  null\n]\n";
+    assert(tt_write_file_atomic(null_fav_path, null_json, strlen(null_json)));
+    FavoriteList fl;
+    favlist_init(&fl);
+    assert(favlist_load(&fl, null_fav_path));
+    assert(fl.count == 0);
+    unlink(null_fav_path);
+
+    FavoriteItem f1 = {.kind = ITEM_CHANNEL, .title = "Ch One", .thumbnail_url = "https://x/1.jpg"};
+    snprintf(f1.id, sizeof(f1.id), "UC123");
+    assert(favlist_add(&fl, &f1));
+    assert(favlist_contains(&fl, "UC123"));
+
+    char fav_path[] = "/tmp/tuitube_test_fav.json";
+    assert(favlist_save(&fl, fav_path));
+    favlist_free(&fl);
+
+    favlist_init(&fl);
+    assert(favlist_load(&fl, fav_path));
+    assert(fl.count == 1 && strcmp(fl.items[0].id, "UC123") == 0);
+    assert(favlist_remove(&fl, "UC123"));
+    assert(!favlist_contains(&fl, "UC123"));
+    favlist_free(&fl);
+    unlink(fav_path);
+
+    /* History deduplication & round-trip */
+    HistoryList hl;
+    history_init(&hl);
+    MediaItem v1 = {.kind = ITEM_VIDEO, .title = "First"};
+    snprintf(v1.id, sizeof(v1.id), "vidA");
+    MediaItem v2 = {.kind = ITEM_VIDEO, .title = "Second"};
+    snprintf(v2.id, sizeof(v2.id), "vidB");
+
+    assert(history_record(&hl, &v1, 100));
+    assert(history_record(&hl, &v2, 200));
+    assert(history_record(&hl, &v1, 300)); /* moves vidA to front */
+    assert(hl.count == 2);
+    assert(strcmp(hl.items[0].video_id, "vidA") == 0);
+    assert(hl.items[0].watched_at == 300);
+    assert(history_contains(&hl, "vidB"));
+
+    char hist_path[] = "/tmp/tuitube_test_hist.json";
+    assert(history_save(&hl, hist_path));
+    history_free(&hl);
+
+    history_init(&hl);
+    assert(history_load(&hl, hist_path));
+    assert(hl.count == 2 && strcmp(hl.items[0].video_id, "vidA") == 0);
+    history_free(&hl);
+    unlink(hist_path);
+}
+
+static void test_image_decoding_and_mascot(void) {
+    /* Corrupt bytes must return false without aborting */
+    const uint8_t garbage[] = {0xFF, 0xD8, 0x00, 0x01, 0x02, 0x03};
+    ImageBuffer buf;
+    assert(!image_decode_bytes(garbage, sizeof(garbage), &buf));
+
+    const uint8_t png_bad[] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00};
+    assert(!image_decode_bytes(png_bad, sizeof(png_bad), &buf));
+
+    /* Generate a valid 2x2 PNG via Cairo and verify round-trip decoding */
+    char png_path[] = "/tmp/tuitube_test_icon.png";
+    cairo_surface_t *gen = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 2, 2);
+    assert(cairo_surface_write_to_png(gen, png_path) == CAIRO_STATUS_SUCCESS);
+    cairo_surface_destroy(gen);
+
+    cairo_surface_t *surf = image_load_cairo_file(png_path);
+    assert(surf != NULL);
+    assert(cairo_image_surface_get_width(surf) == 2);
+    assert(cairo_image_surface_get_height(surf) == 2);
+    cairo_surface_destroy(surf);
+    unlink(png_path);
+}
+
+static void assert_theme_wcag_aa(const char *name) {
+    Theme th;
+    theme_init_builtin(&th, name);
+    assert(theme_contrast_ratio(th.base.fg, th.base.bg) >= 4.5);
+    assert(theme_contrast_ratio(th.text_normal.fg, th.text_normal.bg) >= 4.5);
+    assert(theme_contrast_ratio(th.text_hover.fg, th.text_hover.bg) >= 4.5);
+    assert(theme_contrast_ratio(th.text_pressed.fg, th.text_pressed.bg) >= 4.5);
+    assert(theme_contrast_ratio(th.text_selected.fg, th.text_selected.bg) >= 4.5);
+    assert(theme_contrast_ratio(th.elem_normal.fg, th.elem_normal.bg) >= 4.5);
+    assert(theme_contrast_ratio(th.elem_hover.fg, th.elem_hover.bg) >= 4.5);
+    assert(theme_contrast_ratio(th.elem_pressed.fg, th.elem_pressed.bg) >= 4.5);
+    assert(theme_contrast_ratio(th.elem_selected.fg, th.elem_selected.bg) >= 4.5);
+    assert(theme_contrast_ratio(th.scrollbar_normal.fg, th.scrollbar_normal.bg) >= 3.0);
+    assert(theme_contrast_ratio(th.scrollbar_hover.fg, th.scrollbar_hover.bg) >= 3.0);
+    assert(theme_contrast_ratio(th.scrollbar_pressed.fg, th.scrollbar_pressed.bg) >= 3.0);
+    assert(theme_contrast_ratio(th.scrollbar_selected.fg, th.scrollbar_selected.bg) >= 3.0);
+}
+
+static void test_wcag_themes_and_default_dark(void) {
+    assert_theme_wcag_aa("dark");
+    assert_theme_wcag_aa("light");
+    assert_theme_wcag_aa("yuuka");
+
+    /* Missing config directory defaults to "dark" */
+    char tmpdir[] = "/tmp/tuitube_test_def_XXXXXX";
+    assert(mkdtemp(tmpdir) != NULL);
+    TuiTubeConfig cfg;
+    assert(config_load(&cfg, tmpdir));
+    assert(strcmp(cfg.theme_name, "dark") == 0);
+    assert(cfg.theme.base.bg.r == 15 && cfg.theme.base.bg.g == 17 && cfg.theme.base.bg.b == 23);
+
+    /* UI scale clamping */
+    assert(config_effective_ui_scale(NULL) == 1.0);
+    cfg.scale = 0.0;  assert(config_effective_ui_scale(&cfg) == 1.0);
+    cfg.scale = 0.2;  assert(config_effective_ui_scale(&cfg) == 0.5);
+    cfg.scale = 1.25; assert(config_effective_ui_scale(&cfg) == 1.25);
+    cfg.scale = 5.0;  assert(config_effective_ui_scale(&cfg) == 3.0);
+
+    config_free(&cfg);
+    rmdir(tmpdir);
+}
+
+static void test_new_keybindings_and_formatting(void) {
+    TuiTubeConfig cfg;
+    config_init_defaults(&cfg);
+
+    xkb_keysym_t qsym = XKB_KEY_NoSymbol;
+    assert(config_key_from_string("?", &qsym) && qsym == XKB_KEY_question);
+    assert(config_action_from_string("navigate_back") == ACT_NAV_BACK);
+    assert(config_action_from_string("toggle_help") == ACT_TOGGLE_HELP);
+
+    assert(config_match_keybinding(&cfg, TT_MOD_ALT, XKB_KEY_Left) == ACT_NAV_BACK);
+    assert(config_match_keybinding(&cfg, 0, XKB_KEY_BackSpace) == ACT_NAV_BACK);
+    assert(config_match_keybinding(&cfg, 0, XKB_KEY_F1) == ACT_TOGGLE_HELP);
+    assert(config_match_keybinding(&cfg, 0, XKB_KEY_question) == ACT_TOGGLE_HELP);
+    assert(config_match_keybinding(&cfg, TT_MOD_SHIFT, XKB_KEY_question) == ACT_TOGGLE_HELP);
+
+    char out[64];
+    assert(config_format_action_shortcut(&cfg, ACT_SHOW_FAVORITES, out, sizeof(out)));
+    assert(strcmp(out, "Ctrl+F") == 0);
+    assert(config_format_action_shortcut(&cfg, ACT_NAV_BACK, out, sizeof(out)));
+    assert(strcmp(out, "Alt+Left") == 0);
+    assert(config_format_action_shortcut(&cfg, ACT_TOGGLE_HELP, out, sizeof(out)));
+    assert(strcmp(out, "F1") == 0);
+    assert(config_format_action_shortcut(&cfg, ACT_FOCUS_SEARCH_INPUT, out, sizeof(out)));
+    assert(strcmp(out, "/") == 0);
+    assert(config_format_action_shortcut(&cfg, ACT_PLAY_VIDEO, out, sizeof(out)));
+    assert(strcmp(out, "Enter") == 0);
+    assert(!config_format_action_shortcut(&cfg, ACT_VIEW_USER_VIDEOS, out, sizeof(out)));
+    assert(out[0] == '\0');
+    assert(!config_format_action_shortcut(&cfg, ACT_NONE, out, sizeof(out)));
+
+    config_free(&cfg);
+}
+
+static void test_nav_stack_push_pop_and_eviction(void) {
+    NavStack ns;
+    nav_stack_init(&ns);
+    assert(!nav_stack_can_pop(&ns));
+
+    for (int i = 0; i < NAV_STACK_MAX + 2; i++) {
+        NavEntry snap = {0};
+        media_list_init(&snap.list);
+        snap.list.heading = tt_asprintf("Heading %d", i);
+        snap.list.continuation_token = tt_asprintf("tok_%d", i);
+
+        MediaItem it = {0};
+        it.kind = ITEM_VIDEO;
+        snprintf(it.id, sizeof(it.id), "vid_%d", i);
+        it.title = tt_asprintf("Title %d", i);
+        media_list_append_move(&snap.list, &it);
+
+        snap.selected_idx = i;
+        snap.scroll_y = (double)i * 12.5;
+        snap.view_mode = i % 3;
+        snap.query = tt_asprintf("query_%d", i);
+        snap.heading = tt_asprintf("Heading %d", i);
+
+        assert(nav_stack_push(&ns, &snap));
+        nav_entry_free_fields(&snap);
+    }
+
+    assert(ns.count == NAV_STACK_MAX);
+    assert(nav_stack_can_pop(&ns));
+
+    /* Entries 0 and 1 were evicted; popping yields 17 down to 2 */
+    for (int expected = NAV_STACK_MAX + 1; expected >= 2; expected--) {
+        NavEntry popped = {0};
+        assert(nav_stack_pop(&ns, &popped));
+        assert(popped.selected_idx == expected);
+        assert(popped.list.count == 1);
+        char exp_id[32];
+        snprintf(exp_id, sizeof(exp_id), "vid_%d", expected);
+        assert(strcmp(popped.list.items[0].id, exp_id) == 0);
+        nav_entry_free_fields(&popped);
+    }
+
+    assert(!nav_stack_can_pop(&ns));
+    assert(ns.count == 0);
+    nav_stack_free(&ns);
+}
+
+int main(void) {
+    RUN_TEST(test_util_utf8_and_entities);
+    RUN_TEST(test_search_params_encoding);
+    RUN_TEST(test_url_parsing);
+    RUN_TEST(test_innertube_search_browse_next_json);
+    RUN_TEST(test_rss_and_feed_filtering);
+    RUN_TEST(test_config_theme_and_keybindings);
+    RUN_TEST(test_player_format_mapping);
+    RUN_TEST(test_model_favlist_and_history_persistence);
+    RUN_TEST(test_image_decoding_and_mascot);
+    RUN_TEST(test_wcag_themes_and_default_dark);
+    RUN_TEST(test_new_keybindings_and_formatting);
+    RUN_TEST(test_nav_stack_push_pop_and_eviction);
+
+    printf("\nAll %d tests passed!\n", g_tests_run);
+    return 0;
+}

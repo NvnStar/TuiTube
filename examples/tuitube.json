@@ -1,0 +1,30 @@
+{
+  // TuiTube sample configuration
+  "scale": 0.0,
+  "font": "",
+  "font_size": 13,
+  "thumb_size": 72,
+  "playlist_width": 380,
+  "player_path": "mpv",
+  "video_format": "1080p60",
+  "sub_language": "en",
+  "theme": "dark",
+  "theme_path": "",
+  "mascot": "",
+  "single_click_select": false,
+  "show_extra_metadata": false,
+  "infinite_scroll": false,
+  "save_history": true,
+  "dim_watched_videos": true,
+  "feed_use_rss": true,
+  "max_feed_videos_per_channel": 15,
+  "max_feed_age": "1 month",
+  "allow_hdr": false,
+  "all_codecs": false,
+  "key_bindings": [
+    {"action": "set_light_theme", "mod": "", "key": "F2"},
+    {"action": "set_dark_theme", "mod": "", "key": "F3"},
+    {"action": "set_yuuka_theme", "mod": "", "key": "F4"},
+    {"action": "clear_thumbnail_cache", "mod": "CTRL-ALT", "key": "C"}
+  ]
+}
