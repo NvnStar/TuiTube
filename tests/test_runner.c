@@ -89,6 +89,43 @@ static void test_rmdir(const char *path) {
 #endif
 }
 
+static bool test_same_file_path(const char *a, const char *b) {
+    if (!a || !b) return false;
+#ifdef _WIN32
+    wchar_t *wa = tt_utf8_to_wide(a);
+    wchar_t *wb = tt_utf8_to_wide(b);
+    if (!wa || !wb) {
+        free(wa);
+        free(wb);
+        return false;
+    }
+    HANDLE ha = CreateFileW(wa, 0,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hb = CreateFileW(wb, 0,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wa);
+    free(wb);
+    if (ha == INVALID_HANDLE_VALUE || hb == INVALID_HANDLE_VALUE) {
+        if (ha != INVALID_HANDLE_VALUE) CloseHandle(ha);
+        if (hb != INVALID_HANDLE_VALUE) CloseHandle(hb);
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION ia, ib;
+    bool ok = GetFileInformationByHandle(ha, &ia) &&
+              GetFileInformationByHandle(hb, &ib) &&
+              ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber &&
+              ia.nFileIndexHigh == ib.nFileIndexHigh &&
+              ia.nFileIndexLow == ib.nFileIndexLow;
+    CloseHandle(ha);
+    CloseHandle(hb);
+    return ok;
+#else
+    return strcmp(a, b) == 0;
+#endif
+}
+
 #define RUN_TEST(fn) do { \
     printf("Running %-42s ... ", #fn); \
     fflush(stdout); \
@@ -1790,7 +1827,7 @@ static void test_ytdlp_path_resolution_and_mpv_opts(void) {
     char *resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
     assert(resolved != NULL);
     assert(needs_opt);
-    assert(strcmp(resolved, cfg_bin) == 0);
+    assert(test_same_file_path(resolved, cfg_bin));
 
     bool has_ytdlp = false;
     player_check_deps(&cfg, NULL, &has_ytdlp);
@@ -1819,7 +1856,7 @@ static void test_ytdlp_path_resolution_and_mpv_opts(void) {
     needs_opt = false;
     resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
     assert(resolved != NULL && needs_opt);
-    assert(strcmp(resolved, sub_custom) == 0);
+    assert(test_same_file_path(resolved, sub_custom));
     assert(player_build_mpv_ytdl_script_opt(&cfg, opt, sizeof(opt)));
     snprintf(expected_opt, sizeof(expected_opt), "ytdl_hook-ytdl_path=%s", resolved);
     assert(strcmp(opt, expected_opt) == 0);
@@ -1839,7 +1876,7 @@ static void test_ytdlp_path_resolution_and_mpv_opts(void) {
     needs_opt = false;
     resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
     assert(resolved != NULL && needs_opt);
-    assert(strcmp(resolved, sub_std) == 0);
+    assert(test_same_file_path(resolved, sub_std));
     free(resolved);
 
     /* 5. Relative ytdlp_path under <config_dir> */
@@ -1852,7 +1889,7 @@ static void test_ytdlp_path_resolution_and_mpv_opts(void) {
     needs_opt = false;
     resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
     assert(resolved != NULL && needs_opt);
-    assert(strcmp(resolved, sub_custom) == 0);
+    assert(test_same_file_path(resolved, sub_custom));
     free(resolved);
 
     test_unlink_file(sub_custom);
