@@ -3,38 +3,59 @@
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #define MAX_ACTIVE_DOWNLOADS 8
 
 typedef struct {
+#ifdef _WIN32
+    int active;
+    int done;
+    HANDLE proc_handle;
+    HANDLE out_read;
+    DWORD exit_code;
+#else
     volatile sig_atomic_t active;
     volatile sig_atomic_t done;
     volatile sig_atomic_t pid;
     volatile sig_atomic_t exit_status;
+    int out_fd;
+#endif
     char video_id[64];
     char title[128];
     char dir[PATH_MAX];
     char file_path[PATH_MAX];
-    int out_fd;
     double progress;
     char line_buf[1024];
     size_t line_len;
 } DownloadSlot;
 
+#ifdef _WIN32
+static DownloadSlot g_dl_slots[MAX_ACTIVE_DOWNLOADS] = {
+    {.progress = -1.0}, {.progress = -1.0}, {.progress = -1.0}, {.progress = -1.0},
+    {.progress = -1.0}, {.progress = -1.0}, {.progress = -1.0}, {.progress = -1.0},
+};
+#else
 static DownloadSlot g_dl_slots[MAX_ACTIVE_DOWNLOADS] = {
     {.out_fd = -1, .progress = -1.0}, {.out_fd = -1, .progress = -1.0},
     {.out_fd = -1, .progress = -1.0}, {.out_fd = -1, .progress = -1.0},
     {.out_fd = -1, .progress = -1.0}, {.out_fd = -1, .progress = -1.0},
     {.out_fd = -1, .progress = -1.0}, {.out_fd = -1, .progress = -1.0},
 };
+#endif
 
+#ifndef _WIN32
 static void sigchld_handler(int sig) {
     (void)sig;
     int saved_errno = errno;
@@ -52,14 +73,17 @@ static void sigchld_handler(int sig) {
     }
     errno = saved_errno;
 }
+#endif
 
 void player_install_sigchld_handler(void) {
+#ifndef _WIN32
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigchld_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa, NULL);
+#endif
 }
 
 bool player_map_video_format(const char *video_format, bool allow_hdr, bool all_codecs,
@@ -116,17 +140,22 @@ bool player_map_video_format(const char *video_format, bool allow_hdr, bool all_
 
 static bool is_vlc_path(const char *player_path) {
     if (!player_path) return false;
-    const char *base = strrchr(player_path, '/');
-    base = base ? base + 1 : player_path;
+    const char *slash = strrchr(player_path, '/');
+    const char *bslash = strrchr(player_path, '\\');
+    const char *sep = slash;
+    if (bslash && (!sep || bslash > sep)) sep = bslash;
+    const char *base = sep ? sep + 1 : player_path;
     return tt_strcasecmp(base, "vlc") == 0 || tt_strcasecmp(base, "vlc.exe") == 0;
 }
 
+#ifndef _WIN32
 static bool make_cloexec_pipe(int fds[2]) {
     if (pipe(fds) != 0) return false;
     fcntl(fds[0], F_SETFD, FD_CLOEXEC);
     fcntl(fds[1], F_SETFD, FD_CLOEXEC);
     return true;
 }
+#endif
 
 bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
                    char *err_buf, size_t err_cap) {
@@ -141,12 +170,6 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
 
     const char *title = (video->title && video->title[0]) ? video->title : video->id;
 
-    int err_pipe[2];
-    if (!make_cloexec_pipe(err_pipe)) {
-        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to create pipe");
-        return false;
-    }
-
     char ytdl_fmt[512];
     player_map_video_format(cfg->video_format, cfg->allow_hdr, cfg->all_codecs,
                             ytdl_fmt, sizeof(ytdl_fmt));
@@ -157,6 +180,72 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
     char *arg_slang = (cfg->sub_language && cfg->sub_language[0])
                           ? tt_asprintf("--slang=%s", cfg->sub_language)
                           : NULL;
+
+#ifdef _WIN32
+    char *cmdline = NULL;
+    if (is_vlc_path(player)) {
+        const char *argv_vlc[] = {player, arg_title_vlc, url, NULL};
+        cmdline = tt_win32_build_cmdline(argv_vlc);
+    } else {
+        const char *argv_mpv[8];
+        int idx = 0;
+        argv_mpv[idx++] = player;
+        argv_mpv[idx++] = "--ytdl=yes";
+        argv_mpv[idx++] = arg_fmt;
+        argv_mpv[idx++] = arg_title_mpv;
+        if (arg_slang) argv_mpv[idx++] = arg_slang;
+        argv_mpv[idx++] = url;
+        argv_mpv[idx] = NULL;
+        cmdline = tt_win32_build_cmdline(argv_mpv);
+    }
+
+    free(arg_fmt);
+    free(arg_title_mpv);
+    free(arg_title_vlc);
+    free(arg_slang);
+
+    if (!cmdline) {
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Out of memory");
+        return false;
+    }
+
+    wchar_t *wcmd = tt_utf8_to_wide(cmdline);
+    free(cmdline);
+    if (!wcmd) {
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Out of memory");
+        return false;
+    }
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+
+    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT,
+                             NULL, NULL, &si, &pi);
+    free(wcmd);
+    if (!ok) {
+        if (err_buf && err_cap) {
+            snprintf(err_buf, err_cap, "Failed to launch player: %s", player);
+        }
+        return false;
+    }
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+#else
+    int err_pipe[2];
+    if (!make_cloexec_pipe(err_pipe)) {
+        free(arg_fmt);
+        free(arg_title_mpv);
+        free(arg_title_vlc);
+        free(arg_slang);
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to create pipe");
+        return false;
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -231,6 +320,7 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
     }
 
     return true;
+#endif
 }
 
 bool player_is_downloading(const char *video_id) {
@@ -360,33 +450,72 @@ static bool process_download_line(DownloadSlot *slot, const char *line) {
     return false;
 }
 
+static bool feed_slot_bytes(DownloadSlot *slot, const char *buf, size_t n) {
+    bool changed = false;
+    for (size_t k = 0; k < n; k++) {
+        char c = buf[k];
+        if (c == '\n' || c == '\r') {
+            slot->line_buf[slot->line_len] = '\0';
+            if (process_download_line(slot, slot->line_buf)) {
+                changed = true;
+            }
+            slot->line_len = 0;
+        } else if (slot->line_len + 1 < sizeof(slot->line_buf)) {
+            slot->line_buf[slot->line_len++] = c;
+        }
+    }
+    return changed;
+}
+
+static bool flush_slot_line(DownloadSlot *slot) {
+    if (slot->line_len == 0) return false;
+    slot->line_buf[slot->line_len] = '\0';
+    bool changed = process_download_line(slot, slot->line_buf);
+    slot->line_len = 0;
+    return changed;
+}
+
 static bool drain_slot_stdout(DownloadSlot *slot) {
+#ifdef _WIN32
+    if (!slot || slot->out_read == NULL) return false;
+    bool changed = false;
+    char buf[512];
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(slot->out_read, NULL, 0, NULL, &avail, NULL)) {
+            if (flush_slot_line(slot)) changed = true;
+            CloseHandle(slot->out_read);
+            slot->out_read = NULL;
+            break;
+        }
+        if (avail == 0) {
+            break;
+        }
+        DWORD to_read = avail < (DWORD)sizeof(buf) ? avail : (DWORD)sizeof(buf);
+        DWORD nread = 0;
+        if (!ReadFile(slot->out_read, buf, to_read, &nread, NULL) || nread == 0) {
+            if (flush_slot_line(slot)) changed = true;
+            CloseHandle(slot->out_read);
+            slot->out_read = NULL;
+            break;
+        }
+        if (feed_slot_bytes(slot, buf, (size_t)nread)) {
+            changed = true;
+        }
+    }
+    return changed;
+#else
     if (!slot || slot->out_fd < 0) return false;
     bool changed = false;
     char buf[512];
     for (;;) {
         ssize_t n = read(slot->out_fd, buf, sizeof(buf));
         if (n > 0) {
-            for (ssize_t k = 0; k < n; k++) {
-                char c = buf[k];
-                if (c == '\n' || c == '\r') {
-                    slot->line_buf[slot->line_len] = '\0';
-                    if (process_download_line(slot, slot->line_buf)) {
-                        changed = true;
-                    }
-                    slot->line_len = 0;
-                } else if (slot->line_len + 1 < sizeof(slot->line_buf)) {
-                    slot->line_buf[slot->line_len++] = c;
-                }
+            if (feed_slot_bytes(slot, buf, (size_t)n)) {
+                changed = true;
             }
         } else if (n == 0) {
-            if (slot->line_len > 0) {
-                slot->line_buf[slot->line_len] = '\0';
-                if (process_download_line(slot, slot->line_buf)) {
-                    changed = true;
-                }
-                slot->line_len = 0;
-            }
+            if (flush_slot_line(slot)) changed = true;
             close(slot->out_fd);
             slot->out_fd = -1;
             break;
@@ -396,16 +525,25 @@ static bool drain_slot_stdout(DownloadSlot *slot) {
         }
     }
     return changed;
+#endif
 }
 
 bool player_poll_download_progress(void) {
     bool changed = false;
     for (int i = 0; i < MAX_ACTIVE_DOWNLOADS; i++) {
+#ifdef _WIN32
+        if (g_dl_slots[i].active == 1 && g_dl_slots[i].out_read != NULL) {
+            if (drain_slot_stdout(&g_dl_slots[i])) {
+                changed = true;
+            }
+        }
+#else
         if (g_dl_slots[i].active == 1 && g_dl_slots[i].out_fd >= 0) {
             if (drain_slot_stdout(&g_dl_slots[i])) {
                 changed = true;
             }
         }
+#endif
     }
     return changed;
 }
@@ -449,6 +587,100 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
         snprintf(out_dir_buf, out_dir_cap, "%s", dir);
     }
 
+    char ytdl_fmt[512];
+    player_map_video_format(cfg->video_format, cfg->allow_hdr, cfg->all_codecs,
+                            ytdl_fmt, sizeof(ytdl_fmt));
+
+    char url[128];
+    snprintf(url, sizeof(url), "https://www.youtube.com/watch?v=%s", video->id);
+
+#ifdef _WIN32
+    const char *argv[] = {
+        "yt-dlp",
+        "--no-playlist",
+        "--no-simulate",
+        "--progress",
+        "--newline",
+        "--progress-template",
+        "download:TT_DL:%(progress.downloaded_bytes)s:%(progress.total_bytes)s:%(progress.total_bytes_estimate)s:%(progress._percent_str)s",
+        "--print",
+        "after_move:TT_FILE:%(filepath)s",
+        "-f", ytdl_fmt,
+        "-P", dir,
+        "-o", "%(title).200B [%(id)s].%(ext)s",
+        "--",
+        url,
+        NULL
+    };
+    char *cmdline = tt_win32_build_cmdline(argv);
+    if (!cmdline) {
+        free(dir);
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Out of memory");
+        return false;
+    }
+    wchar_t *wcmd = tt_utf8_to_wide(cmdline);
+    free(cmdline);
+    if (!wcmd) {
+        free(dir);
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Out of memory");
+        return false;
+    }
+
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    HANDLE out_read = NULL, out_write = NULL;
+    if (!CreatePipe(&out_read, &out_write, &sa, 0)) {
+        free(wcmd);
+        free(dir);
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to create output pipe");
+        return false;
+    }
+    SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0);
+
+    HANDLE h_nul = CreateFileW(L"NUL", GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    SetEnvironmentVariableW(L"PYTHONUNBUFFERED", L"1");
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = out_write;
+    si.hStdError = out_write;
+    si.hStdInput = (h_nul != INVALID_HANDLE_VALUE) ? h_nul : NULL;
+
+    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                             NULL, NULL, &si, &pi);
+    free(wcmd);
+    CloseHandle(out_write);
+    if (h_nul != INVALID_HANDLE_VALUE) CloseHandle(h_nul);
+    if (!ok) {
+        CloseHandle(out_read);
+        free(dir);
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to launch yt-dlp");
+        return false;
+    }
+    CloseHandle(pi.hThread);
+
+    g_dl_slots[slot].proc_handle = pi.hProcess;
+    g_dl_slots[slot].exit_code = 0;
+    g_dl_slots[slot].done = 0;
+    snprintf(g_dl_slots[slot].video_id, sizeof(g_dl_slots[slot].video_id), "%s", video->id);
+    snprintf(g_dl_slots[slot].title, sizeof(g_dl_slots[slot].title), "%s", title);
+    snprintf(g_dl_slots[slot].dir, sizeof(g_dl_slots[slot].dir), "%s", dir);
+    g_dl_slots[slot].file_path[0] = '\0';
+    g_dl_slots[slot].out_read = out_read;
+    g_dl_slots[slot].progress = -1.0;
+    g_dl_slots[slot].line_len = 0;
+    g_dl_slots[slot].active = 1;
+
+    free(dir);
+    return true;
+#else
     int err_pipe[2];
     if (!make_cloexec_pipe(err_pipe)) {
         free(dir);
@@ -464,13 +696,6 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to create output pipe");
         return false;
     }
-
-    char ytdl_fmt[512];
-    player_map_video_format(cfg->video_format, cfg->allow_hdr, cfg->all_codecs,
-                            ytdl_fmt, sizeof(ytdl_fmt));
-
-    char url[128];
-    snprintf(url, sizeof(url), "https://www.youtube.com/watch?v=%s", video->id);
 
     sigset_t blk, oldmask;
     sigemptyset(&blk);
@@ -571,10 +796,55 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
 
     free(dir);
     return true;
+#endif
 }
 
 bool player_poll_download_event(DownloadEvent *out_ev) {
     if (!out_ev) return false;
+#ifdef _WIN32
+    for (int i = 0; i < MAX_ACTIVE_DOWNLOADS; i++) {
+        if (g_dl_slots[i].active == 1 && g_dl_slots[i].done == 0 &&
+            g_dl_slots[i].proc_handle != NULL) {
+            if (WaitForSingleObject(g_dl_slots[i].proc_handle, 0) == WAIT_OBJECT_0) {
+                DWORD ec = 1;
+                GetExitCodeProcess(g_dl_slots[i].proc_handle, &ec);
+                CloseHandle(g_dl_slots[i].proc_handle);
+                g_dl_slots[i].proc_handle = NULL;
+                g_dl_slots[i].exit_code = ec;
+                g_dl_slots[i].done = 1;
+            }
+        }
+    }
+
+    for (int i = 0; i < MAX_ACTIVE_DOWNLOADS; i++) {
+        if (g_dl_slots[i].active == 1 && g_dl_slots[i].done == 1) {
+            drain_slot_stdout(&g_dl_slots[i]);
+            if (g_dl_slots[i].out_read != NULL) {
+                CloseHandle(g_dl_slots[i].out_read);
+                g_dl_slots[i].out_read = NULL;
+            }
+            DWORD ec = g_dl_slots[i].exit_code;
+            memset(out_ev, 0, sizeof(*out_ev));
+            snprintf(out_ev->video_id, sizeof(out_ev->video_id), "%s", g_dl_slots[i].video_id);
+            snprintf(out_ev->title, sizeof(out_ev->title), "%s", g_dl_slots[i].title);
+            snprintf(out_ev->saved_path, sizeof(out_ev->saved_path), "%s",
+                     g_dl_slots[i].file_path[0] ? g_dl_slots[i].file_path : g_dl_slots[i].dir);
+            g_dl_slots[i].active = 0;
+            g_dl_slots[i].done = 0;
+            g_dl_slots[i].proc_handle = NULL;
+            g_dl_slots[i].exit_code = 0;
+            g_dl_slots[i].dir[0] = '\0';
+            g_dl_slots[i].file_path[0] = '\0';
+            g_dl_slots[i].progress = -1.0;
+            g_dl_slots[i].line_len = 0;
+
+            out_ev->ok = (ec == 0);
+            out_ev->exit_code = (int)ec;
+            return true;
+        }
+    }
+    return false;
+#else
     sigset_t blk, oldmask;
     sigemptyset(&blk);
     sigaddset(&blk, SIGCHLD);
@@ -625,10 +895,44 @@ bool player_poll_download_event(DownloadEvent *out_ev) {
 
     sigprocmask(SIG_SETMASK, &oldmask, NULL);
     return false;
+#endif
 }
 
 bool player_copy_wl_copy(const char *text) {
     if (!text) return false;
+#ifdef _WIN32
+    wchar_t *w = tt_utf8_to_wide(text);
+    if (!w) return false;
+    if (!OpenClipboard(NULL)) {
+        free(w);
+        return false;
+    }
+    EmptyClipboard();
+    size_t bytes = (wcslen(w) + 1u) * sizeof(wchar_t);
+    HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!hmem) {
+        CloseClipboard();
+        free(w);
+        return false;
+    }
+    void *dst = GlobalLock(hmem);
+    if (!dst) {
+        GlobalFree(hmem);
+        CloseClipboard();
+        free(w);
+        return false;
+    }
+    memcpy(dst, w, bytes);
+    GlobalUnlock(hmem);
+    free(w);
+    if (!SetClipboardData(CF_UNICODETEXT, hmem)) {
+        GlobalFree(hmem);
+        CloseClipboard();
+        return false;
+    }
+    CloseClipboard();
+    return true;
+#else
     int pfd[2];
     if (!make_cloexec_pipe(pfd)) return false;
 
@@ -665,4 +969,5 @@ bool player_copy_wl_copy(const char *text) {
     }
     close(pfd[1]);
     return true;
+#endif
 }

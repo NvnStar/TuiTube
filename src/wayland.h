@@ -1,10 +1,11 @@
 #ifndef TUITUBE_WAYLAND_H
 #define TUITUBE_WAYLAND_H
 
+#include "tt_keysyms.h"
+
 #include <cairo.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <xkbcommon/xkbcommon.h>
 
 typedef enum {
     TT_CURSOR_DEFAULT = 0,
@@ -93,6 +94,9 @@ void wayland_ime_set_cursor_rect(WaylandApp *wl, int32_t x, int32_t y,
                                  int32_t w, int32_t h);
 
 int wayland_poll_once(WaylandApp *wl, int extra_fd, int timeout_ms, bool *out_extra_ready);
+#ifdef _WIN32
+int win32_poll_once(WaylandApp *wl, void *extra_event, int timeout_ms, bool *out_extra_ready);
+#endif
 void wayland_render_if_needed(WaylandApp *wl);
 
 #endif

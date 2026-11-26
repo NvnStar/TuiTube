@@ -4,8 +4,13 @@
 #include "config.h"
 #include "model.h"
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 typedef struct {
     bool ok;

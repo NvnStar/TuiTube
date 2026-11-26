@@ -5,8 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <yyjson.h>
 
 #define INNERTUBE_CLIENT_VER "2.20260708.00.00"
@@ -1475,49 +1473,19 @@ static bool innertube_post(CURL *curl, const char *endpoint, yyjson_mut_doc *doc
 
 static bool search_ytdlp_fallback(const char *query, MediaList *out_list) {
     if (!query || !query[0]) return false;
-    int pfd[2];
-    if (pipe(pfd) != 0) return false;
-
     char *search_arg = tt_asprintf("ytsearch20:%s", query);
-    if (!search_arg) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return false;
-    }
+    if (!search_arg) return false;
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        free(search_arg);
-        close(pfd[0]);
-        close(pfd[1]);
-        return false;
-    }
-    if (pid == 0) {
-        close(pfd[0]);
-        dup2(pfd[1], STDOUT_FILENO);
-        close(pfd[1]);
-        char *argv[] = {"yt-dlp", "--flat-playlist", "--dump-single-json", search_arg, NULL};
-        execvp("yt-dlp", argv);
-        _exit(127);
-    }
-
-    close(pfd[1]);
-    free(search_arg);
-
+    const char *argv[] = {
+        "yt-dlp", "--flat-playlist", "--dump-single-json", search_arg, NULL
+    };
     StrBuf sb;
     sb_init(&sb);
-    char buf[8192];
-    ssize_t n;
-    while ((n = read(pfd[0], buf, sizeof(buf))) > 0) {
-        if (sb.len + (size_t)n > INNERTUBE_MAX_JSON) break;
-        sb_append_n(&sb, buf, (size_t)n);
-    }
-    close(pfd[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
+    bool spawn_ok = tt_spawn_capture_stdout(argv, INNERTUBE_MAX_JSON, &sb);
+    free(search_arg);
 
     bool ok = false;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && sb.len > 0) {
+    if (spawn_ok && sb.len > 0) {
         ok = innertube_parse_ytdlp_json(sb.data, sb.len, out_list);
     }
     sb_free(&sb);

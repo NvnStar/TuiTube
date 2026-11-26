@@ -4,9 +4,20 @@
 #include "ui.h"
 #include "wayland.h"
 
-#include <signal.h>
 #include <stdio.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+
+static void attach_parent_console(void) {
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        (void)freopen("CONOUT$", "w", stdout);
+        (void)freopen("CONOUT$", "w", stderr);
+    }
+}
+#else
+#include <signal.h>
 
 static volatile sig_atomic_t g_sig_stop = 0;
 
@@ -14,14 +25,20 @@ static void handle_stop_sig(int sig) {
     (void)sig;
     g_sig_stop = 1;
 }
+#endif
 
 static void print_help(const char *prog) {
+#ifdef _WIN32
+    const char *tagline = "Lightweight native Windows YouTube client.";
+#else
+    const char *tagline = "Lightweight native Wayland YouTube client.";
+#endif
     printf("Usage: %s [OPTIONS]\n\n"
-           "Lightweight native Wayland YouTube client.\n\n"
+           "%s\n\n"
            "Options:\n"
            "  --config-dir <dir>   Override configuration directory\n"
            "  -h, --help           Show this help message and exit\n",
-           prog);
+           prog, tagline);
 }
 
 static bool standalone_play_video(void *play_ctx, const TuiTubeConfig *cfg,
@@ -68,24 +85,35 @@ int main(int argc, char **argv) {
     const char *cli_config_dir = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+#ifdef _WIN32
+            attach_parent_console();
+#endif
             print_help(argv[0]);
             return 0;
         } else if (strcmp(argv[i], "--config-dir") == 0) {
             if (i + 1 >= argc) {
+#ifdef _WIN32
+                attach_parent_console();
+#endif
                 fprintf(stderr, "Error: --config-dir requires an argument\n");
                 return 1;
             }
             cli_config_dir = argv[++i];
         } else {
+#ifdef _WIN32
+            attach_parent_console();
+#endif
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_help(argv[0]);
             return 1;
         }
     }
 
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_stop_sig);
     signal(SIGTERM, handle_stop_sig);
+#endif
     player_install_sigchld_handler();
 
     if (!http_global_init()) {
@@ -121,6 +149,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+#ifdef _WIN32
+    void *notify_handle = app_notify_handle(&app);
+    while (!wayland_should_quit(wl)) {
+        app_poll_downloads(&app);
+        wayland_render_if_needed(wl);
+        bool extra_ready = false;
+        int pr = win32_poll_once(wl, notify_handle, 250, &extra_ready);
+        if (pr < 0) break;
+        if (extra_ready) {
+            app_process_async_results(&app);
+        }
+        app_poll_downloads(&app);
+    }
+#else
     int notify_fd = app_notify_fd(&app);
     while (!g_sig_stop && !wayland_should_quit(wl)) {
         app_poll_downloads(&app);
@@ -133,6 +175,7 @@ int main(int argc, char **argv) {
         }
         app_poll_downloads(&app);
     }
+#endif
 
     app_destroy(&app);
     wayland_destroy(wl);

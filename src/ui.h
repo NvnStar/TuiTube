@@ -5,12 +5,12 @@
 #include "image.h"
 #include "innertube.h"
 #include "model.h"
+#include "util.h"
 #include "wayland.h"
 
 #include <cairo.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <sys/types.h>
 
 typedef struct UiState UiState;
 

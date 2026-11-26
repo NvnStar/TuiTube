@@ -57,6 +57,7 @@ bool app_init(AppState *app, const char *cli_config_dir, WaylandApp *wl,
               AppPlayVideoFn play_fn, void *play_ctx, const char *player_display_name);
 void app_destroy(AppState *app);
 int app_notify_fd(const AppState *app);
+void *app_notify_handle(const AppState *app);
 void app_process_async_results(AppState *app);
 void app_poll_downloads(AppState *app);
 void app_release_hidden_resources(AppState *app);

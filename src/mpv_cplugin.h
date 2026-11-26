@@ -4,10 +4,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(__GNUC__) || defined(__clang__)
+#ifdef _WIN32
+#define TT_MPV_EXPORT __declspec(dllexport)
+#define TT_MPV_SELECTANY __declspec(selectany)
+#ifndef MPV_CPLUGIN_DYNAMIC_SYM
+#define MPV_CPLUGIN_DYNAMIC_SYM
+#endif
+#elif defined(__GNUC__) || defined(__clang__)
 #define TT_MPV_EXPORT __attribute__((visibility("default")))
+#define TT_MPV_SELECTANY
 #else
 #define TT_MPV_EXPORT
+#define TT_MPV_SELECTANY
 #endif
 
 #if defined(__has_include) && __has_include(<mpv/client.h>)
@@ -95,6 +103,62 @@ typedef struct mpv_event {
     void *data;
 } mpv_event;
 
+#ifdef MPV_CPLUGIN_DYNAMIC_SYM
+
+typedef unsigned long (*tt_pfn_mpv_client_api_version)(void);
+typedef const char *(*tt_pfn_mpv_error_string)(int error);
+typedef void (*tt_pfn_mpv_free)(void *data);
+typedef const char *(*tt_pfn_mpv_client_name)(mpv_handle *ctx);
+typedef void (*tt_pfn_mpv_free_node_contents)(mpv_node *node);
+typedef int (*tt_pfn_mpv_command)(mpv_handle *ctx, const char **args);
+typedef int (*tt_pfn_mpv_command_node)(mpv_handle *ctx, mpv_node *args, mpv_node *result);
+typedef int (*tt_pfn_mpv_command_ret)(mpv_handle *ctx, const char **args, mpv_node *result);
+typedef int (*tt_pfn_mpv_set_property)(mpv_handle *ctx, const char *name, mpv_format format, void *data);
+typedef int (*tt_pfn_mpv_set_property_string)(mpv_handle *ctx, const char *name, const char *data);
+typedef int (*tt_pfn_mpv_get_property)(mpv_handle *ctx, const char *name, mpv_format format, void *data);
+typedef char *(*tt_pfn_mpv_get_property_string)(mpv_handle *ctx, const char *name);
+typedef int (*tt_pfn_mpv_observe_property)(mpv_handle *mpv, uint64_t registered_reply_userdata,
+                                           const char *name, mpv_format format);
+typedef int (*tt_pfn_mpv_unobserve_property)(mpv_handle *mpv, uint64_t registered_reply_userdata);
+typedef mpv_event *(*tt_pfn_mpv_wait_event)(mpv_handle *ctx, double timeout);
+typedef void (*tt_pfn_mpv_set_wakeup_callback)(mpv_handle *ctx, void (*cb)(void *d), void *d);
+
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_client_api_version pfn_mpv_client_api_version = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_error_string pfn_mpv_error_string = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_free pfn_mpv_free = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_client_name pfn_mpv_client_name = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_free_node_contents pfn_mpv_free_node_contents = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_command pfn_mpv_command = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_command_node pfn_mpv_command_node = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_command_ret pfn_mpv_command_ret = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_set_property pfn_mpv_set_property = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_set_property_string pfn_mpv_set_property_string = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_get_property pfn_mpv_get_property = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_get_property_string pfn_mpv_get_property_string = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_observe_property pfn_mpv_observe_property = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_unobserve_property pfn_mpv_unobserve_property = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_wait_event pfn_mpv_wait_event = NULL;
+TT_MPV_SELECTANY TT_MPV_EXPORT tt_pfn_mpv_set_wakeup_callback pfn_mpv_set_wakeup_callback = NULL;
+
+#define mpv_client_api_version  pfn_mpv_client_api_version
+#define mpv_error_string        pfn_mpv_error_string
+#define mpv_free                pfn_mpv_free
+#define mpv_client_name         pfn_mpv_client_name
+#define mpv_free_node_contents  pfn_mpv_free_node_contents
+#define mpv_command             pfn_mpv_command
+#define mpv_command_node        pfn_mpv_command_node
+#define mpv_command_ret         pfn_mpv_command_ret
+#define mpv_set_property        pfn_mpv_set_property
+#define mpv_set_property_string pfn_mpv_set_property_string
+#define mpv_get_property        pfn_mpv_get_property
+#define mpv_get_property_string pfn_mpv_get_property_string
+#define mpv_observe_property    pfn_mpv_observe_property
+#define mpv_unobserve_property  pfn_mpv_unobserve_property
+#define mpv_wait_event          pfn_mpv_wait_event
+#define mpv_set_wakeup_callback pfn_mpv_set_wakeup_callback
+
+#else
+
 extern unsigned long mpv_client_api_version(void);
 extern const char *mpv_error_string(int error);
 extern void mpv_free(void *data);
@@ -112,6 +176,8 @@ extern int mpv_observe_property(mpv_handle *mpv, uint64_t registered_reply_userd
 extern int mpv_unobserve_property(mpv_handle *mpv, uint64_t registered_reply_userdata);
 extern mpv_event *mpv_wait_event(mpv_handle *ctx, double timeout);
 extern void mpv_set_wakeup_callback(mpv_handle *ctx, void (*cb)(void *d), void *d);
+
+#endif
 
 #endif
 

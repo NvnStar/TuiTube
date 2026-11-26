@@ -432,16 +432,21 @@ char *config_resolve_asset_path(const TuiTubeConfig *cfg, const char *rel_or_abs
 
 char *config_resolve_download_dir(const TuiTubeConfig *cfg) {
     const char *env_home = getenv("HOME");
+#ifdef _WIN32
+    if (!env_home || !env_home[0]) env_home = getenv("USERPROFILE");
+    if (!env_home || !env_home[0]) env_home = getenv("TEMP");
+#endif
     const char *home = (env_home && env_home[0]) ? env_home : "/tmp";
 
     if (cfg && cfg->download_dir && cfg->download_dir[0]) {
         if (strcmp(cfg->download_dir, "~") == 0) {
             return tt_strdup(home);
         }
-        if (strncmp(cfg->download_dir, "~/", 2) == 0) {
+        if (cfg->download_dir[0] == '~' &&
+            (cfg->download_dir[1] == '/' || cfg->download_dir[1] == '\\')) {
             return tt_path_join(home, cfg->download_dir + 2);
         }
-        if (cfg->download_dir[0] == '/') {
+        if (tt_is_abs_path(cfg->download_dir)) {
             return tt_strdup(cfg->download_dir);
         }
         return tt_path_join(cfg->config_dir, cfg->download_dir);
@@ -452,7 +457,7 @@ char *config_resolve_download_dir(const TuiTubeConfig *cfg) {
     }
 
     const char *xdg_dl = getenv("XDG_DOWNLOAD_DIR");
-    if (xdg_dl && xdg_dl[0] == '/') {
+    if (xdg_dl && tt_is_abs_path(xdg_dl)) {
         return tt_strdup(xdg_dl);
     }
     return tt_path_join(home, "Downloads");

@@ -8,13 +8,85 @@
 
 #include <assert.h>
 #include <math.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <poll.h>
 #include <unistd.h>
+#endif
 
 static int g_tests_run = 0;
+
+static void test_temp_base(char *out, size_t cap) {
+#ifdef _WIN32
+    wchar_t wtmp[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, wtmp);
+    if (n > 0 && n < MAX_PATH) {
+        char *utf8 = tt_wide_to_utf8(wtmp);
+        if (utf8) {
+            size_t len = strlen(utf8);
+            while (len > 1 && (utf8[len - 1] == '\\' || utf8[len - 1] == '/')) {
+                if (len == 3 && utf8[1] == ':') break;
+                utf8[--len] = '\0';
+            }
+            snprintf(out, cap, "%s", utf8);
+            free(utf8);
+            return;
+        }
+    }
+    snprintf(out, cap, ".");
+#else
+    snprintf(out, cap, "/tmp");
+#endif
+}
+
+static void test_make_temp_dir(const char *prefix, char *out, size_t cap) {
+#ifdef _WIN32
+    static unsigned long seq = 0;
+    char base[PATH_MAX];
+    test_temp_base(base, sizeof(base));
+    snprintf(out, cap, "%s/%s_%lu_%lu", base, prefix,
+             (unsigned long)GetCurrentProcessId(), ++seq);
+    assert(tt_mkdir_p(out, 0755));
+#else
+    snprintf(out, cap, "/tmp/%s_XXXXXX", prefix);
+    assert(mkdtemp(out) != NULL);
+#endif
+}
+
+static void test_make_temp_file(const char *name, char *out, size_t cap) {
+    char base[PATH_MAX];
+    test_temp_base(base, sizeof(base));
+    snprintf(out, cap, "%s/%s", base, name);
+}
+
+static void test_unlink_file(const char *path) {
+#ifdef _WIN32
+    wchar_t *w = tt_utf8_to_wide(path);
+    if (w) {
+        DeleteFileW(w);
+        free(w);
+    }
+#else
+    unlink(path);
+#endif
+}
+
+static void test_rmdir(const char *path) {
+#ifdef _WIN32
+    wchar_t *w = tt_utf8_to_wide(path);
+    if (w) {
+        RemoveDirectoryW(w);
+        free(w);
+    }
+#else
+    rmdir(path);
+#endif
+}
 
 #define RUN_TEST(fn) do { \
     printf("Running %-42s ... ", #fn); \
@@ -341,10 +413,10 @@ static void test_config_theme_and_keybindings(void) {
     assert(theme_contrast_ratio(custom_theme.text_normal.fg, custom_theme.text_normal.bg) >= 4.5);
 
     /* Temporary config directory */
-    char tmpdir[] = "/tmp/tuitube_test_cfg_XXXXXX";
-    assert(mkdtemp(tmpdir) != NULL);
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_cfg", tmpdir, sizeof(tmpdir));
 
-    char cfg_file[256];
+    char cfg_file[PATH_MAX + 32];
     snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
     const char *cfg_json =
         "{\n"
@@ -374,8 +446,8 @@ static void test_config_theme_and_keybindings(void) {
     assert(config_match_keybinding(&cfg, TT_MOD_CTRL, XKB_KEY_q) == ACT_QUIT);
 
     config_free(&cfg);
-    unlink(cfg_file);
-    rmdir(tmpdir);
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
 }
 
 static void test_player_format_mapping(void) {
@@ -403,21 +475,23 @@ static void test_player_format_mapping(void) {
 
 static void test_model_favlist_and_history_persistence(void) {
     /* Load favlist containing [null] entries cleanly */
-    char null_fav_path[] = "/tmp/tuitube_test_fav_null.json";
+    char null_fav_path[PATH_MAX];
+    test_make_temp_file("tuitube_test_fav_null.json", null_fav_path, sizeof(null_fav_path));
     const char *null_json = "[\n  null\n]\n";
     assert(tt_write_file_atomic(null_fav_path, null_json, strlen(null_json)));
     FavoriteList fl;
     favlist_init(&fl);
     assert(favlist_load(&fl, null_fav_path));
     assert(fl.count == 0);
-    unlink(null_fav_path);
+    test_unlink_file(null_fav_path);
 
     FavoriteItem f1 = {.kind = ITEM_CHANNEL, .title = "Ch One", .thumbnail_url = "https://x/1.jpg"};
     snprintf(f1.id, sizeof(f1.id), "UC123");
     assert(favlist_add(&fl, &f1));
     assert(favlist_contains(&fl, "UC123"));
 
-    char fav_path[] = "/tmp/tuitube_test_fav.json";
+    char fav_path[PATH_MAX];
+    test_make_temp_file("tuitube_test_fav.json", fav_path, sizeof(fav_path));
     assert(favlist_save(&fl, fav_path));
     favlist_free(&fl);
 
@@ -427,7 +501,7 @@ static void test_model_favlist_and_history_persistence(void) {
     assert(favlist_remove(&fl, "UC123"));
     assert(!favlist_contains(&fl, "UC123"));
     favlist_free(&fl);
-    unlink(fav_path);
+    test_unlink_file(fav_path);
 
     /* History deduplication & round-trip */
     HistoryList hl;
@@ -445,7 +519,8 @@ static void test_model_favlist_and_history_persistence(void) {
     assert(hl.items[0].watched_at == 300);
     assert(history_contains(&hl, "vidB"));
 
-    char hist_path[] = "/tmp/tuitube_test_hist.json";
+    char hist_path[PATH_MAX];
+    test_make_temp_file("tuitube_test_hist.json", hist_path, sizeof(hist_path));
     assert(history_save(&hl, hist_path));
     history_free(&hl);
 
@@ -453,7 +528,7 @@ static void test_model_favlist_and_history_persistence(void) {
     assert(history_load(&hl, hist_path));
     assert(hl.count == 2 && strcmp(hl.items[0].video_id, "vidA") == 0);
     history_free(&hl);
-    unlink(hist_path);
+    test_unlink_file(hist_path);
 }
 
 static void test_image_decoding_and_mascot(void) {
@@ -466,7 +541,8 @@ static void test_image_decoding_and_mascot(void) {
     assert(!image_decode_bytes(png_bad, sizeof(png_bad), &buf));
 
     /* Generate a valid 2x2 PNG via Cairo and verify round-trip decoding */
-    char png_path[] = "/tmp/tuitube_test_icon.png";
+    char png_path[PATH_MAX];
+    test_make_temp_file("tuitube_test_icon.png", png_path, sizeof(png_path));
     cairo_surface_t *gen = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 2, 2);
     assert(cairo_surface_write_to_png(gen, png_path) == CAIRO_STATUS_SUCCESS);
     cairo_surface_destroy(gen);
@@ -476,7 +552,7 @@ static void test_image_decoding_and_mascot(void) {
     assert(cairo_image_surface_get_width(surf) == 2);
     assert(cairo_image_surface_get_height(surf) == 2);
     cairo_surface_destroy(surf);
-    unlink(png_path);
+    test_unlink_file(png_path);
 }
 
 static void assert_theme_wcag_aa(const char *name) {
@@ -503,8 +579,8 @@ static void test_wcag_themes_and_default_dark(void) {
     assert_theme_wcag_aa("yuuka");
 
     /* Missing config directory defaults to "dark" */
-    char tmpdir[] = "/tmp/tuitube_test_def_XXXXXX";
-    assert(mkdtemp(tmpdir) != NULL);
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_def", tmpdir, sizeof(tmpdir));
     TuiTubeConfig cfg;
     assert(config_load(&cfg, tmpdir));
     assert(strcmp(cfg.theme_name, "dark") == 0);
@@ -518,7 +594,7 @@ static void test_wcag_themes_and_default_dark(void) {
     cfg.scale = 5.0;  assert(config_effective_ui_scale(&cfg) == 3.0);
 
     config_free(&cfg);
-    rmdir(tmpdir);
+    test_rmdir(tmpdir);
 }
 
 static void test_new_keybindings_and_formatting(void) {
@@ -785,12 +861,21 @@ static void test_http_pool_detail_gen_independence(void) {
     assert(http_pool_submit(pool, JOB_DETAIL, 0, a2, pool_test_work, free, free));
     assert(http_pool_submit(pool, JOB_DETAIL, 1, a3, pool_test_work, free, free));
 
+#ifdef _WIN32
+    HANDLE nh = (HANDLE)http_pool_notify_handle(pool);
+    assert(nh != NULL);
+    bool got_valid = false;
+    for (int iter = 0; iter < 50 && !got_valid; iter++) {
+        WaitForSingleObject(nh, 100);
+        http_pool_drain_notify(pool);
+#else
     int nfd = http_pool_notify_fd(pool);
     bool got_valid = false;
     for (int iter = 0; iter < 50 && !got_valid; iter++) {
         struct pollfd pfd = {.fd = nfd, .events = POLLIN};
         poll(&pfd, 1, 100);
         http_pool_drain_notify(pool);
+#endif
         HttpResult res;
         while (http_pool_pop_result(pool, &res)) {
             if (res.kind == RES_JOB_DONE && res.job_type == JOB_DETAIL && res.request_gen == 1) {
@@ -809,10 +894,10 @@ static void test_http_pool_detail_gen_independence(void) {
 }
 
 static void test_config_members_only_and_download(void) {
-    char tmpdir[] = "/tmp/tuitube_test_dl_XXXXXX";
-    assert(mkdtemp(tmpdir) != NULL);
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_dl", tmpdir, sizeof(tmpdir));
 
-    char cfg_file[256];
+    char cfg_file[PATH_MAX + 32];
     snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
     const char *cfg_json =
         "{\n"
@@ -856,8 +941,8 @@ static void test_config_members_only_and_download(void) {
     free(resolved);
     config_free(&cfg);
 
-    unlink(cfg_file);
-    rmdir(tmpdir);
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
 
     /* Download progress template parsing */
     double p = -1.0;
@@ -977,7 +1062,7 @@ static void test_mpv_osd_dims_and_script_opts(void) {
 
     /* Underscore key & ~ expansion */
     assert(tt_mpv_parse_script_opt_config_dir("tuitube_config_dir=~/my_tuitube", dir, sizeof(dir)));
-    assert(strstr(dir, "/my_tuitube") != NULL && dir[0] == '/');
+    assert(strstr(dir, "/my_tuitube") != NULL && tt_is_abs_path(dir));
 
     /* Buffer too small */
     char tiny[8];
@@ -1050,10 +1135,10 @@ static void test_mpv_key_mouse_and_unicode_parsing(void) {
 }
 
 static void test_config_explicit_format_and_slang_flags(void) {
-    char tmpdir[] = "/tmp/tuitube_test_mpvcfg_XXXXXX";
-    assert(mkdtemp(tmpdir) != NULL);
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_mpvcfg", tmpdir, sizeof(tmpdir));
 
-    char cfg_file[256];
+    char cfg_file[PATH_MAX + 32];
     snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
 
     /* Absent -> has_video_format == false, has_sub_language == false */
@@ -1083,13 +1168,13 @@ static void test_config_explicit_format_and_slang_flags(void) {
     assert(strcmp(cfg.sub_language, "ja,en") == 0);
     config_free(&cfg);
 
-    unlink(cfg_file);
-    rmdir(tmpdir);
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
 }
 
 static void test_thumb_cache_flush_ram_and_drop_jobs(void) {
-    char tmpdir[] = "/tmp/tuitube_test_tc_XXXXXX";
-    assert(mkdtemp(tmpdir) != NULL);
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_tc", tmpdir, sizeof(tmpdir));
 
     ThumbCache *tc = thumb_cache_create(tmpdir);
     assert(tc != NULL);
@@ -1113,13 +1198,198 @@ static void test_thumb_cache_flush_ram_and_drop_jobs(void) {
 
     thumb_cache_clear(tc);
     thumb_cache_destroy(tc);
-    rmdir(tmpdir);
+    test_rmdir(tmpdir);
 
     /* Drop queued thumbnail jobs cleanly */
     HttpPool *pool = http_pool_create(1);
     assert(pool != NULL);
     http_pool_drop_thumbnails(pool);
     http_pool_destroy(pool);
+}
+
+static void test_win32_cmdline_quoting(void) {
+    StrBuf sb;
+    sb_init(&sb);
+
+    assert(tt_win32_quote_arg("yt-dlp", &sb));
+    assert(strcmp(sb.data, "yt-dlp") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("", &sb));
+    assert(strcmp(sb.data, "\"\"") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("hello world", &sb));
+    assert(strcmp(sb.data, "\"hello world\"") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("say \"hi\"", &sb));
+    assert(strcmp(sb.data, "\"say \\\"hi\\\"\"") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("C:\\Users\\test\\file.mp4", &sb));
+    assert(strcmp(sb.data, "C:\\Users\\test\\file.mp4") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("C:\\Program Files\\mpv\\mpv.exe", &sb));
+    assert(strcmp(sb.data, "\"C:\\Program Files\\mpv\\mpv.exe\"") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("a\\\"b", &sb));
+    assert(strcmp(sb.data, "\"a\\\\\\\"b\"") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("C:\\my dir\\", &sb));
+    assert(strcmp(sb.data, "\"C:\\my dir\\\\\"") == 0);
+    sb_free(&sb);
+
+    const char *argv[] = {
+        "C:\\Program Files\\mpv\\mpv.exe",
+        "--force-media-title=a \"b\"\\",
+        "",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        NULL
+    };
+    char *cmd = tt_win32_build_cmdline(argv);
+    assert(cmd != NULL);
+    assert(strcmp(cmd,
+                  "\"C:\\Program Files\\mpv\\mpv.exe\" "
+                  "\"--force-media-title=a \\\"b\\\"\\\\\" "
+                  "\"\" "
+                  "https://www.youtube.com/watch?v=dQw4w9WgXcQ") == 0);
+    free(cmd);
+}
+
+static void test_windows_paths_and_script_opts(void) {
+    assert(tt_is_abs_path("/usr/local/bin"));
+    assert(tt_is_abs_path("C:/Users/alice"));
+    assert(tt_is_abs_path("D:\\Media\\yt"));
+    assert(tt_is_abs_path("C:"));
+    assert(tt_is_abs_path("\\\\server\\share\\folder"));
+    assert(!tt_is_abs_path(""));
+    assert(!tt_is_abs_path("relative/path"));
+    assert(!tt_is_abs_path("C:relative"));
+
+    char *j1 = tt_path_join("C:\\Users\\alice", "tuitube.json");
+    assert(j1 && strcmp(j1, "C:\\Users\\alice/tuitube.json") == 0);
+    free(j1);
+
+    char *j2 = tt_path_join("C:\\", "tuitube.json");
+    assert(j2 && strcmp(j2, "C:\\tuitube.json") == 0);
+    free(j2);
+
+    char *j3 = tt_path_join("C:\\Users\\alice", "D:\\override\\cfg.json");
+    assert(j3 && strcmp(j3, "D:\\override\\cfg.json") == 0);
+    free(j3);
+
+    char dir[PATH_MAX];
+    assert(tt_mpv_parse_script_opt_config_dir(
+        "foo=1,tuitube-config_dir=C:\\Users\\alice\\tuitube,bar=2", dir, sizeof(dir)));
+    assert(strcmp(dir, "C:\\Users\\alice\\tuitube") == 0);
+
+    assert(tt_mpv_parse_script_opt_config_dir(
+        "tuitube_config_dir=~\\win_cfg", dir, sizeof(dir)));
+    assert(strstr(dir, "\\win_cfg") != NULL && tt_is_abs_path(dir));
+}
+
+static void write_u16be(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)(v & 0xFFu);
+}
+
+static void write_u32be(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)((v >> 16) & 0xFFu);
+    p[2] = (uint8_t)((v >> 8) & 0xFFu);
+    p[3] = (uint8_t)(v & 0xFFu);
+}
+
+static void test_ttf_family_name_parser(void) {
+    char fam[128];
+
+    /* Invalid / corrupt / truncated inputs must fail safely */
+    assert(!tt_ttf_read_family_name(NULL, 100, fam, sizeof(fam)));
+    const uint8_t tiny[8] = {0};
+    assert(!tt_ttf_read_family_name(tiny, sizeof(tiny), fam, sizeof(fam)));
+    const uint8_t bad_magic[16] = {'B', 'A', 'D', '!'};
+    assert(!tt_ttf_read_family_name(bad_magic, sizeof(bad_magic), fam, sizeof(fam)));
+
+    /* Minimal SFNT with nameID=1 (Mac Roman) + nameID=16 (Win UTF-16BE English) */
+    uint8_t sfnt[256];
+    memset(sfnt, 0, sizeof(sfnt));
+    write_u32be(sfnt + 0, 0x00010000u);
+    write_u16be(sfnt + 4, 1); /* numTables */
+    /* Table record at offset 12: 'name' */
+    write_u32be(sfnt + 12, 0x6E616D65u);
+    write_u32be(sfnt + 20, 28);  /* offset */
+    write_u32be(sfnt + 24, 128); /* length */
+
+    /* 'name' header at 28 */
+    uint8_t *nt = sfnt + 28;
+    write_u16be(nt + 0, 0);
+    write_u16be(nt + 2, 2);  /* count */
+    write_u16be(nt + 4, 30); /* stringOffset = 6 + 2*12 */
+
+    /* Record 0: Mac Roman nameID=1 ("OldFam") */
+    write_u16be(nt + 6 + 0, 1);  /* platformID */
+    write_u16be(nt + 6 + 2, 0);  /* encodingID */
+    write_u16be(nt + 6 + 4, 0);  /* languageID */
+    write_u16be(nt + 6 + 6, 1);  /* nameID */
+    write_u16be(nt + 6 + 8, 6);  /* length */
+    write_u16be(nt + 6 + 10, 0); /* offset */
+    memcpy(nt + 30, "OldFam", 6);
+
+    /* Record 1: Windows Unicode BMP English nameID=16 ("JetBrains") */
+    const char *pref = "JetBrains";
+    size_t plen = strlen(pref);
+    write_u16be(nt + 18 + 0, 3);
+    write_u16be(nt + 18 + 2, 1);
+    write_u16be(nt + 18 + 4, 0x0409u);
+    write_u16be(nt + 18 + 6, 16);
+    write_u16be(nt + 18 + 8, (uint16_t)(plen * 2u));
+    write_u16be(nt + 18 + 10, 6);
+    for (size_t i = 0; i < plen; i++) {
+        write_u16be(nt + 30 + 6 + i * 2u, (uint16_t)(unsigned char)pref[i]);
+    }
+
+    assert(tt_ttf_read_family_name(sfnt, 28 + 128, fam, sizeof(fam)));
+    assert(strcmp(fam, "JetBrains") == 0);
+
+    /* Corrupt name table length past buffer -> must fail safely */
+    write_u32be(sfnt + 24, 99999u);
+    assert(!tt_ttf_read_family_name(sfnt, 28 + 128, fam, sizeof(fam)));
+    write_u32be(sfnt + 24, 128);
+
+    /* TTC ('ttcf') container pointing to an OTTO font with surrogate pair + UTF-8 */
+    uint8_t ttc[320];
+    memset(ttc, 0, sizeof(ttc));
+    write_u32be(ttc + 0, 0x74746366u); /* 'ttcf' */
+    write_u32be(ttc + 4, 0x00010000u);
+    write_u32be(ttc + 8, 1);  /* numFonts */
+    write_u32be(ttc + 12, 32); /* offset to font 0 */
+
+    uint8_t *f0 = ttc + 32;
+    write_u32be(f0 + 0, 0x4F54544Fu); /* 'OTTO' */
+    write_u16be(f0 + 4, 1);
+    write_u32be(f0 + 12, 0x6E616D65u);
+    write_u32be(f0 + 20, 32 + 28);
+    write_u32be(f0 + 24, 64);
+
+    uint8_t *nt2 = f0 + 28;
+    write_u16be(nt2 + 2, 1);
+    write_u16be(nt2 + 4, 18);
+    write_u16be(nt2 + 6 + 0, 3);
+    write_u16be(nt2 + 6 + 2, 10);
+    write_u16be(nt2 + 6 + 4, 0x0409u);
+    write_u16be(nt2 + 6 + 6, 1);
+    write_u16be(nt2 + 6 + 8, 6); /* 3 UTF-16 code units: U+1F3B5 + 'A' */
+    write_u16be(nt2 + 6 + 10, 0);
+    write_u16be(nt2 + 18 + 0, 0xD83Cu);
+    write_u16be(nt2 + 18 + 2, 0xDFB5u);
+    write_u16be(nt2 + 18 + 4, 'A');
+
+    assert(tt_ttf_read_family_name(ttc, sizeof(ttc), fam, sizeof(fam)));
+    assert(strcmp(fam, "\xF0\x9F\x8E\xB5" "A") == 0);
 }
 
 int main(void) {
@@ -1143,6 +1413,9 @@ int main(void) {
     RUN_TEST(test_mpv_key_mouse_and_unicode_parsing);
     RUN_TEST(test_config_explicit_format_and_slang_flags);
     RUN_TEST(test_thumb_cache_flush_ram_and_drop_jobs);
+    RUN_TEST(test_win32_cmdline_quoting);
+    RUN_TEST(test_windows_paths_and_script_opts);
+    RUN_TEST(test_ttf_family_name_parser);
 
     printf("\nAll %d tests passed!\n", g_tests_run);
     return 0;

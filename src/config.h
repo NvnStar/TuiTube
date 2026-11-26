@@ -1,11 +1,16 @@
 #ifndef TUITUBE_CONFIG_H
 #define TUITUBE_CONFIG_H
 
+#include "tt_keysyms.h"
+
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <xkbcommon/xkbcommon.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 typedef struct {
     uint8_t r;

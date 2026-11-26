@@ -926,6 +926,11 @@ int app_notify_fd(const AppState *app) {
     return http_pool_notify_fd(app->pool);
 }
 
+void *app_notify_handle(const AppState *app) {
+    if (!app || !app->pool) return NULL;
+    return http_pool_notify_handle(app->pool);
+}
+
 void app_process_async_results(AppState *app) {
     if (!app || !app->pool || !app->ui) return;
     http_pool_drain_notify(app->pool);

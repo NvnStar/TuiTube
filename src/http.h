@@ -54,6 +54,7 @@ void http_response_free(HttpResponse *res);
 HttpPool *http_pool_create(int num_threads);
 void http_pool_destroy(HttpPool *pool);
 int http_pool_notify_fd(const HttpPool *pool);
+void *http_pool_notify_handle(const HttpPool *pool);
 void http_pool_drain_notify(HttpPool *pool);
 
 bool http_pool_submit(HttpPool *pool, HttpJobType type, uint64_t request_gen,

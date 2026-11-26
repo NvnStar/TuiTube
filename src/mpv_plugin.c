@@ -1,32 +1,40 @@
+#ifndef _WIN32
 #define _GNU_SOURCE
+#endif
 
 #include "app.h"
 #include "config.h"
 #include "http.h"
 #include "mpv_cplugin.h"
 #include "player.h"
+#include "tt_keysyms.h"
 #include "ui.h"
 #include "util.h"
 #include "wayland.h"
 
 #include <cairo.h>
 #include <ctype.h>
-#include <dlfcn.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
 #include <math.h>
-#include <poll.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <inttypes.h>
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#include <fcntl.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+#include <poll.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#endif
 
 enum {
     TT_OVERLAY_ID = 61
@@ -55,20 +63,38 @@ struct WaylandApp {
     int logical_h;
     double mouse_phys_x;
     double mouse_phys_y;
+#ifdef _WIN32
+    bool overlay_active;
+    HANDLE wakeup_event;
+#else
     int fb_fd;
+    int wakeup_pipe[2];
+#endif
     void *fb_data;
     size_t fb_cap;
     AppState *app;
     char client_name[64];
-    int wakeup_pipe[2];
 };
 
+#ifdef _WIN32
+static INIT_ONCE g_curl_once = INIT_ONCE_STATIC_INIT;
+static bool g_curl_ok = false;
+
+static BOOL CALLBACK plugin_curl_init_once_cb(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once;
+    (void)param;
+    (void)ctx;
+    g_curl_ok = http_global_init();
+    return TRUE;
+}
+#else
 static pthread_once_t g_curl_once = PTHREAD_ONCE_INIT;
 static bool g_curl_ok = false;
 
 static void plugin_curl_init_once(void) {
     g_curl_ok = http_global_init();
 }
+#endif
 
 static const int s_plugin_anchor = 0;
 
@@ -102,6 +128,20 @@ static void trim_process_heap(void) {
 
 static void release_fb(WaylandApp *wl) {
     if (!wl) return;
+#ifdef _WIN32
+    if (wl->overlay_active && wl->mpv && !wl->quit) {
+        char id_str[16];
+        snprintf(id_str, sizeof(id_str), "%d", TT_OVERLAY_ID);
+        const char *rem_cmd[] = {"overlay-remove", id_str, NULL};
+        mpv_command(wl->mpv, rem_cmd);
+        wl->overlay_active = false;
+    }
+    if (wl->fb_data) {
+        VirtualFree(wl->fb_data, 0, MEM_RELEASE);
+        wl->fb_data = NULL;
+    }
+    wl->fb_cap = 0;
+#else
     if (wl->fb_data && wl->fb_data != MAP_FAILED && wl->fb_cap > 0) {
         munmap(wl->fb_data, wl->fb_cap);
     }
@@ -111,12 +151,24 @@ static void release_fb(WaylandApp *wl) {
         close(wl->fb_fd);
         wl->fb_fd = -1;
     }
+#endif
 }
 
 static bool ensure_fb_capacity(WaylandApp *wl, size_t needed) {
     size_t target_cap = tt_shm_pool_capacity(needed);
     if (target_cap == 0) return false;
 
+#ifdef _WIN32
+    if (wl->fb_data && needed <= wl->fb_cap && !tt_shm_should_shrink(needed, wl->fb_cap)) {
+        return true;
+    }
+    release_fb(wl);
+    void *data = VirtualAlloc(NULL, target_cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!data) return false;
+    wl->fb_data = data;
+    wl->fb_cap = target_cap;
+    return true;
+#else
     if (wl->fb_fd >= 0 && wl->fb_data && !tt_shm_should_shrink(needed, wl->fb_cap)) {
         if (needed <= wl->fb_cap) {
             return true;
@@ -147,6 +199,7 @@ static bool ensure_fb_capacity(WaylandApp *wl, size_t needed) {
     wl->fb_data = data;
     wl->fb_cap = target_cap;
     return true;
+#endif
 }
 
 static void update_mouse_pos_node(WaylandApp *wl, const mpv_node *node) {
@@ -244,6 +297,9 @@ static void mpv_overlay_set_visible(WaylandApp *wl, bool show) {
         snprintf(id_str, sizeof(id_str), "%d", TT_OVERLAY_ID);
         const char *rem_cmd[] = {"overlay-remove", id_str, NULL};
         mpv_command(wl->mpv, rem_cmd);
+#ifdef _WIN32
+        wl->overlay_active = false;
+#endif
         release_fb(wl);
         if (wl->app) {
             app_release_hidden_resources(wl->app);
@@ -294,13 +350,16 @@ static void mpv_overlay_render_if_needed(WaylandApp *wl) {
     cairo_surface_destroy(surf);
     wl->dirty = false;
 
+    char id_arg[16], fd_arg[48], pw_arg[16], ph_arg[16], stride_arg[32];
+    snprintf(id_arg, sizeof(id_arg), "%d", TT_OVERLAY_ID);
+#ifdef _WIN32
+    snprintf(fd_arg, sizeof(fd_arg), "&%" PRIuPTR, (uintptr_t)wl->fb_data);
+#else
     if (lseek(wl->fb_fd, 0, SEEK_SET) < 0) {
         return;
     }
-
-    char id_arg[16], fd_arg[32], pw_arg[16], ph_arg[16], stride_arg[32];
-    snprintf(id_arg, sizeof(id_arg), "%d", TT_OVERLAY_ID);
     snprintf(fd_arg, sizeof(fd_arg), "@%d", wl->fb_fd);
+#endif
     snprintf(pw_arg, sizeof(pw_arg), "%d", pw);
     snprintf(ph_arg, sizeof(ph_arg), "%d", ph);
     snprintf(stride_arg, sizeof(stride_arg), "%zu", stride);
@@ -310,6 +369,9 @@ static void mpv_overlay_render_if_needed(WaylandApp *wl) {
         pw_arg, ph_arg, stride_arg, NULL
     };
     mpv_command(wl->mpv, cmd);
+#ifdef _WIN32
+    wl->overlay_active = true;
+#endif
 }
 
 /* Host WaylandApp shim functions required by ui.c / app.c */
@@ -502,6 +564,58 @@ static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out
         if (ok) return true;
     }
 
+#ifdef _WIN32
+    HMODULE hm = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)(const void *)&s_plugin_anchor, &hm) && hm) {
+        wchar_t wdll[4096];
+        DWORD n = GetModuleFileNameW(hm, wdll, (DWORD)(sizeof(wdll) / sizeof(wdll[0])));
+        if (n > 0 && n < (DWORD)(sizeof(wdll) / sizeof(wdll[0]))) {
+            char *dll_path = tt_wide_to_utf8(wdll);
+            if (dll_path) {
+                char *slash = NULL;
+                for (char *p = dll_path; *p; p++) {
+                    if (*p == '/' || *p == '\\') slash = p;
+                }
+                if (slash) {
+                    if ((size_t)(slash - dll_path) == 2 &&
+                        isalpha((unsigned char)dll_path[0]) && dll_path[1] == ':') {
+                        slash[1] = '\0';
+                    } else if (slash == dll_path) {
+                        slash[1] = '\0';
+                    } else {
+                        *slash = '\0';
+                    }
+                    char *marker = tt_path_join(dll_path, "tuitube_portable_mode.txt");
+                    bool exists = marker && tt_file_exists(marker);
+                    free(marker);
+                    if (exists && strlen(dll_path) < out_cap) {
+                        snprintf(out_dir, out_cap, "%s", dll_path);
+                        free(dll_path);
+                        return true;
+                    }
+                }
+                free(dll_path);
+            }
+        }
+    }
+
+    const char *xdg_cfg = getenv("XDG_CONFIG_HOME");
+    const char *appdata = getenv("APPDATA");
+    const char *userprofile = getenv("USERPROFILE");
+    if (!userprofile || !userprofile[0]) userprofile = getenv("HOME");
+    if (!userprofile || !userprofile[0]) userprofile = getenv("TEMP");
+    if (!userprofile || !userprofile[0]) userprofile = ".";
+    if (xdg_cfg && xdg_cfg[0]) {
+        snprintf(out_dir, out_cap, "%s/tuitube", xdg_cfg);
+    } else if (appdata && appdata[0]) {
+        snprintf(out_dir, out_cap, "%s/tuitube", appdata);
+    } else {
+        snprintf(out_dir, out_cap, "%s/AppData/Roaming/tuitube", userprofile);
+    }
+    return true;
+#else
     Dl_info dli;
     if (dladdr(&s_plugin_anchor, &dli) != 0 && dli.dli_fname && dli.dli_fname[0]) {
         const char *slash = strrchr(dli.dli_fname, '/');
@@ -534,6 +648,7 @@ static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out
         snprintf(out_dir, out_cap, "%s/.config/tuitube", home);
     }
     return true;
+#endif
 }
 
 static void sanitize_client_name(const char *raw, char *out, size_t cap) {
@@ -805,10 +920,15 @@ static void handle_client_message(WaylandApp *wl, const mpv_event_client_message
 
 static void mpv_wakeup_cb(void *d) {
     WaylandApp *wl = d;
+#ifdef _WIN32
+    if (!wl || !wl->wakeup_event) return;
+    SetEvent(wl->wakeup_event);
+#else
     if (!wl || wl->wakeup_pipe[1] < 0) return;
     char b = 1;
     ssize_t r = write(wl->wakeup_pipe[1], &b, 1);
     (void)r;
+#endif
 }
 
 static void drain_mpv_events(WaylandApp *wl) {
@@ -851,15 +971,30 @@ static void drain_mpv_events(WaylandApp *wl) {
 }
 
 TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
+#ifdef MPV_CPLUGIN_DYNAMIC_SYM
+    if (!mpv_wait_event || !mpv_command || !mpv_command_node) {
+        return -1;
+    }
+#endif
     if (!mpv) return -1;
 
+#ifdef _WIN32
+    InitOnceExecuteOnce(&g_curl_once, plugin_curl_init_once_cb, NULL, NULL);
+#else
     pthread_once(&g_curl_once, plugin_curl_init_once);
+#endif
     if (!g_curl_ok) return -1;
 
     WaylandApp wl;
     memset(&wl, 0, sizeof(wl));
     wl.mpv = mpv;
     wl.hidpi_scale = 1.0;
+#ifdef _WIN32
+    wl.wakeup_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!wl.wakeup_event) {
+        return -1;
+    }
+#else
     wl.fb_fd = -1;
     wl.wakeup_pipe[0] = -1;
     wl.wakeup_pipe[1] = -1;
@@ -867,6 +1002,7 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
     if (pipe2(wl.wakeup_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
         return -1;
     }
+#endif
 
     sanitize_client_name(mpv_client_name(mpv), wl.client_name, sizeof(wl.client_name));
 
@@ -875,8 +1011,12 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
 
     AppState app;
     if (!app_init(&app, cfg_dir, &wl, mpv_host_play_video, &wl, "mpv")) {
+#ifdef _WIN32
+        CloseHandle(wl.wakeup_event);
+#else
         close(wl.wakeup_pipe[0]);
         close(wl.wakeup_pipe[1]);
+#endif
         return -1;
     }
     wl.app = &app;
@@ -888,7 +1028,11 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
     setup_input_sections(&wl, &app.cfg);
     mpv_set_wakeup_callback(mpv, mpv_wakeup_cb, &wl);
 
+#ifdef _WIN32
+    HANDLE notify_h = (HANDLE)app_notify_handle(&app);
+#else
     int notify_fd = app_notify_fd(&app);
+#endif
 
     while (!wl.quit) {
         drain_mpv_events(&wl);
@@ -897,6 +1041,28 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
         app_poll_downloads(&app);
         mpv_overlay_render_if_needed(&wl);
 
+#ifdef _WIN32
+        HANDLE handles[2];
+        DWORD hcount = 0;
+        handles[hcount++] = wl.wakeup_event;
+        if (notify_h) {
+            handles[hcount++] = notify_h;
+        }
+        DWORD timeout_ms = (player_get_active_download_summary(NULL, NULL, 0) > 0) ? 250u : INFINITE;
+        DWORD wr = WaitForMultipleObjects(hcount, handles, FALSE, timeout_ms);
+        if (wr == WAIT_FAILED) {
+            break;
+        }
+        if (notify_h && ((hcount > 1 && wr == WAIT_OBJECT_0 + 1) ||
+                         WaitForSingleObject(notify_h, 0) == WAIT_OBJECT_0)) {
+            app_process_async_results(&app);
+            if (!wl.visible) {
+                ui_release_hidden_caches(app.ui);
+                trim_process_heap();
+            }
+        }
+        app_poll_downloads(&app);
+#else
         struct pollfd pfds[2];
         nfds_t nfds = 0;
         pfds[nfds].fd = wl.wakeup_pipe[0];
@@ -931,6 +1097,7 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
             }
         }
         app_poll_downloads(&app);
+#endif
     }
 
     mpv_set_wakeup_callback(mpv, NULL, NULL);
@@ -939,7 +1106,11 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
     mpv_unobserve_property(mpv, OBS_OSD_H);
     mpv_unobserve_property(mpv, OBS_HIDPI);
     app_destroy(&app);
+#ifdef _WIN32
+    CloseHandle(wl.wakeup_event);
+#else
     close(wl.wakeup_pipe[0]);
     close(wl.wakeup_pipe[1]);
+#endif
     return 0;
 }
