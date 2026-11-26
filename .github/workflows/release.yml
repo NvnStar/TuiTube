@@ -1,0 +1,175 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0 or v0.1.0-beta.1)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Force mark as prerelease (tags containing "-" are always prereleases)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git ca-certificates pkg-config \
+            libwayland-bin wayland-protocols \
+            libwayland-dev libxkbcommon-dev libcairo2-dev libpango1.0-dev \
+            libfontconfig-dev libcurl4-openssl-dev \
+            libjpeg-dev libpng-dev
+          git clone --depth 1 https://github.com/ibireme/yyjson.git /tmp/yyjson
+          cmake -S /tmp/yyjson -B /tmp/yyjson/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build /tmp/yyjson/build -j"$(nproc)"
+          sudo cmake --install /tmp/yyjson/build
+          rm -rf /tmp/yyjson
+
+      - name: Lint, build, and test
+        run: |
+          make lint
+          make release
+          make test
+          ./tuitube --help
+
+      - name: Package Linux tarball
+        run: |
+          mkdir -p dist/tuitube-linux-x64/examples
+          cp tuitube tuitube.so README.md LICENSE dist/tuitube-linux-x64/
+          cp examples/tuitube.json examples/sample_theme.json dist/tuitube-linux-x64/examples/
+          tar -C dist -czf dist/tuitube-linux-x64.tar.gz tuitube-linux-x64
+
+      - name: Upload Linux release tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x64
+          path: dist/tuitube-linux-x64.tar.gz
+          retention-days: 1
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-cairo
+            mingw-w64-ucrt-x86_64-pango
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-yyjson
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libpng
+
+      - name: Lint, build, and test
+        run: |
+          make lint
+          make release
+          make test
+          ./tuitube.exe --help
+
+      - name: Package Windows portable zip
+        run: |
+          mkdir -p dist/tuitube-windows-x64/examples
+          cp tuitube.exe tuitube.dll README.md LICENSE dist/tuitube-windows-x64/
+          cp examples/tuitube.json examples/sample_theme.json dist/tuitube-windows-x64/examples/
+          ldd ./tuitube.exe ./tuitube.dll | awk '/\/ucrt64\/bin\// {print $3}' | sort -u | xargs -r cp -t dist/tuitube-windows-x64/
+          (cd dist && zip -r9 tuitube-windows-x64.zip tuitube-windows-x64)
+
+      - name: Upload Windows release zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: dist/tuitube-windows-x64.zip
+          retention-days: 1
+
+  publish-release:
+    runs-on: ubuntu-24.04
+    needs: [build-linux, build-windows]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd release-assets
+          sha256sum tuitube-windows-x64.zip tuitube-linux-x64.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then
+            TAG="$REF_NAME"
+          else
+            TAG="$INPUT_TAG"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "Error: release tag is empty" >&2
+            exit 1
+          fi
+
+          PRERELEASE_FLAG=""
+          if [ "$INPUT_PRERELEASE" = "true" ] || echo "$TAG" | grep -q '-'; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              release-assets/tuitube-windows-x64.zip \
+              release-assets/tuitube-linux-x64.tar.gz \
+              release-assets/SHA256SUMS.txt \
+              --clobber
+          else
+            gh release create "$TAG" \
+              release-assets/tuitube-windows-x64.zip \
+              release-assets/tuitube-linux-x64.tar.gz \
+              release-assets/SHA256SUMS.txt \
+              --target "$COMMIT_SHA" \
+              --title "TuiTube $TAG" \
+              --generate-notes \
+              $PRERELEASE_FLAG
+          fi

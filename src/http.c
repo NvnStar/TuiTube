@@ -106,6 +106,10 @@ static void pool_cond_broadcast(HttpPool *pool) {
 }
 
 bool http_global_init(void) {
+#ifdef _WIN32
+    /* Prefer Windows Schannel when multi-SSL libcurl is available; falls back cleanly otherwise */
+    (void)curl_global_sslset(CURLSSLBACKEND_SCHANNEL, NULL, NULL);
+#endif
     return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
 }
 
@@ -181,6 +185,21 @@ static bool perform_curl(CURL *reuse_handle, const char *url,
     curl_easy_setopt(curl, CURLOPT_USERAGENT, HTTP_USER_AGENT);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+#ifdef _WIN32
+    /* Use Windows System Certificate Store instead of MSYS2's compile-time ca-bundle path */
+    long ssl_opts = 0;
+#ifdef CURLSSLOPT_NATIVE_CA
+    ssl_opts |= CURLSSLOPT_NATIVE_CA;
+#endif
+#ifdef CURLSSLOPT_REVOKE_BEST_EFFORT
+    ssl_opts |= CURLSSLOPT_REVOKE_BEST_EFFORT;
+#endif
+    if (ssl_opts != 0) {
+        curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, ssl_opts);
+    }
+    curl_easy_setopt(curl, CURLOPT_CAINFO, NULL);
+    curl_easy_setopt(curl, CURLOPT_CAPATH, NULL);
+#endif
 
     if (slist) {
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);

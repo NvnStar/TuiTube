@@ -67,7 +67,7 @@ make test      # Run offline unit tests + plugin symbol/linkage checks
 make lint      # Strict -Wall -Wextra -Wpedantic -Werror syntax check
 ```
 
-Prebuilt Windows portable bundles (`tuitube-windows-x64.zip`, containing `tuitube.exe`, `tuitube.dll`, and all MSYS2 UCRT64 runtime DLLs) are also produced as GitHub Actions CI artifacts on every push and pull request.
+Prebuilt binaries (`tuitube-windows-x64.zip` with MSYS2 UCRT64 runtime DLLs, `tuitube-linux-x64.tar.gz`, and `SHA256SUMS.txt`) are published on the [GitHub Releases](https://github.com/NvnStar/TuiTube/releases) page (served via direct CDN downloads without requiring a GitHub login).
 
 ---
 
