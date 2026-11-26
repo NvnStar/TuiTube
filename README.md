@@ -47,8 +47,11 @@ sudo apt install build-essential pkg-config libwayland-bin wayland-protocols \
 ## Building & Running
 
 ```bash
-# Release binary (./tuitube)
+# Release binary (./tuitube) + native mpv C plugin (./tuitube.so)
 make release
+
+# Build only the native mpv C plugin (./tuitube.so)
+make plugin
 
 # Debug binary with ASan/UBSan (./tuitube-debug)
 make debug
@@ -56,14 +59,31 @@ make debug
 # Strict compiler lint (-Wall -Wextra -Wpedantic -Werror)
 make lint
 
-# Run offline unit tests under ASan/UBSan
+# Run offline unit tests under ASan/UBSan + plugin symbol/linkage checks
 make test
 
-# Run
+# Run standalone Wayland client
 ./tuitube
 # Or override config directory:
 ./tuitube --config-dir ~/.config/tuitube
 ```
+
+### Native `mpv` C Plugin (`tuitube.so`)
+
+TuiTube also builds as a single-file native `mpv` C plugin (`./tuitube.so`) that renders inside the active `mpv` window via `overlay-add` and plays selected videos directly in the host `mpv` instance (respecting your `mpv.conf` unless `"video_format"` / `"sub_language"` are explicitly set in `tuitube.json`). It requires **neither** `libmpv-dev` at build time nor Wayland libraries at runtime.
+
+```bash
+# Build ./tuitube.so and install for mpv
+make plugin
+mkdir -p ~/.config/mpv/scripts
+cp ./tuitube.so ~/.config/mpv/scripts/tuitube.so
+
+# Or load directly from the repo without installing
+mpv --idle --script=./tuitube.so
+```
+
+- **Toggle Overlay:** Press `F12` (default non-forced binding), bind `script-binding tuitube/toggle` in `input.conf`, or send `script-message tuitube-toggle` (`tuitube-open` / `tuitube-close` are also supported).
+- **Shared Config & State:** Automatically uses `~/.config/tuitube/{tuitube.json,favlist.json,history.json}` and `~/.cache/tuitube/thumbs` (shared with standalone `./tuitube`). Override with `--script-opts=tuitube-config_dir=/path/to/dir` or place `tuitube_portable_mode.txt` beside `tuitube.so`.
 
 ### Portable Mode
 Place an empty file named `tuitube_portable_mode.txt` in the same directory as the `tuitube` executable to store `tuitube.json`, `favlist.json`, `history.json`, and `cache/thumbs/` alongside the binary.
@@ -93,15 +113,11 @@ Default keybindings (when search input is not focused, or with modifiers):
 
 ---
 
-## Credits & Acknowledgments
+## Credits
 
-If you enjoy TuiTube, please consider thanking or supporting the upstream projects and authors that made it possible:
-
-- **[ikatube](https://chino-chan.gitlab.io/programs.html#s2)** by **chino-chan** *(original UX inspiration)* — TuiTube's two-pane layout, portable mode convention (`ikatk` toolkit), `tuitube.json` options, 8-value RGBA theme schema, and keybinding design are inspired by `ikatube` (`ikatube2-wl`) and its configuration reference. Thank you to `chino-chan` for designing such a clean, no-nonsense YouTube desktop workflow!
-- **[mpv](https://mpv.io/)** ([GitHub](https://github.com/mpv-player/mpv)) & **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — Do the heavy lifting of stream extraction, adaptive muxing, downloads, and hardware-accelerated video playback. Please star `yt-dlp` and support the `mpv` developers!
-- **Core C Libraries:** [Wayland](https://wayland.freedesktop.org/), [libxkbcommon](https://xkbcommon.org/), [Cairo](https://www.cairographics.org/), [Pango](https://pango.gnome.org/), [Fontconfig](https://www.freedesktop.org/wiki/Software/fontconfig/), [libcurl](https://curl.se/libcurl/), [yyjson](https://github.com/ibireme/yyjson), [libjpeg-turbo](https://libjpeg-turbo.org/), and [libpng](https://www.libpng.org/pub/png/libpng.html).
-
-*How to show appreciation:* Star the open-source upstream repositories (`yt-dlp/yt-dlp`, `mpv-player/mpv`, `ibireme/yyjson`), check out `chino-chan`'s programs at [chino-chan.gitlab.io](https://chino-chan.gitlab.io/programs.html#s2), report reproducible issues with logs/fixtures, and keep `yt-dlp` updated when YouTube changes player signatures.
+- **[ikatube](https://chino-chan.gitlab.io/programs.html#s2)** by **chino-chan** — UX, layout, theme, and config inspiration.
+- **[mpv](https://mpv.io/)** & **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — Playback, stream extraction, and downloads.
+- **C Libraries:** Wayland, libxkbcommon, Cairo, Pango, Fontconfig, libcurl, yyjson, libjpeg-turbo, and libpng.
 
 ---
 

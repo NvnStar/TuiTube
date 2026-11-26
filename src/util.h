@@ -52,4 +52,42 @@ bool tt_resolve_paths(const char *cli_config_dir,
                       char *out_cache_dir, size_t cache_cap,
                       bool *out_portable);
 
+#define TT_SHM_ALIGN_BYTES (256u * 1024u)
+#define TT_SHM_SHRINK_THRESHOLD_BYTES (512u * 1024u)
+
+bool tt_shm_target_dims(int logical_w, int logical_h, uint32_t scale_120,
+                        int int_scale, int *out_pw, int *out_ph);
+size_t tt_shm_pool_capacity(size_t needed_bytes);
+bool tt_shm_should_shrink(size_t needed_bytes, size_t current_cap);
+
+typedef enum {
+    TT_MPV_INPUT_NONE = 0,
+    TT_MPV_INPUT_KEY,
+    TT_MPV_INPUT_BUTTON,
+    TT_MPV_INPUT_WHEEL
+} TtMpvInputKind;
+
+typedef struct {
+    TtMpvInputKind kind;
+    bool pressed;
+    bool repeat;
+    bool double_click;
+    bool is_press_pulse;
+    uint32_t mods;       /* TT_MOD_CTRL / SHIFT / ALT / SUPER bitmask (1,2,4,8) */
+    uint32_t keysym;     /* xkb_keysym_t */
+    char utf8[64];
+    int mouse_btn;       /* 1=left, 2=right, 3=middle, 4=back, 5=forward */
+    double wheel_dx;
+    double wheel_dy;
+} TtMpvKeyEvent;
+
+bool tt_mpv_osd_dims(int64_t osd_w, int64_t osd_h, double hidpi_scale,
+                     int *out_phys_w, int *out_phys_h,
+                     int *out_logical_w, int *out_logical_h);
+bool tt_mpv_parse_script_opt_config_dir(const char *script_opts,
+                                        char *out_dir, size_t out_cap);
+bool tt_mpv_parse_key_event(const char *state_str, const char *key_name,
+                            const char *key_text, const char *scale_str,
+                            TtMpvKeyEvent *out);
+
 #endif

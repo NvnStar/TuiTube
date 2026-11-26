@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 
 void sb_init(StrBuf *sb) {
     sb->data = NULL;
@@ -570,5 +572,399 @@ bool tt_resolve_paths(const char *cli_config_dir,
 
     tt_mkdir_p(out_config_dir, 0755);
     tt_mkdir_p(out_cache_dir, 0755);
+    return true;
+}
+
+bool tt_shm_target_dims(int logical_w, int logical_h, uint32_t scale_120,
+                        int int_scale, int *out_pw, int *out_ph) {
+    if (logical_w <= 0 || logical_h <= 0 || !out_pw || !out_ph) return false;
+
+    int64_t pw64 = 0;
+    int64_t ph64 = 0;
+    if (scale_120 > 0u) {
+        uint32_t s120 = scale_120 < 60u ? 60u : (scale_120 > 480u ? 480u : scale_120);
+        pw64 = ((int64_t)logical_w * (int64_t)s120 + 60) / 120;
+        ph64 = ((int64_t)logical_h * (int64_t)s120 + 60) / 120;
+        if (pw64 < 1) pw64 = 1;
+        if (ph64 < 1) ph64 = 1;
+    } else {
+        int sc = int_scale < 1 ? 1 : (int_scale > 4 ? 4 : int_scale);
+        pw64 = (int64_t)logical_w * (int64_t)sc;
+        ph64 = (int64_t)logical_h * (int64_t)sc;
+    }
+
+    if (pw64 > 32767 || ph64 > 32767 ||
+        (uint64_t)pw64 * 4u * (uint64_t)ph64 > (uint64_t)INT32_MAX) {
+        return false;
+    }
+
+    *out_pw = (int)pw64;
+    *out_ph = (int)ph64;
+    return true;
+}
+
+size_t tt_shm_pool_capacity(size_t needed_bytes) {
+    if (needed_bytes == 0 || needed_bytes > (size_t)INT32_MAX) return 0;
+    size_t rem = needed_bytes % TT_SHM_ALIGN_BYTES;
+    size_t cap = rem == 0 ? needed_bytes : (needed_bytes + (TT_SHM_ALIGN_BYTES - rem));
+    if (cap > (size_t)INT32_MAX) cap = (size_t)INT32_MAX;
+    return cap;
+}
+
+bool tt_shm_should_shrink(size_t needed_bytes, size_t current_cap) {
+    return needed_bytes > 0 && current_cap > needed_bytes &&
+           (current_cap - needed_bytes) >= TT_SHM_SHRINK_THRESHOLD_BYTES;
+}
+
+bool tt_mpv_osd_dims(int64_t osd_w, int64_t osd_h, double hidpi_scale,
+                     int *out_phys_w, int *out_phys_h,
+                     int *out_logical_w, int *out_logical_h) {
+    if (osd_w <= 0 || osd_h <= 0 ||
+        !out_phys_w || !out_phys_h || !out_logical_w || !out_logical_h) {
+        return false;
+    }
+    if (osd_w > 32767 || osd_h > 32767 ||
+        (uint64_t)osd_w * 4u * (uint64_t)osd_h > (uint64_t)INT32_MAX) {
+        return false;
+    }
+
+    double sc = (hidpi_scale > 0.0 && isfinite(hidpi_scale)) ? hidpi_scale : 1.0;
+    if (sc < 0.5) sc = 0.5;
+    if (sc > 4.0) sc = 4.0;
+
+    int lw = (int)lround((double)osd_w / sc);
+    int lh = (int)lround((double)osd_h / sc);
+    if (lw < 1) lw = 1;
+    if (lh < 1) lh = 1;
+
+    *out_phys_w = (int)osd_w;
+    *out_phys_h = (int)osd_h;
+    *out_logical_w = lw;
+    *out_logical_h = lh;
+    return true;
+}
+
+bool tt_mpv_parse_script_opt_config_dir(const char *script_opts,
+                                        char *out_dir, size_t out_cap) {
+    if (!out_dir || out_cap == 0) return false;
+    out_dir[0] = '\0';
+    if (!script_opts || !script_opts[0]) return false;
+
+    bool found = false;
+    const char *p = script_opts;
+    while (*p) {
+        while (*p == ',') p++;
+        if (!*p) break;
+
+        const char *key = p;
+        const char *eq = NULL;
+        while (*p && *p != ',' && *p != '=') p++;
+        if (*p != '=') {
+            if (*p == ',') p++;
+            continue;
+        }
+        eq = p;
+        size_t klen = (size_t)(eq - key);
+        const char *v = eq + 1;
+
+        const char *val_start = v;
+        size_t vlen = 0;
+        if (*v == '%' && isdigit((unsigned char)v[1])) {
+            char *after_len = NULL;
+            unsigned long plen = strtoul(v + 1, &after_len, 10);
+            if (after_len > v + 1 && *after_len == '%') {
+                val_start = after_len + 1;
+                size_t avail = strlen(val_start);
+                vlen = (plen <= avail) ? (size_t)plen : avail;
+                p = val_start + vlen;
+                if (*p == ',') p++;
+            } else {
+                const char *comma = strchr(v, ',');
+                vlen = comma ? (size_t)(comma - v) : strlen(v);
+                p = comma ? comma + 1 : v + vlen;
+            }
+        } else {
+            const char *comma = strchr(v, ',');
+            vlen = comma ? (size_t)(comma - v) : strlen(v);
+            p = comma ? comma + 1 : v + vlen;
+        }
+
+        if (klen == 18 &&
+            (strncmp(key, "tuitube-config_dir", 18) == 0 ||
+             strncmp(key, "tuitube_config_dir", 18) == 0)) {
+            if (vlen == 0) {
+                continue;
+            }
+            if (vlen == 1 && val_start[0] == '~') {
+                const char *home = getenv("HOME");
+                if (!home || !home[0]) home = "/tmp";
+                int n = snprintf(out_dir, out_cap, "%s", home);
+                if (n < 0 || (size_t)n >= out_cap) {
+                    out_dir[0] = '\0';
+                    return false;
+                }
+            } else if (vlen >= 2 && val_start[0] == '~' && val_start[1] == '/') {
+                const char *home = getenv("HOME");
+                if (!home || !home[0]) home = "/tmp";
+                int n = snprintf(out_dir, out_cap, "%s/%.*s", home,
+                                 (int)(vlen - 2), val_start + 2);
+                if (n < 0 || (size_t)n >= out_cap) {
+                    out_dir[0] = '\0';
+                    return false;
+                }
+            } else {
+                if (vlen >= out_cap) {
+                    out_dir[0] = '\0';
+                    return false;
+                }
+                memcpy(out_dir, val_start, vlen);
+                out_dir[vlen] = '\0';
+            }
+            found = true;
+        }
+    }
+
+    return found;
+}
+
+static void copy_utf8_bounded(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0) return;
+    dst[0] = '\0';
+    if (!src || !src[0]) return;
+    size_t slen = strlen(src);
+    size_t n = slen;
+    if (n >= cap) {
+        n = utf8_clamp_pos(src, cap - 1, slen);
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+bool tt_mpv_parse_key_event(const char *state_str, const char *key_name,
+                            const char *key_text, const char *scale_str,
+                            TtMpvKeyEvent *out) {
+    if (!state_str || !state_str[0] || !key_name || !key_name[0] || !out) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+
+    bool canceled = (state_str[1] != '\0' && state_str[2] == 'c');
+    switch (state_str[0]) {
+        case 'd':
+            out->pressed = !canceled;
+            out->repeat = false;
+            break;
+        case 'r':
+            out->pressed = !canceled;
+            out->repeat = !canceled;
+            break;
+        case 'p':
+            out->pressed = !canceled;
+            out->repeat = false;
+            out->is_press_pulse = !canceled;
+            break;
+        case 'u':
+            out->pressed = false;
+            out->repeat = false;
+            break;
+        default:
+            return false;
+    }
+
+    /* Strip modifier prefixes matching TT_MOD_CTRL/SHIFT/ALT/SUPER (1,2,4,8) */
+    const char *base = key_name;
+    for (;;) {
+        if (tt_strncasecmp(base, "Ctrl+", 5) == 0) {
+            out->mods |= (1u << 0);
+            base += 5;
+        } else if (tt_strncasecmp(base, "Shift+", 6) == 0) {
+            out->mods |= (1u << 1);
+            base += 6;
+        } else if (tt_strncasecmp(base, "Alt+", 4) == 0) {
+            out->mods |= (1u << 2);
+            base += 4;
+        } else if (tt_strncasecmp(base, "Meta+", 5) == 0) {
+            out->mods |= (1u << 3);
+            base += 5;
+        } else if (tt_strncasecmp(base, "Super+", 6) == 0) {
+            out->mods |= (1u << 3);
+            base += 6;
+        } else {
+            break;
+        }
+    }
+    if (!base[0]) return false;
+
+    /* Mouse buttons */
+    if (tt_strcasecmp(base, "MBTN_LEFT") == 0) {
+        out->kind = TT_MPV_INPUT_BUTTON;
+        out->mouse_btn = 1;
+        return true;
+    }
+    if (tt_strcasecmp(base, "MBTN_LEFT_DBL") == 0) {
+        if (!out->pressed) return false;
+        out->kind = TT_MPV_INPUT_BUTTON;
+        out->mouse_btn = 1;
+        out->double_click = true;
+        return true;
+    }
+    if (tt_strcasecmp(base, "MBTN_RIGHT") == 0) {
+        out->kind = TT_MPV_INPUT_BUTTON;
+        out->mouse_btn = 2;
+        return true;
+    }
+    if (tt_strcasecmp(base, "MBTN_MID") == 0) {
+        out->kind = TT_MPV_INPUT_BUTTON;
+        out->mouse_btn = 3;
+        return true;
+    }
+    if (tt_strcasecmp(base, "MBTN_BACK") == 0) {
+        out->kind = TT_MPV_INPUT_BUTTON;
+        out->mouse_btn = 4;
+        return true;
+    }
+    if (tt_strcasecmp(base, "MBTN_FORWARD") == 0) {
+        out->kind = TT_MPV_INPUT_BUTTON;
+        out->mouse_btn = 5;
+        return true;
+    }
+
+    /* Wheel / Axis */
+    bool w_up = (tt_strcasecmp(base, "WHEEL_UP") == 0 || tt_strcasecmp(base, "AXIS_UP") == 0);
+    bool w_down = (tt_strcasecmp(base, "WHEEL_DOWN") == 0 || tt_strcasecmp(base, "AXIS_DOWN") == 0);
+    bool w_left = (tt_strcasecmp(base, "WHEEL_LEFT") == 0 || tt_strcasecmp(base, "AXIS_LEFT") == 0);
+    bool w_right = (tt_strcasecmp(base, "WHEEL_RIGHT") == 0 || tt_strcasecmp(base, "AXIS_RIGHT") == 0);
+    if (w_up || w_down || w_left || w_right) {
+        if (!out->pressed) return false;
+        double sc = 1.0;
+        if (scale_str && scale_str[0]) {
+            char *end = NULL;
+            double v = strtod(scale_str, &end);
+            if (end != scale_str && isfinite(v) && v > 0.0) {
+                sc = v;
+            }
+        }
+        if (sc < 0.05) sc = 0.05;
+        if (sc > 20.0) sc = 20.0;
+        double step = 15.0 * sc;
+        out->kind = TT_MPV_INPUT_WHEEL;
+        if (w_up) out->wheel_dy = -step;
+        else if (w_down) out->wheel_dy = step;
+        else if (w_left) out->wheel_dx = -step;
+        else if (w_right) out->wheel_dx = step;
+        return true;
+    }
+
+    /* Keyboard & ANY_UNICODE / IME text */
+    out->kind = TT_MPV_INPUT_KEY;
+
+    static const struct { const char *name; uint32_t sym; } named[] = {
+        {"ESC",       XKB_KEY_Escape},
+        {"ESCAPE",    XKB_KEY_Escape},
+        {"ENTER",     XKB_KEY_Return},
+        {"RETURN",    XKB_KEY_Return},
+        {"KP_ENTER",  XKB_KEY_KP_Enter},
+        {"TAB",       XKB_KEY_Tab},
+        {"BS",        XKB_KEY_BackSpace},
+        {"BACKSPACE", XKB_KEY_BackSpace},
+        {"DEL",       XKB_KEY_Delete},
+        {"DELETE",    XKB_KEY_Delete},
+        {"INS",       XKB_KEY_Insert},
+        {"INSERT",    XKB_KEY_Insert},
+        {"UP",        XKB_KEY_Up},
+        {"DOWN",      XKB_KEY_Down},
+        {"LEFT",      XKB_KEY_Left},
+        {"RIGHT",     XKB_KEY_Right},
+        {"PGUP",      XKB_KEY_Page_Up},
+        {"PAGE_UP",   XKB_KEY_Page_Up},
+        {"PGDWN",     XKB_KEY_Page_Down},
+        {"PAGE_DOWN", XKB_KEY_Page_Down},
+        {"HOME",      XKB_KEY_Home},
+        {"END",       XKB_KEY_End},
+    };
+    for (size_t i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
+        if (tt_strcasecmp(base, named[i].name) == 0) {
+            out->keysym = named[i].sym;
+            return true;
+        }
+    }
+
+    if (tt_strcasecmp(base, "SPACE") == 0) {
+        out->keysym = XKB_KEY_space;
+        if ((out->mods & ~(1u << 1)) == 0) {
+            out->utf8[0] = ' ';
+            out->utf8[1] = '\0';
+        }
+        return true;
+    }
+    if (tt_strcasecmp(base, "KP_DIVIDE") == 0) {
+        out->keysym = XKB_KEY_slash;
+        if ((out->mods & ((1u << 0) | (1u << 2) | (1u << 3))) == 0) {
+            out->utf8[0] = '/';
+            out->utf8[1] = '\0';
+        }
+        return true;
+    }
+    if (tt_strcasecmp(base, "SHARP") == 0) {
+        out->keysym = (uint32_t)'#';
+        if ((out->mods & ((1u << 0) | (1u << 2) | (1u << 3))) == 0) {
+            out->utf8[0] = '#';
+            out->utf8[1] = '\0';
+        }
+        return true;
+    }
+    if ((base[0] == 'F' || base[0] == 'f') && isdigit((unsigned char)base[1])) {
+        char *end = NULL;
+        long fn = strtol(base + 1, &end, 10);
+        if (end && *end == '\0' && fn >= 1 && fn <= 12) {
+            out->keysym = (uint32_t)(XKB_KEY_F1 + (fn - 1));
+            return true;
+        }
+    }
+
+    if (base[1] == '\0' &&
+        (unsigned char)base[0] >= 0x21 && (unsigned char)base[0] <= 0x7E) {
+        unsigned char c = (unsigned char)base[0];
+        if (c >= 'A' && c <= 'Z') {
+            out->mods |= (1u << 1);
+        }
+        out->keysym = (uint32_t)c;
+        if ((out->mods & ((1u << 0) | (1u << 2) | (1u << 3))) == 0) {
+            const char *txt = (key_text && key_text[0]) ? key_text : base;
+            copy_utf8_bounded(out->utf8, sizeof(out->utf8), txt);
+        }
+        return true;
+    }
+
+    const char *src_text = NULL;
+    if (tt_strcasecmp(base, "ANY_UNICODE") == 0) {
+        src_text = key_text;
+    } else if ((unsigned char)base[0] >= 0x80) {
+        src_text = (key_text && key_text[0]) ? key_text : base;
+    } else if (key_text && key_text[0]) {
+        src_text = key_text;
+    }
+
+    if (!src_text || !src_text[0]) {
+        return false;
+    }
+
+    copy_utf8_bounded(out->utf8, sizeof(out->utf8), src_text);
+    if (!out->utf8[0]) return false;
+
+    if (out->utf8[1] == '\0' &&
+        (unsigned char)out->utf8[0] >= 0x20 && (unsigned char)out->utf8[0] <= 0x7E) {
+        unsigned char c = (unsigned char)out->utf8[0];
+        if (c == ' ') {
+            out->keysym = XKB_KEY_space;
+        } else {
+            if (c >= 'A' && c <= 'Z') {
+                out->mods |= (1u << 1);
+            }
+            out->keysym = (uint32_t)c;
+        }
+    } else {
+        out->keysym = XKB_KEY_NoSymbol;
+    }
     return true;
 }

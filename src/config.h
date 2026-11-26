@@ -84,7 +84,9 @@ typedef struct {
     int playlist_width;
     char *player_path;
     char *video_format;
+    bool has_video_format;
     char *sub_language;
+    bool has_sub_language;
     char *theme_name;
     char *theme_path;
     char *mascot;

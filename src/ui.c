@@ -1,7 +1,6 @@
 #include "ui.h"
 #include "player.h"
 #include "util.h"
-#include "xdg-shell-client-protocol.h"
 
 #include <ctype.h>
 #include <fontconfig/fontconfig.h>
@@ -960,6 +959,9 @@ UiState *ui_create(TuiTubeConfig *cfg, WaylandApp *wl, ThumbCache *thumbs,
     ui_reload_mascot(ui);
     wayland_ime_set_enabled(ui->wl, true);
     ime_sync_surrounding(ui, false);
+    if (ui->cfg) {
+        wayland_set_opaque(ui->wl, ui->cfg->theme.base.bg.a == 255);
+    }
     return ui;
 }
 
@@ -2652,7 +2654,7 @@ static HitId hit_test(UiState *ui, const Layout *L, double x, double y) {
 }
 
 static uint32_t csd_edge_at(const UiState *ui, double lx, double ly) {
-    if (!wayland_needs_csd(ui->wl) || wayland_is_maximized(ui->wl)) return 0;
+    if (!wayland_needs_csd(ui->wl) || wayland_is_maximized(ui->wl)) return TT_RESIZE_NONE;
     double W = 1024.0, H = 640.0;
     logical_viewport(ui, &W, &H);
     double m = 5.0;
@@ -2660,15 +2662,15 @@ static uint32_t csd_edge_at(const UiState *ui, double lx, double ly) {
     bool right = lx >= W - m;
     bool top = ly < m;
     bool bottom = ly >= H - m;
-    if (top && left) return XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT;
-    if (top && right) return XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT;
-    if (bottom && left) return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT;
-    if (bottom && right) return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT;
-    if (top) return XDG_TOPLEVEL_RESIZE_EDGE_TOP;
-    if (bottom) return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
-    if (left) return XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
-    if (right) return XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
-    return 0;
+    if (top && left) return TT_RESIZE_TOP_LEFT;
+    if (top && right) return TT_RESIZE_TOP_RIGHT;
+    if (bottom && left) return TT_RESIZE_BOTTOM_LEFT;
+    if (bottom && right) return TT_RESIZE_BOTTOM_RIGHT;
+    if (top) return TT_RESIZE_TOP;
+    if (bottom) return TT_RESIZE_BOTTOM;
+    if (left) return TT_RESIZE_LEFT;
+    if (right) return TT_RESIZE_RIGHT;
+    return TT_RESIZE_NONE;
 }
 
 static void maybe_infinite_scroll(UiState *ui, const Layout *L) {
@@ -2789,14 +2791,14 @@ void ui_on_pointer_motion(void *ctx, double x, double y) {
     }
 
     uint32_t edge = csd_edge_at(ui, lx, ly);
-    if (edge != 0) {
+    if (edge != TT_RESIZE_NONE) {
         TtCursorShape sh = TT_CURSOR_DEFAULT;
-        if (edge == XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT) sh = TT_CURSOR_NW_RESIZE;
-        else if (edge == XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT) sh = TT_CURSOR_NE_RESIZE;
-        else if (edge == XDG_TOPLEVEL_RESIZE_EDGE_TOP) sh = TT_CURSOR_N_RESIZE;
-        else if (edge == XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM) sh = TT_CURSOR_S_RESIZE;
-        else if (edge == XDG_TOPLEVEL_RESIZE_EDGE_LEFT) sh = TT_CURSOR_W_RESIZE;
-        else if (edge == XDG_TOPLEVEL_RESIZE_EDGE_RIGHT) sh = TT_CURSOR_E_RESIZE;
+        if (edge == TT_RESIZE_TOP_LEFT) sh = TT_CURSOR_NW_RESIZE;
+        else if (edge == TT_RESIZE_TOP_RIGHT) sh = TT_CURSOR_NE_RESIZE;
+        else if (edge == TT_RESIZE_TOP) sh = TT_CURSOR_N_RESIZE;
+        else if (edge == TT_RESIZE_BOTTOM) sh = TT_CURSOR_S_RESIZE;
+        else if (edge == TT_RESIZE_LEFT) sh = TT_CURSOR_W_RESIZE;
+        else if (edge == TT_RESIZE_RIGHT) sh = TT_CURSOR_E_RESIZE;
         wayland_set_cursor(ui->wl, sh);
         return;
     }
@@ -3348,19 +3350,26 @@ static void execute_action(UiState *ui, KeyAction act) {
             break;
         case ACT_SET_DARK_THEME:
             config_apply_theme(ui->cfg, "dark");
+            wayland_set_opaque(ui->wl, ui->cfg->theme.base.bg.a == 255);
             ui_set_status(ui, "Theme: dark");
             break;
         case ACT_SET_LIGHT_THEME:
             config_apply_theme(ui->cfg, "light");
+            wayland_set_opaque(ui->wl, ui->cfg->theme.base.bg.a == 255);
             ui_set_status(ui, "Theme: light");
             break;
         case ACT_SET_YUUKA_THEME:
             config_apply_theme(ui->cfg, "yuuka");
+            wayland_set_opaque(ui->wl, ui->cfg->theme.base.bg.a == 255);
             ui_set_status(ui, "Theme: yuuka");
             break;
         case ACT_SET_CUSTOM_THEME:
-            if (config_apply_theme(ui->cfg, "custom")) ui_set_status(ui, "Theme: custom");
-            else ui_set_status(ui, "Custom theme not configured or invalid");
+            if (config_apply_theme(ui->cfg, "custom")) {
+                wayland_set_opaque(ui->wl, ui->cfg->theme.base.bg.a == 255);
+                ui_set_status(ui, "Theme: custom");
+            } else {
+                ui_set_status(ui, "Custom theme not configured or invalid");
+            }
             break;
         case ACT_CLEAR_THUMBNAIL_CACHE:
             if (ui->cbs.on_clear_cache) ui->cbs.on_clear_cache(ui->user_ctx);
@@ -3800,4 +3809,21 @@ void ui_on_key(void *ctx, uint32_t mods, xkb_keysym_t sym,
     } else if (sym == XKB_KEY_End) {
         move_selection(ui, (ssize_t)ui->list.count);
     }
+}
+
+bool ui_can_escape_internally(const UiState *ui) {
+    if (!ui) return false;
+    if (ui->show_help || ui->ctx_menu.open) return true;
+    if (ui->focus_zone == FOCUS_SEARCH &&
+        (ui->search_len > 0 || ui->ime_preedit_len > 0 || ui->list.count > 0)) {
+        return true;
+    }
+    return false;
+}
+
+void ui_release_hidden_caches(UiState *ui) {
+    if (!ui) return;
+    thumb_cache_flush_ram(ui->thumbs);
+    str_list_free(&ui->inflight_keys, &ui->inflight_count, &ui->inflight_cap);
+    str_list_free(&ui->failed_keys, &ui->failed_count, &ui->failed_cap);
 }

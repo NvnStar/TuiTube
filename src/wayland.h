@@ -27,6 +27,18 @@ typedef enum {
     TT_BTN_FORWARD = 5
 } TtMouseButton;
 
+typedef enum {
+    TT_RESIZE_NONE         = 0,
+    TT_RESIZE_TOP          = 1,
+    TT_RESIZE_BOTTOM       = 2,
+    TT_RESIZE_LEFT         = 4,
+    TT_RESIZE_TOP_LEFT     = 5,
+    TT_RESIZE_BOTTOM_LEFT  = 6,
+    TT_RESIZE_RIGHT        = 8,
+    TT_RESIZE_TOP_RIGHT    = 9,
+    TT_RESIZE_BOTTOM_RIGHT = 10
+} TtResizeEdge;
+
 typedef struct {
     const char *preedit_text;
     int32_t preedit_cursor_begin;
@@ -62,6 +74,7 @@ bool wayland_is_maximized(const WaylandApp *wl);
 bool wayland_should_quit(const WaylandApp *wl);
 void wayland_request_quit(WaylandApp *wl);
 void wayland_request_redraw(WaylandApp *wl);
+void wayland_set_opaque(WaylandApp *wl, bool opaque);
 void wayland_set_cursor(WaylandApp *wl, TtCursorShape shape);
 
 void wayland_start_move(WaylandApp *wl);

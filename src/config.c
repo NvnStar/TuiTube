@@ -395,7 +395,9 @@ void config_init_defaults(TuiTubeConfig *cfg) {
     cfg->playlist_width = 380;
     cfg->player_path = tt_strdup("mpv");
     cfg->video_format = tt_strdup("1080p60");
+    cfg->has_video_format = false;
     cfg->sub_language = tt_strdup("en");
+    cfg->has_sub_language = false;
     cfg->theme_name = tt_strdup("dark");
     cfg->theme_path = tt_strdup("");
     cfg->mascot = tt_strdup("");
@@ -548,7 +550,15 @@ bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
     if (v && yyjson_is_num(v)) cfg->playlist_width = clamp_int((int)yyjson_get_sint(v), 200, 1200);
 
     replace_str_field(root, "player_path", &cfg->player_path);
+    yyjson_val *vf = yyjson_obj_get(root, "video_format");
+    if (vf && yyjson_is_str(vf) && yyjson_get_str(vf)[0] != '\0') {
+        cfg->has_video_format = true;
+    }
     replace_str_field(root, "video_format", &cfg->video_format);
+    yyjson_val *sl = yyjson_obj_get(root, "sub_language");
+    if (sl && yyjson_is_str(sl) && yyjson_get_str(sl)[0] != '\0') {
+        cfg->has_sub_language = true;
+    }
     replace_str_field(root, "sub_language", &cfg->sub_language);
     replace_str_field(root, "theme", &cfg->theme_name);
     replace_str_field(root, "theme_path", &cfg->theme_path);

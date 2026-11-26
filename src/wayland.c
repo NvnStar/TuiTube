@@ -4,14 +4,17 @@
 
 #include "wayland.h"
 #include "config.h"
+#include "fractional-scale-v1-client-protocol.h"
 #include "player.h"
 #include "text-input-unstable-v3-client-protocol.h"
 #include "util.h"
+#include "viewporter-client-protocol.h"
 #include "xdg-decoration-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/input-event-codes.h>
 #include <math.h>
 #include <poll.h>
@@ -27,12 +30,17 @@
 #include <xkbcommon/xkbcommon-compose.h>
 
 typedef struct {
+    struct WaylandApp *owner;
+    int index;
+    int fd;
+    struct wl_shm_pool *pool;
     struct wl_buffer *buffer;
     void *data;
-    size_t size;
+    size_t cap;
     int width;
     int height;
     int stride;
+    uint32_t shm_format;
     bool busy;
 } ShmBuffer;
 
@@ -54,8 +62,14 @@ struct WaylandApp {
     struct wl_data_device_manager *data_mgr;
     struct zxdg_decoration_manager_v1 *deco_mgr;
     struct zwp_text_input_manager_v3 *ti_mgr;
+    struct wp_viewporter *viewporter;
+    struct wp_fractional_scale_manager_v1 *frac_scale_mgr;
 
     struct wl_surface *surface;
+    struct wp_viewport *viewport;
+    struct wp_fractional_scale_v1 *frac_scale;
+    struct wl_callback *frame_cb;
+    uint64_t frame_req_ms;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
     struct zxdg_toplevel_decoration_v1 *toplevel_deco;
@@ -110,6 +124,14 @@ struct WaylandApp {
     int pending_width;
     int pending_height;
     int buf_scale;
+    int surface_pref_scale;
+    uint32_t preferred_scale_120;
+    uint32_t pending_configure_serial;
+    bool has_pending_configure;
+    bool opaque;
+    int opaque_w;
+    int opaque_h;
+    bool opaque_region_valid;
     bool configured;
     bool maximized;
     bool needs_csd;
@@ -137,71 +159,211 @@ static uint64_t monotonic_ms(void) {
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+static int effective_int_scale(const WaylandApp *wl) {
+    int sc = wl->surface_pref_scale > 0 ? wl->surface_pref_scale : wl->buf_scale;
+    if (sc < 1) return 1;
+    if (sc > 4) return 4;
+    return sc;
+}
+
+static bool target_buffer_dims(const WaylandApp *wl, int *out_pw, int *out_ph) {
+    int int_sc = effective_int_scale(wl);
+    uint32_t s120 = (wl->viewport && wl->preferred_scale_120 > 0) ? wl->preferred_scale_120 : 0u;
+    return tt_shm_target_dims(wl->width, wl->height, s120, int_sc, out_pw, out_ph);
+}
+
 static void shm_buffer_destroy(ShmBuffer *b) {
+    if (!b) return;
     if (b->buffer) wl_buffer_destroy(b->buffer);
-    if (b->data && b->data != MAP_FAILED) munmap(b->data, b->size);
+    if (b->pool) wl_shm_pool_destroy(b->pool);
+    if (b->data && b->data != MAP_FAILED && b->cap > 0) munmap(b->data, b->cap);
+    if (b->fd >= 0) close(b->fd);
+    WaylandApp *owner = b->owner;
+    int index = b->index;
     memset(b, 0, sizeof(*b));
+    b->owner = owner;
+    b->index = index;
+    b->fd = -1;
 }
 
 static void buffer_release_cb(void *data, struct wl_buffer *wl_buffer) {
-    (void)wl_buffer;
     ShmBuffer *b = data;
+    if (!b || b->buffer != wl_buffer) return;
     b->busy = false;
+
+    WaylandApp *wl = b->owner;
+    if (!wl) return;
+
+    int pw = 0, ph = 0;
+    if (!target_buffer_dims(wl, &pw, &ph)) return;
+
+    uint32_t shm_fmt = wl->opaque ? WL_SHM_FORMAT_XRGB8888 : WL_SHM_FORMAT_ARGB8888;
+    cairo_format_t cairo_fmt = wl->opaque ? CAIRO_FORMAT_RGB24 : CAIRO_FORMAT_ARGB32;
+    int stride = cairo_format_stride_for_width(cairo_fmt, pw);
+    if (stride <= 0) return;
+    size_t needed = (size_t)stride * (size_t)ph;
+
+    /* Evict stale-dimension/format or oversized buffer immediately on release */
+    if (b->width != pw || b->height != ph || b->shm_format != shm_fmt ||
+        tt_shm_should_shrink(needed, b->cap)) {
+        shm_buffer_destroy(b);
+        return;
+    }
+
+    /* Evict duplicate idle buffer so steady-state idle holds at most 1 buffer */
+    ShmBuffer *other = &wl->buffers[1 - b->index];
+    if (other->buffer != NULL && !other->busy &&
+        other->width == pw && other->height == ph && other->shm_format == shm_fmt &&
+        !tt_shm_should_shrink(needed, other->cap)) {
+        shm_buffer_destroy(b);
+    }
 }
 
 static const struct wl_buffer_listener buffer_listener = {
     .release = buffer_release_cb
 };
 
-static bool shm_buffer_ensure(WaylandApp *wl, ShmBuffer *b, int lw, int lh, int scale) {
-    int pw = lw * scale;
-    int ph = lh * scale;
+static bool shm_buffer_ensure(WaylandApp *wl, ShmBuffer *b, int pw, int ph,
+                              uint32_t shm_fmt, cairo_format_t cairo_fmt) {
     if (pw <= 0 || ph <= 0) return false;
-    if (b->buffer && b->width == pw && b->height == ph) return true;
+    int stride = cairo_format_stride_for_width(cairo_fmt, pw);
+    if (stride <= 0) return false;
+    size_t needed = (size_t)stride * (size_t)ph;
+    size_t target_cap = tt_shm_pool_capacity(needed);
+    if (target_cap == 0) return false;
 
-    shm_buffer_destroy(b);
-
-    int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, pw);
-    size_t size = (size_t)stride * (size_t)ph;
-
-    int fd = memfd_create("tuitube-shm", MFD_CLOEXEC);
-    if (fd < 0) return false;
-    if (ftruncate(fd, (off_t)size) != 0) {
-        close(fd);
-        return false;
+    if (b->buffer && b->width == pw && b->height == ph &&
+        b->shm_format == shm_fmt && !tt_shm_should_shrink(needed, b->cap)) {
+        return true;
     }
 
-    void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) {
-        close(fd);
-        return false;
+    if (b->pool && tt_shm_should_shrink(needed, b->cap)) {
+        shm_buffer_destroy(b);
     }
 
-    struct wl_shm_pool *pool = wl_shm_create_pool(wl->shm, fd, (int32_t)size);
-    close(fd);
-    if (!pool) {
-        munmap(data, size);
-        return false;
+    if (b->pool) {
+        if (b->buffer) {
+            wl_buffer_destroy(b->buffer);
+            b->buffer = NULL;
+        }
+        if (needed > b->cap) {
+            if (ftruncate(b->fd, (off_t)target_cap) == 0) {
+                void *new_data = mremap(b->data, b->cap, target_cap, MREMAP_MAYMOVE);
+                if (new_data != MAP_FAILED) {
+                    b->data = new_data;
+                    b->cap = target_cap;
+                    wl_shm_pool_resize(b->pool, (int32_t)target_cap);
+                } else {
+                    shm_buffer_destroy(b);
+                }
+            } else {
+                shm_buffer_destroy(b);
+            }
+        }
+    }
+
+    if (!b->pool) {
+        int fd = memfd_create("tuitube-shm", MFD_CLOEXEC);
+        if (fd < 0) return false;
+        if (ftruncate(fd, (off_t)target_cap) != 0) {
+            close(fd);
+            return false;
+        }
+
+        void *data = mmap(NULL, target_cap, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (data == MAP_FAILED) {
+            close(fd);
+            return false;
+        }
+
+        struct wl_shm_pool *pool = wl_shm_create_pool(wl->shm, fd, (int32_t)target_cap);
+        if (!pool) {
+            munmap(data, target_cap);
+            close(fd);
+            return false;
+        }
+
+        b->fd = fd;
+        b->pool = pool;
+        b->data = data;
+        b->cap = target_cap;
     }
 
     struct wl_buffer *buf = wl_shm_pool_create_buffer(
-        pool, 0, pw, ph, stride, WL_SHM_FORMAT_ARGB8888);
-    wl_shm_pool_destroy(pool);
+        b->pool, 0, pw, ph, stride, shm_fmt);
     if (!buf) {
-        munmap(data, size);
+        shm_buffer_destroy(b);
         return false;
     }
 
     wl_buffer_add_listener(buf, &buffer_listener, b);
     b->buffer = buf;
-    b->data = data;
-    b->size = size;
     b->width = pw;
     b->height = ph;
     b->stride = stride;
+    b->shm_format = shm_fmt;
     b->busy = false;
     return true;
 }
+
+/* wl_surface & wp_fractional_scale_v1 & wl_surface.frame */
+static void surface_enter(void *data, struct wl_surface *surface, struct wl_output *output) {
+    (void)data; (void)surface; (void)output;
+}
+
+static void surface_leave(void *data, struct wl_surface *surface, struct wl_output *output) {
+    (void)data; (void)surface; (void)output;
+}
+
+#ifdef WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
+static void surface_preferred_buffer_scale(void *data, struct wl_surface *surface, int32_t factor) {
+    (void)surface;
+    WaylandApp *wl = data;
+    if (factor >= 1 && factor <= 4 && factor != wl->surface_pref_scale) {
+        wl->surface_pref_scale = factor;
+        wl->dirty = true;
+    }
+}
+
+static void surface_preferred_buffer_transform(void *data, struct wl_surface *surface, uint32_t transform) {
+    (void)data; (void)surface; (void)transform;
+}
+#endif
+
+static const struct wl_surface_listener surface_listener = {
+    .enter = surface_enter,
+    .leave = surface_leave,
+#ifdef WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
+    .preferred_buffer_scale = surface_preferred_buffer_scale,
+    .preferred_buffer_transform = surface_preferred_buffer_transform
+#endif
+};
+
+static void frac_scale_preferred_scale(void *data, struct wp_fractional_scale_v1 *fs, uint32_t scale) {
+    (void)fs;
+    WaylandApp *wl = data;
+    if (scale >= 60u && scale <= 480u && scale != wl->preferred_scale_120) {
+        wl->preferred_scale_120 = scale;
+        wl->dirty = true;
+    }
+}
+
+static const struct wp_fractional_scale_v1_listener frac_scale_listener = {
+    .preferred_scale = frac_scale_preferred_scale
+};
+
+static void frame_done_cb(void *data, struct wl_callback *cb, uint32_t time) {
+    (void)time;
+    WaylandApp *wl = data;
+    if (wl && wl->frame_cb == cb) {
+        wl->frame_cb = NULL;
+    }
+    wl_callback_destroy(cb);
+}
+
+static const struct wl_callback_listener frame_listener = {
+    .done = frame_done_cb
+};
 
 /* xdg_wm_base */
 static void wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
@@ -215,8 +377,10 @@ static const struct xdg_wm_base_listener wm_base_listener = {
 
 /* xdg_surface */
 static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial) {
+    (void)xdg_surface;
     WaylandApp *wl = data;
-    xdg_surface_ack_configure(xdg_surface, serial);
+    wl->pending_configure_serial = serial;
+    wl->has_pending_configure = true;
     if (wl->pending_width > 0 && wl->pending_height > 0) {
         if (wl->pending_width != wl->width || wl->pending_height != wl->height) {
             wl->width = wl->pending_width;
@@ -1058,7 +1222,7 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
                             const char *iface, uint32_t version) {
     WaylandApp *wl = data;
     if (strcmp(iface, wl_compositor_interface.name) == 0) {
-        uint32_t v = version < 4 ? version : 4;
+        uint32_t v = version < 6 ? version : 6;
         wl->compositor = wl_registry_bind(reg, name, &wl_compositor_interface, v);
     } else if (strcmp(iface, wl_shm_interface.name) == 0) {
         wl->shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
@@ -1081,6 +1245,10 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
         wl->deco_mgr = wl_registry_bind(reg, name, &zxdg_decoration_manager_v1_interface, 1);
     } else if (strcmp(iface, zwp_text_input_manager_v3_interface.name) == 0) {
         wl->ti_mgr = wl_registry_bind(reg, name, &zwp_text_input_manager_v3_interface, 1);
+    } else if (strcmp(iface, wp_viewporter_interface.name) == 0) {
+        wl->viewporter = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
+    } else if (strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0) {
+        wl->frac_scale_mgr = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
     }
 }
 
@@ -1098,6 +1266,14 @@ WaylandApp *wayland_create(int init_width, int init_height, const char *title,
                            char *err_buf, size_t err_cap) {
     WaylandApp *wl = calloc(1, sizeof(WaylandApp));
     if (!wl) return NULL;
+
+    wl->buffers[0].owner = wl;
+    wl->buffers[0].index = 0;
+    wl->buffers[0].fd = -1;
+    wl->buffers[1].owner = wl;
+    wl->buffers[1].index = 1;
+    wl->buffers[1].fd = -1;
+    wl->opaque = true;
 
     wl->width = init_width >= 640 ? init_width : 1024;
     wl->height = init_height >= 400 ? init_height : 640;
@@ -1166,6 +1342,21 @@ WaylandApp *wayland_create(int init_width, int init_height, const char *title,
     wl->cursor_surface = wl_compositor_create_surface(wl->compositor);
 
     wl->surface = wl_compositor_create_surface(wl->compositor);
+    wl_surface_add_listener(wl->surface, &surface_listener, wl);
+    if (wl->viewporter && wl->frac_scale_mgr) {
+        wl->viewport = wp_viewporter_get_viewport(wl->viewporter, wl->surface);
+        if (wl->viewport) {
+            wl->frac_scale = wp_fractional_scale_manager_v1_get_fractional_scale(
+                wl->frac_scale_mgr, wl->surface);
+            if (wl->frac_scale) {
+                wp_fractional_scale_v1_add_listener(wl->frac_scale, &frac_scale_listener, wl);
+            } else {
+                wp_viewport_destroy(wl->viewport);
+                wl->viewport = NULL;
+            }
+        }
+    }
+
     wl->xdg_surface = xdg_wm_base_get_xdg_surface(wl->wm_base, wl->surface);
     xdg_surface_add_listener(wl->xdg_surface, &xdg_surface_listener, wl);
 
@@ -1194,6 +1385,10 @@ WaylandApp *wayland_create(int init_width, int init_height, const char *title,
 
 void wayland_destroy(WaylandApp *wl) {
     if (!wl) return;
+    if (wl->frame_cb) {
+        wl_callback_destroy(wl->frame_cb);
+        wl->frame_cb = NULL;
+    }
     shm_buffer_destroy(&wl->buffers[0]);
     shm_buffer_destroy(&wl->buffers[1]);
 
@@ -1207,6 +1402,8 @@ void wayland_destroy(WaylandApp *wl) {
     }
     if (wl->data_device) wl_data_device_destroy(wl->data_device);
 
+    if (wl->frac_scale) wp_fractional_scale_v1_destroy(wl->frac_scale);
+    if (wl->viewport) wp_viewport_destroy(wl->viewport);
     if (wl->toplevel_deco) zxdg_toplevel_decoration_v1_destroy(wl->toplevel_deco);
     if (wl->toplevel) xdg_toplevel_destroy(wl->toplevel);
     if (wl->xdg_surface) xdg_surface_destroy(wl->xdg_surface);
@@ -1226,6 +1423,8 @@ void wayland_destroy(WaylandApp *wl) {
     if (wl->xkb_ctx) xkb_context_unref(wl->xkb_ctx);
     if (wl->repeat_timer_fd >= 0) close(wl->repeat_timer_fd);
 
+    if (wl->frac_scale_mgr) wp_fractional_scale_manager_v1_destroy(wl->frac_scale_mgr);
+    if (wl->viewporter) wp_viewporter_destroy(wl->viewporter);
     if (wl->ti_mgr) zwp_text_input_manager_v3_destroy(wl->ti_mgr);
     if (wl->deco_mgr) zxdg_decoration_manager_v1_destroy(wl->deco_mgr);
     if (wl->data_mgr) wl_data_device_manager_destroy(wl->data_mgr);
@@ -1244,6 +1443,13 @@ bool wayland_is_maximized(const WaylandApp *wl) { return wl ? wl->maximized : fa
 bool wayland_should_quit(const WaylandApp *wl) { return wl ? wl->quit : true; }
 void wayland_request_quit(WaylandApp *wl) { if (wl) wl->quit = true; }
 void wayland_request_redraw(WaylandApp *wl) { if (wl) wl->dirty = true; }
+
+void wayland_set_opaque(WaylandApp *wl, bool opaque) {
+    if (!wl || wl->opaque == opaque) return;
+    wl->opaque = opaque;
+    wl->opaque_region_valid = false;
+    wl->dirty = true;
+}
 
 void wayland_start_move(WaylandApp *wl) {
     if (wl && wl->toplevel && wl->seat) {
@@ -1335,8 +1541,19 @@ char *wayland_clipboard_paste(WaylandApp *wl) {
 }
 
 void wayland_render_if_needed(WaylandApp *wl) {
-    if (!wl || !wl->configured || !wl->dirty) return;
-    if (wl->width <= 0 || wl->height <= 0) return;
+    if (!wl || !wl->configured || !wl->dirty || wl->width <= 0 || wl->height <= 0) return;
+
+    if (wl->frame_cb != NULL) {
+        if (wl->has_pending_configure && (monotonic_ms() - wl->frame_req_ms) >= 50u) {
+            wl_callback_destroy(wl->frame_cb);
+            wl->frame_cb = NULL;
+        } else {
+            return;
+        }
+    }
+
+    int pw = 0, ph = 0;
+    if (!target_buffer_dims(wl, &pw, &ph)) return;
 
     ShmBuffer *b = NULL;
     for (int i = 0; i < 2; i++) {
@@ -1347,16 +1564,23 @@ void wayland_render_if_needed(WaylandApp *wl) {
     }
     if (!b) return;
 
-    if (!shm_buffer_ensure(wl, b, wl->width, wl->height, wl->buf_scale)) return;
+    ShmBuffer *other = &wl->buffers[1 - b->index];
+    if (!other->busy && other->pool != NULL) {
+        shm_buffer_destroy(other);
+    }
+
+    uint32_t shm_fmt = wl->opaque ? WL_SHM_FORMAT_XRGB8888 : WL_SHM_FORMAT_ARGB8888;
+    cairo_format_t cairo_fmt = wl->opaque ? CAIRO_FORMAT_RGB24 : CAIRO_FORMAT_ARGB32;
+    if (!shm_buffer_ensure(wl, b, pw, ph, shm_fmt, cairo_fmt)) return;
 
     cairo_surface_t *surf = cairo_image_surface_create_for_data(
-        b->data, CAIRO_FORMAT_ARGB32, b->width, b->height, b->stride);
+        b->data, cairo_fmt, b->width, b->height, b->stride);
     if (!surf || cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
         if (surf) cairo_surface_destroy(surf);
         return;
     }
     cairo_t *cr = cairo_create(surf);
-    cairo_scale(cr, (double)wl->buf_scale, (double)wl->buf_scale);
+    cairo_scale(cr, (double)pw / (double)wl->width, (double)ph / (double)wl->height);
 
     if (wl->cbs.on_render) {
         wl->cbs.on_render(wl->user_ctx, cr, wl->width, wl->height);
@@ -1366,9 +1590,49 @@ void wayland_render_if_needed(WaylandApp *wl) {
     cairo_surface_flush(surf);
     cairo_surface_destroy(surf);
 
-    wl_surface_set_buffer_scale(wl->surface, wl->buf_scale);
+    if (wl->viewport && wl->preferred_scale_120 > 0) {
+        wl_surface_set_buffer_scale(wl->surface, 1);
+        wp_viewport_set_destination(wl->viewport, wl->width, wl->height);
+    } else {
+        if (wl->viewport) {
+            wp_viewport_set_destination(wl->viewport, -1, -1);
+        }
+        wl_surface_set_buffer_scale(wl->surface, effective_int_scale(wl));
+    }
+
+    if (!wl->opaque_region_valid || wl->opaque_w != wl->width || wl->opaque_h != wl->height) {
+        if (wl->opaque) {
+            struct wl_region *reg = wl_compositor_create_region(wl->compositor);
+            if (reg) {
+                wl_region_add(reg, 0, 0, wl->width, wl->height);
+                wl_surface_set_opaque_region(wl->surface, reg);
+                wl_region_destroy(reg);
+            }
+        } else {
+            wl_surface_set_opaque_region(wl->surface, NULL);
+        }
+        wl->opaque_w = wl->width;
+        wl->opaque_h = wl->height;
+        wl->opaque_region_valid = true;
+    }
+
+    if (wl->has_pending_configure) {
+        xdg_surface_ack_configure(wl->xdg_surface, wl->pending_configure_serial);
+        wl->has_pending_configure = false;
+    }
+
+    wl->frame_cb = wl_surface_frame(wl->surface);
+    if (wl->frame_cb) {
+        wl_callback_add_listener(wl->frame_cb, &frame_listener, wl);
+        wl->frame_req_ms = monotonic_ms();
+    }
+
     wl_surface_attach(wl->surface, b->buffer, 0, 0);
-    wl_surface_damage(wl->surface, 0, 0, wl->width, wl->height);
+    if (wl_surface_get_version(wl->surface) >= 4) {
+        wl_surface_damage_buffer(wl->surface, 0, 0, pw, ph);
+    } else {
+        wl_surface_damage(wl->surface, 0, 0, wl->width, wl->height);
+    }
     b->busy = true;
     wl->dirty = false;
     wl_surface_commit(wl->surface);

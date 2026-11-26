@@ -124,6 +124,7 @@ static bool perform_curl(CURL *reuse_handle, const char *url,
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 25L);
+    curl_easy_setopt(curl, CURLOPT_MAXCONNECTS, 2L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, HTTP_USER_AGENT);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
@@ -142,7 +143,11 @@ static bool perform_curl(CURL *reuse_handle, const char *url,
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out->status_code);
 
     if (slist) curl_slist_free_all(slist);
-    if (!reuse_handle) curl_easy_cleanup(curl);
+    if (reuse_handle) {
+        curl_easy_reset(curl);
+    } else {
+        curl_easy_cleanup(curl);
+    }
 
     if (rc != CURLE_OK) {
         if (ctx.overflow) {
@@ -426,6 +431,22 @@ void http_pool_set_active_gen(HttpPool *pool, uint64_t gen) {
     if (!pool) return;
     pthread_mutex_lock(&pool->mu);
     pool->active_gen = gen;
+    pthread_mutex_unlock(&pool->mu);
+}
+
+void http_pool_drop_thumbnails(HttpPool *pool) {
+    if (!pool) return;
+    pthread_mutex_lock(&pool->mu);
+    size_t w = 0;
+    for (size_t i = 0; i < pool->job_count; i++) {
+        if (pool->jobs[i].type == JOB_THUMBNAIL) {
+            if (pool->jobs[i].free_arg) pool->jobs[i].free_arg(pool->jobs[i].arg);
+        } else {
+            if (w != i) pool->jobs[w] = pool->jobs[i];
+            w++;
+        }
+    }
+    pool->job_count = w;
     pthread_mutex_unlock(&pool->mu);
 }
 
