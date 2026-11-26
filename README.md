@@ -134,7 +134,7 @@ mpv.exe --idle --script=.\tuitube.dll
   (`script-binding tuitube/toggle`, `script-message tuitube-open`, and `script-message tuitube-close` are also supported.)
 - **Closing `mpv`:** Triggering an OS/window-manager close-window action (titlebar `[X]`, `Alt+F4`, or your compositor's window-close shortcut) quits `mpv` directly even while the TuiTube overlay is open (`Ctrl+Q` and `Esc` hide only the overlay).
 - **Playback Behavior:** Videos play directly in the host `mpv` window via `loadfile`, respecting your `mpv.conf` unless `"video_format"` or `"sub_language"` are explicitly set in `tuitube.json`.
-- **Override Config Dir:** Pass `--script-opts=tuitube-config_dir=/path/to/dir` (or `C:\path\to\dir` on Windows).
+- **Plugin Config Location:** `tuitube.json` is optional. When customizing the `mpv` plugin, you can drop `tuitube.json` directly into `mpv`'s `script-opts/` directory (`~/.config/mpv/script-opts/tuitube.json` on Linux, `%APPDATA%\mpv\script-opts\tuitube.json` on Windows, or `portable_config\script-opts\tuitube.json` for portable `mpv`) — or share `~/.config/tuitube/tuitube.json` / `%APPDATA%\tuitube\tuitube.json` with standalone TuiTube. You can also override the full directory via `script-opts-append=tuitube-config_dir=...` in `mpv.conf` or portable `tuitube_portable_mode.txt` beside `tuitube.so`/`tuitube.dll`.
 
 > **Windows Security Note (Unsigned Binaries):** Windows release binaries (`tuitube.exe`, `tuitube.dll`, and bundled MSYS2 UCRT64 runtime DLLs) are **unsigned** open-source builds.
 > - **Microsoft Defender SmartScreen:** Click *More info -> Run anyway*, or run `Unblock-File .\tuitube-windows-x64.zip` in PowerShell before extracting.
@@ -151,23 +151,31 @@ Both the standalone app and the `mpv` plugin share the same config, favorites, h
 ```text
 Standard Mode (Linux)
 ├── ~/.config/tuitube/
-│   ├── tuitube.json                # User configuration (optional)
+│   ├── tuitube.json                # Shared config (standalone & mpv plugin fallback)
 │   ├── favlist.json                # Saved channels & playlists
 │   ├── history.json                # Watch history
 │   └── yt-dlp                      # Optional local yt-dlp binary (chmod +x)
 ├── ~/.cache/tuitube/thumbs/        # Disk thumbnail cache
-└── ~/.config/mpv/scripts/
-    └── tuitube.so                  # Native mpv C plugin (optional)
+└── ~/.config/mpv/
+    ├── script-opts/
+    │   └── tuitube.json            # Optional mpv-plugin config (auto-discovered by tuitube.so)
+    ├── input.conf                  # Optional: custom toggle key (default F12)
+    └── scripts/
+        └── tuitube.so              # Native mpv C plugin (optional)
 
 Standard Mode (Windows)
 ├── %APPDATA%\tuitube\
-│   ├── tuitube.json                # User configuration (optional)
+│   ├── tuitube.json                # Shared config (standalone & mpv plugin fallback)
 │   ├── favlist.json                # Saved channels & playlists
 │   ├── history.json                # Watch history
 │   └── yt-dlp.exe                  # Optional local yt-dlp.exe
 ├── %LOCALAPPDATA%\tuitube\thumbs\  # Disk thumbnail cache
-└── %APPDATA%\mpv\scripts\
-    └── tuitube.dll                 # Native mpv C plugin (+ runtime DLLs if not in PATH)
+└── %APPDATA%\mpv\
+    ├── script-opts\
+    │   └── tuitube.json            # Optional mpv-plugin config (auto-discovered by tuitube.dll)
+    ├── input.conf                  # Optional: custom toggle key (default F12)
+    └── scripts\
+        └── tuitube.dll             # Native mpv C plugin (+ runtime DLLs if not in PATH)
 
 Portable Mode (any directory containing tuitube_portable_mode.txt)
 ├── tuitube / tuitube.exe           # Standalone app (or tuitube.so / tuitube.dll plugin)

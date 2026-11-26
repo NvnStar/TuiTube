@@ -497,6 +497,13 @@ double config_effective_ui_scale(const TuiTubeConfig *cfg) {
 
 char *config_resolve_asset_path(const TuiTubeConfig *cfg, const char *rel_or_abs) {
     if (!cfg || !rel_or_abs || !rel_or_abs[0]) return NULL;
+    if (!tt_is_abs_path(rel_or_abs) && cfg->config_file_dir[0]) {
+        char *from_cfg_file = tt_path_join(cfg->config_file_dir, rel_or_abs);
+        if (from_cfg_file && tt_file_exists(from_cfg_file)) {
+            return from_cfg_file;
+        }
+        free(from_cfg_file);
+    }
     char *primary = tt_path_join(cfg->config_dir, rel_or_abs);
     if (!tt_is_abs_path(rel_or_abs) && (!primary || !tt_file_exists(primary)) && !cfg->portable_mode) {
         char exe_dir[PATH_MAX];
@@ -617,19 +624,59 @@ static void read_bool_field(yyjson_val *obj, const char *key, bool *dst) {
     }
 }
 
+static void copy_parent_dir(const char *path, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    out[0] = '\0';
+    if (!path || !path[0]) return;
+    const char *last_sep = NULL;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') last_sep = p;
+    }
+    if (!last_sep) return;
+    size_t dlen = (size_t)(last_sep - path);
+    if (dlen == 0) {
+        if (out_cap >= 2) {
+            out[0] = '/';
+            out[1] = '\0';
+        }
+        return;
+    }
+#ifdef _WIN32
+    if (dlen == 2 && isalpha((unsigned char)path[0]) && path[1] == ':') {
+        dlen = 3;
+    }
+#endif
+    if (dlen >= out_cap) return;
+    memcpy(out, path, dlen);
+    out[dlen] = '\0';
+}
+
 bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
+    return config_load_from(cfg, cli_config_dir, NULL);
+}
+
+bool config_load_from(TuiTubeConfig *cfg, const char *cli_config_dir,
+                      const char *override_config_file) {
     config_init_defaults(cfg);
     tt_resolve_paths(cli_config_dir,
                      cfg->config_dir, sizeof(cfg->config_dir),
                      cfg->cache_dir, sizeof(cfg->cache_dir),
                      &cfg->portable_mode);
 
-    char *cfg_path = tt_path_join(cfg->config_dir, "tuitube.json");
-    if (!cfg_path) return false;
-
     size_t len = 0;
-    char *raw = tt_read_file(cfg_path, &len);
-    free(cfg_path);
+    char *raw = NULL;
+    if (override_config_file && override_config_file[0]) {
+        raw = tt_read_file(override_config_file, &len);
+        if (raw) {
+            copy_parent_dir(override_config_file, cfg->config_file_dir, sizeof(cfg->config_file_dir));
+        }
+    }
+    if (!raw) {
+        char *cfg_path = tt_path_join(cfg->config_dir, "tuitube.json");
+        if (!cfg_path) return false;
+        raw = tt_read_file(cfg_path, &len);
+        free(cfg_path);
+    }
     if (!raw && (!cli_config_dir || !cli_config_dir[0]) && !cfg->portable_mode) {
         char exe_dir[PATH_MAX];
         if (tt_get_exe_dir(exe_dir, sizeof(exe_dir))) {

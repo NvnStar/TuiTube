@@ -10,18 +10,21 @@ At startup, TuiTube resolves its active directory (`config_dir`) and loads `tuit
 
 1. **Explicit CLI / Plugin Override (`cli_config_dir`):**
    - **Standalone:** `tuitube --config-dir /path/to/dir` (or `C:\path\to\dir` on Windows).
-   - **`mpv` Plugin:** `mpv --script-opts=tuitube-config_dir=/path/to/dir` (also accepts `tuitube_config_dir=...`, `~/...` home expansion, and mpv `%<len>%...` length-prefixed values).
+   - **`mpv` Plugin:** `mpv --script-opts=tuitube-config_dir=/path/to/dir` (or `script-opts-append=tuitube-config_dir=...` in `mpv.conf`; also accepts `tuitube_config_dir=...`, `~/...` home expansion, and mpv `%<len>%...` length-prefixed values).
 2. **Portable Mode (`tuitube_portable_mode.txt`):**
    - If an empty file named `tuitube_portable_mode.txt` exists in the same directory as the binary or plugin (`<exe_dir>`), TuiTube stores `tuitube.json`, `favlist.json`, `history.json`, thumbnail cache (`<exe_dir>/cache/thumbs`), and default downloads (`<exe_dir>/downloads`) inside `<exe_dir>`.
    - Release archives intentionally do **not** include `tuitube_portable_mode.txt` so extracting updates does not overwrite user data or fail in read-only install directories (e.g. `C:\Program Files`, `/opt`).
-3. **Standard User Config Directory:**
+3. **`mpv` Plugin `script-opts/tuitube.json` (Plugin only):**
+   - When running as `tuitube.so` / `tuitube.dll` (without an explicit `tuitube-config_dir` or portable mode), TuiTube checks `mpv`'s resolved `~~/script-opts/tuitube.json` (`~/.config/mpv/script-opts/tuitube.json` on Linux, `%APPDATA%\mpv\script-opts\tuitube.json` on Windows, or `portable_config\script-opts\tuitube.json` for portable `mpv`).
+   - Relative asset paths (`theme_path`, `font`, `mascot`) check that `script-opts/` directory first, while `favlist.json`, `history.json`, and thumbnail cache stay in the standard TuiTube user directories so they remain shared and don't clutter `mpv/script-opts/`.
+4. **Standard User Config Directory:**
    - **Linux:** `$XDG_CONFIG_HOME/tuitube/tuitube.json` (if `XDG_CONFIG_HOME` is set) or `~/.config/tuitube/tuitube.json`.
    - **Windows:** `$XDG_CONFIG_HOME/tuitube/tuitube.json` (if set), `%APPDATA%\tuitube\tuitube.json`, or `%USERPROFILE%\AppData\Roaming\tuitube\tuitube.json`.
-4. **Standalone `<exe_dir>/tuitube.json` Fallback:**
+5. **Standalone `<exe_dir>/tuitube.json` Fallback:**
    - When no `--config-dir` override and no `tuitube_portable_mode.txt` are active, and `<config_dir>/tuitube.json` does not exist yet, standalone TuiTube falls back to `<exe_dir>/tuitube.json` (such as the starter `tuitube.json` shipped beside `tuitube` / `tuitube.exe`).
    - `favlist.json` and `history.json` still save to the standard `<config_dir>` so user data stays safe across upgrades.
    - Relative asset paths (`theme_path`, `font`, `mascot`) also fall back to `<exe_dir>/<relative_path>` when not found in `<config_dir>`.
-5. **Built-in Defaults:** If no `tuitube.json` exists anywhere, built-in defaults are used cleanly.
+6. **Built-in Defaults:** If no `tuitube.json` exists anywhere, built-in defaults are used cleanly.
 
 ### State, Cache, and Download Locations
 

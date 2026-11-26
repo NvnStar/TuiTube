@@ -573,9 +573,33 @@ static bool mpv_host_play_video(void *play_ctx, const TuiTubeConfig *cfg,
     return true;
 }
 
-static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out_cap) {
+static void find_mpv_script_opts_config(mpv_handle *mpv, char *out_file, size_t out_cap) {
+    if (!out_file || out_cap == 0) return;
+    out_file[0] = '\0';
+    if (!mpv) return;
+#ifdef MPV_CPLUGIN_DYNAMIC_SYM
+    if (!mpv_command_ret || !mpv_free_node_contents) return;
+#endif
+    const char *args[] = {"expand-path", "~~/script-opts", NULL};
+    mpv_node res;
+    memset(&res, 0, sizeof(res));
+    if (mpv_command_ret(mpv, args, &res) >= 0) {
+        if (res.format == MPV_FORMAT_STRING && res.u.string && res.u.string[0]) {
+            char *cand = tt_path_join(res.u.string, "tuitube.json");
+            if (cand && tt_file_exists(cand) && strlen(cand) < out_cap) {
+                snprintf(out_file, out_cap, "%s", cand);
+            }
+            free(cand);
+        }
+        mpv_free_node_contents(&res);
+    }
+}
+
+static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out_cap,
+                                      char *out_override_cfg, size_t out_override_cap) {
     if (!out_dir || out_cap == 0) return false;
     out_dir[0] = '\0';
+    if (out_override_cfg && out_override_cap > 0) out_override_cfg[0] = '\0';
 
     char *sopts = mpv_get_property_string(mpv, "script-opts");
     if (sopts) {
@@ -621,6 +645,8 @@ static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out
         }
     }
 
+    find_mpv_script_opts_config(mpv, out_override_cfg, out_override_cap);
+
     const char *xdg_cfg = getenv("XDG_CONFIG_HOME");
     const char *appdata = getenv("APPDATA");
     const char *userprofile = getenv("USERPROFILE");
@@ -658,6 +684,8 @@ static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out
             }
         }
     }
+
+    find_mpv_script_opts_config(mpv, out_override_cfg, out_override_cap);
 
     const char *xdg_cfg = getenv("XDG_CONFIG_HOME");
     const char *home = getenv("HOME");
@@ -997,10 +1025,13 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
     sanitize_client_name(mpv_client_name(mpv), wl.client_name, sizeof(wl.client_name));
 
     char cfg_dir[PATH_MAX] = {0};
-    resolve_plugin_config_dir(mpv, cfg_dir, sizeof(cfg_dir));
+    char override_cfg_file[PATH_MAX] = {0};
+    resolve_plugin_config_dir(mpv, cfg_dir, sizeof(cfg_dir),
+                              override_cfg_file, sizeof(override_cfg_file));
 
     AppState app;
-    if (!app_init(&app, cfg_dir, &wl, mpv_host_play_video, &wl, "mpv")) {
+    if (!app_init_ex(&app, cfg_dir, override_cfg_file[0] ? override_cfg_file : NULL,
+                     &wl, mpv_host_play_video, &wl, "mpv")) {
 #ifdef _WIN32
         CloseHandle(wl.wakeup_event);
 #else

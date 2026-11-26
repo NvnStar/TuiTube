@@ -858,6 +858,12 @@ static void cb_request_thumb(void *ctx, const char *key, const char *url) {
 
 bool app_init(AppState *app, const char *cli_config_dir, WaylandApp *wl,
               AppPlayVideoFn play_fn, void *play_ctx, const char *player_display_name) {
+    return app_init_ex(app, cli_config_dir, NULL, wl, play_fn, play_ctx, player_display_name);
+}
+
+bool app_init_ex(AppState *app, const char *cli_config_dir, const char *override_config_file,
+                 WaylandApp *wl, AppPlayVideoFn play_fn, void *play_ctx,
+                 const char *player_display_name) {
     if (!app) return false;
     memset(app, 0, sizeof(*app));
     app->wl = wl;
@@ -868,7 +874,7 @@ bool app_init(AppState *app, const char *cli_config_dir, WaylandApp *wl,
     }
 
     nav_stack_init(&app->nav_stack);
-    if (!config_load(&app->cfg, cli_config_dir)) {
+    if (!config_load_from(&app->cfg, cli_config_dir, override_config_file)) {
         fprintf(stderr, "Warning: failed to parse config file, using defaults\n");
     }
     innertube_set_locale(app->cfg.resolved_hl, app->cfg.resolved_gl);

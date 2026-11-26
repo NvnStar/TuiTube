@@ -1806,6 +1806,25 @@ static void test_ytdlp_path_resolution_and_mpv_opts(void) {
     assert(loaded.has_ytdlp_path);
     assert(loaded.ytdlp_path && strcmp(loaded.ytdlp_path, "/tmp/custom-ytdlp") == 0);
     config_free(&loaded);
+
+    /* 2b. Override config file (e.g., mpv/script-opts/tuitube.json) & relative asset resolution */
+    char override_cfg[PATH_MAX + 64];
+    snprintf(override_cfg, sizeof(override_cfg), "%s/tuitube.json", subdir);
+    char override_theme[PATH_MAX + 64];
+    snprintf(override_theme, sizeof(override_theme), "%s/mpv_theme.json", subdir);
+    const char *ov_json = "{ \"language\": \"ja\", \"theme_path\": \"mpv_theme.json\" }\n";
+    assert(tt_write_file_atomic(override_cfg, ov_json, strlen(ov_json)));
+    assert(tt_write_file_atomic(override_theme, "{}\n", 3));
+    assert(config_load_from(&loaded, tmpdir, override_cfg));
+    assert(strcmp(loaded.config_dir, tmpdir) == 0);
+    assert(strcmp(loaded.config_file_dir, subdir) == 0);
+    assert(strcmp(loaded.resolved_hl, "ja") == 0);
+    char *resolved_asset = config_resolve_asset_path(&loaded, "mpv_theme.json");
+    assert(resolved_asset != NULL && test_same_file_path(resolved_asset, override_theme));
+    free(resolved_asset);
+    config_free(&loaded);
+    test_unlink_file(override_theme);
+    test_unlink_file(override_cfg);
     test_unlink_file(cfg_file);
 
     TuiTubeConfig cfg;

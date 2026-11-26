@@ -120,6 +120,7 @@ typedef struct {
     size_t key_binding_count;
 
     char config_dir[PATH_MAX];
+    char config_file_dir[PATH_MAX];
     char cache_dir[PATH_MAX];
     bool portable_mode;
     Theme theme;
@@ -143,6 +144,8 @@ bool config_build_mpv_overlay_section(const TuiTubeConfig *cfg,
 void config_init_defaults(TuiTubeConfig *cfg);
 void config_resolve_locale(TuiTubeConfig *cfg);
 bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir);
+bool config_load_from(TuiTubeConfig *cfg, const char *cli_config_dir,
+                      const char *override_config_file);
 bool config_apply_theme(TuiTubeConfig *cfg, const char *theme_name);
 double config_effective_ui_scale(const TuiTubeConfig *cfg);
 char *config_resolve_asset_path(const TuiTubeConfig *cfg, const char *rel_or_abs);
