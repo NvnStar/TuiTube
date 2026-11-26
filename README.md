@@ -142,9 +142,43 @@ mpv.exe --idle --script=.\tuitube.dll
 
 ### Shared State & Portable Mode
 
+Both the standalone app and the `mpv` plugin share the same config, favorites, history, and thumbnail cache:
+
 - **Linux:** `~/.config/tuitube/{tuitube.json,favlist.json,history.json}` and `~/.cache/tuitube/thumbs`.
 - **Windows:** `%APPDATA%\tuitube\{tuitube.json,favlist.json,history.json}` and `%LOCALAPPDATA%\tuitube\thumbs`.
 - **Portable Mode:** Place an empty `tuitube_portable_mode.txt` beside `./tuitube` / `./tuitube.so` (or `tuitube.exe` / `tuitube.dll`).
+
+```text
+Standard Mode (Linux)
+├── ~/.config/tuitube/
+│   ├── tuitube.json                # User configuration (optional)
+│   ├── favlist.json                # Saved channels & playlists
+│   ├── history.json                # Watch history
+│   └── yt-dlp                      # Optional local yt-dlp binary (chmod +x)
+├── ~/.cache/tuitube/thumbs/        # Disk thumbnail cache
+└── ~/.config/mpv/scripts/
+    └── tuitube.so                  # Native mpv C plugin (optional)
+
+Standard Mode (Windows)
+├── %APPDATA%\tuitube\
+│   ├── tuitube.json                # User configuration (optional)
+│   ├── favlist.json                # Saved channels & playlists
+│   ├── history.json                # Watch history
+│   └── yt-dlp.exe                  # Optional local yt-dlp.exe
+├── %LOCALAPPDATA%\tuitube\thumbs\  # Disk thumbnail cache
+└── %APPDATA%\mpv\scripts\
+    └── tuitube.dll                 # Native mpv C plugin (+ runtime DLLs if not in PATH)
+
+Portable Mode (any directory containing tuitube_portable_mode.txt)
+├── tuitube / tuitube.exe           # Standalone app (or tuitube.so / tuitube.dll plugin)
+├── tuitube_portable_mode.txt       # Empty marker file enabling portable mode
+├── tuitube.json                    # Config, favorites, and history live beside binary
+├── favlist.json
+├── history.json
+├── yt-dlp / yt-dlp.exe             # Optional local yt-dlp (and mpv.exe on Windows)
+├── cache/thumbs/                   # Local thumbnail cache
+└── downloads/                      # Default download folder (when download_dir is "")
+```
 
 ---
 
@@ -183,6 +217,46 @@ Starter files: [examples/tuitube.json](examples/tuitube.json) · [examples/sampl
 | `Ctrl+N` | Load next page |
 | `Ctrl+]` / `Ctrl+[` | Widen / narrow list pane |
 | `F1` or `?` | Toggle shortcut help overlay |
+
+---
+
+## Project Structure
+
+```text
+TuiTube/
+├── src/
+│   ├── main.c                      # Standalone CLI & window entrypoint (./tuitube / tuitube.exe)
+│   ├── mpv_plugin.c                # Native mpv C plugin (tuitube.so / tuitube.dll)
+│   ├── mpv_cplugin.h               # Self-contained libmpv C plugin ABI declarations
+│   ├── app.{h,c}                   # Shared app controller, async dispatch, NavStack & history
+│   ├── ui.{h,c}                    # Cairo/PangoCairo UI, virtualized list, themes & fonts
+│   ├── wayland.{h,c}               # Linux Wayland backend (wl_shm, xdg-shell, IME, clipboard)
+│   ├── win32.c                     # Windows Win32 backend (HWND, DIBSection, DPI, IMM32)
+│   ├── innertube.{h,c}             # InnerTube v1 API, RSS feed, URL parser & yt-dlp fallback
+│   ├── player.{h,c}                # Unified yt-dlp resolver, mpv/vlc launcher & downloader
+│   ├── config.{h,c}                # tuitube.json parser, locale detection, themes & keybindings
+│   ├── image.{h,c}                 # JPEG/PNG decoding, disk & LRU thumbnail cache, mascot
+│   ├── http.{h,c}                  # libcurl wrappers & 4-thread priority HttpPool
+│   ├── model.{h,c}                 # MediaItem, FavoriteList & HistoryList persistence
+│   ├── util.{h,c}                  # Path/UTF-8/Win32 helpers, StrBuf & process spawning
+│   └── tt_keysyms.h                # Cross-platform XKB keysym constants
+├── tests/
+│   └── test_runner.c               # Offline unit test suite (ASan + UBSan)
+├── docs/
+│   ├── CONFIGURATION.md            # Binary placement matrix, 27 config keys, themes & keys
+│   ├── ARCHITECTURE.md             # Module map and concurrency model
+│   └── UPSTREAM_MAINTENANCE.md     # Guide for fixing YouTube / yt-dlp / mpv changes
+├── examples/
+│   ├── tuitube.json                # Starter configuration file
+│   └── sample_theme.json           # Sample custom theme JSON
+├── .github/workflows/
+│   ├── ci.yml                      # Linux & Windows CI build, lint, and test workflow
+│   └── release.yml                 # Prebuilt release archive & checksum workflow
+├── Makefile                        # Auto-detects Linux vs Windows (MSYS2 UCRT64)
+├── CONTRIBUTING.md
+├── LICENSE
+└── README.md
+```
 
 ---
 
