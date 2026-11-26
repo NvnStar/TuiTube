@@ -99,7 +99,9 @@ jobs:
           make test
           ./tuitube.exe --help
 
-      - name: Package Windows portable zip
+      - name: Package Windows slim & bundled zips
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p dist/tuitube-windows-x64/docs dist/tuitube-windows-x64/examples
           cp tuitube.exe tuitube.dll README.md LICENSE dist/tuitube-windows-x64/
@@ -109,11 +111,101 @@ jobs:
           ldd ./tuitube.exe ./tuitube.dll | awk '/\/ucrt64\/bin\// {print $3}' | sort -u | xargs -r cp -t dist/tuitube-windows-x64/
           (cd dist && zip -r9 tuitube-windows-x64.zip tuitube-windows-x64)
 
-      - name: Upload Windows release zip
+          cp -a dist/tuitube-windows-x64 dist/tuitube-windows-x64-bundled
+
+          MPV_API_JSON=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest)
+          MPV_TAG=$(printf '%s\n' "$MPV_API_JSON" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')
+          MPV_URL=$(printf '%s\n' "$MPV_API_JSON" | grep -oE 'https://github\.com/shinchiro/mpv-winbuild-cmake/releases/download/[^"]+/mpv-x86_64-[0-9]+-git-[^"]+\.7z' | head -n1)
+          if [ -z "$MPV_URL" ]; then
+            echo "Error: failed to resolve shinchiro mpv-x86_64 .7z download URL" >&2
+            exit 1
+          fi
+          echo "Bundling mpv (${MPV_TAG}): ${MPV_URL}"
+          curl -fsSL -o dist/mpv.7z "$MPV_URL"
+          mkdir -p dist/mpv-extract
+          if command -v 7z >/dev/null 2>&1; then
+            7z x -y -odist/mpv-extract dist/mpv.7z
+          elif [ -x "/c/Program Files/7-Zip/7z.exe" ]; then
+            "/c/Program Files/7-Zip/7z.exe" x -y -odist/mpv-extract dist/mpv.7z
+          else
+            bsdtar -xf dist/mpv.7z -C dist/mpv-extract
+          fi
+
+          MPV_EXE_PATH=$(find dist/mpv-extract -maxdepth 3 -iname 'mpv.exe' | head -n1)
+          if [ -z "$MPV_EXE_PATH" ]; then
+            echo "Error: mpv.exe not found inside extracted archive" >&2
+            exit 1
+          fi
+          MPV_ROOT=$(dirname "$MPV_EXE_PATH")
+          cp -f "$MPV_EXE_PATH" dist/tuitube-windows-x64-bundled/mpv.exe
+          if [ -f "${MPV_ROOT}/mpv.com" ]; then
+            cp -f "${MPV_ROOT}/mpv.com" dist/tuitube-windows-x64-bundled/mpv.com
+          fi
+          for dll in "${MPV_ROOT}"/*.dll; do
+            [ -f "$dll" ] || continue
+            base=$(basename "$dll")
+            if [ ! -f "dist/tuitube-windows-x64-bundled/${base}" ]; then
+              cp "$dll" "dist/tuitube-windows-x64-bundled/${base}"
+            fi
+          done
+
+          YTDLP_API_JSON=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest)
+          YTDLP_TAG=$(printf '%s\n' "$YTDLP_API_JSON" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')
+          YTDLP_URL="https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_TAG}/yt-dlp.exe"
+          if [ -z "$YTDLP_TAG" ]; then
+            YTDLP_TAG="latest"
+            YTDLP_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+          fi
+          echo "Bundling yt-dlp (${YTDLP_TAG}): ${YTDLP_URL}"
+          curl -fsSL -o dist/tuitube-windows-x64-bundled/yt-dlp.exe "$YTDLP_URL"
+
+          test -s dist/tuitube-windows-x64-bundled/mpv.exe
+          test -s dist/tuitube-windows-x64-bundled/yt-dlp.exe
+
+          cat > dist/tuitube-windows-x64-bundled/THIRD_PARTY_LICENSES.txt << EOF
+          TuiTube Bundled Windows Archive — Third-Party Software Notices
+          ==============================================================
+
+          TuiTube itself is licensed under the MIT License (see LICENSE).
+          This bundled archive also includes unmodified standalone third-party
+          executables spawned as separate processes at runtime:
+
+          1. mpv (Windows x86_64 build by shinchiro)
+             - Release tag: ${MPV_TAG}
+             - Download: ${MPV_URL}
+             - Upstream source & build scripts:
+               https://github.com/mpv-player/mpv
+               https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/${MPV_TAG}
+             - License: GPLv2+ / GPLv3 (see https://www.gnu.org/licenses/gpl-3.0.txt)
+
+          2. yt-dlp (yt-dlp.exe)
+             - Release tag: ${YTDLP_TAG}
+             - Download: ${YTDLP_URL}
+             - Upstream source: https://github.com/yt-dlp/yt-dlp
+             - License: The Unlicense (Public Domain)
+             - Tip: Run '.\yt-dlp.exe -U' in this folder to update yt-dlp when
+               upstream YouTube changes occur.
+
+          3. MSYS2 UCRT64 Runtime Libraries (*.dll)
+             - Cairo, Pango, HarfBuzz, GLib, libcurl, yyjson, libjpeg-turbo, libpng,
+               and their transitive dependencies from MSYS2 UCRT64 (https://www.msys2.org/).
+          EOF
+
+          (cd dist && zip -r9 tuitube-windows-x64-bundled.zip tuitube-windows-x64-bundled)
+
+      - name: Upload Windows release zips
         uses: actions/upload-artifact@v4
         with:
           name: release-windows-x64
-          path: dist/tuitube-windows-x64.zip
+          path: |
+            dist/tuitube-windows-x64.zip
+            dist/tuitube-windows-x64-bundled.zip
           retention-days: 1
 
   publish-release:
@@ -133,7 +225,7 @@ jobs:
       - name: Generate SHA256SUMS.txt
         run: |
           cd release-assets
-          sha256sum tuitube-windows-x64.zip tuitube-linux-x64.tar.gz > SHA256SUMS.txt
+          sha256sum tuitube-windows-x64.zip tuitube-windows-x64-bundled.zip tuitube-linux-x64.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create or update GitHub Release
@@ -164,41 +256,47 @@ jobs:
           cat > release-notes.md << 'EOF'
           Lightweight, pure-C17 YouTube client for **Linux (Wayland)** and **Windows (Win32)** — available as both a standalone desktop application and a native `mpv` C plugin.
 
-          > [!WARNING]
-          > **Runtime Dependencies Required (`mpv` and `yt-dlp` are NOT bundled)**
-          > Both `tuitube-windows-x64.zip` and `tuitube-linux-x64.tar.gz` **require `mpv` (or `vlc` for standalone) and `yt-dlp` at runtime** (`ffmpeg` is recommended for merging high-resolution streams and downloads).
+          > [!NOTE]
+          > **Which Windows Archive Should You Download?**
+          > - **`tuitube-windows-x64-bundled.zip` (Recommended for quick start):** Includes `mpv.exe` and `yt-dlp.exe` ready to run out of the box (extract and double-click `tuitube.exe`; run `.\yt-dlp.exe -U` later if YouTube changes break playback; optional [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) is only needed for merging high-resolution `Ctrl+S` downloads).
+          > - **`tuitube-windows-x64.zip` (Slim):** Does **not** include `mpv` or `yt-dlp` — ideal if you already have `mpv` & `yt-dlp` installed or only want the `tuitube.dll` `mpv` plugin.
           >
+          > **Runtime Dependencies for Slim Windows (`tuitube-windows-x64.zip`) & Linux (`tuitube-linux-x64.tar.gz`):**
           > - **Windows (`winget`):** `winget install shinchiro.mpv yt-dlp.yt-dlp Gyan.FFmpeg`
           > - **Windows (`scoop`):** `scoop install mpv yt-dlp ffmpeg`
+          > - **Windows (direct downloads):** [mpv (shinchiro builds)](https://github.com/shinchiro/mpv-winbuild-cmake/releases) ([mpv.io](https://mpv.io/installation/)), [yt-dlp (`yt-dlp.exe`)](https://github.com/yt-dlp/yt-dlp/releases/latest), and optional [FFmpeg](https://www.gyan.dev/ffmpeg/builds/).
           > - **Windows (local / portable):** Place `mpv.exe` & `yt-dlp.exe` beside `tuitube.exe`, or place `yt-dlp.exe` in `%APPDATA%\tuitube\` (works for both standalone and the `mpv` plugin).
           > - **Arch Linux:** `sudo pacman -S mpv yt-dlp ffmpeg`
           > - **Debian / Ubuntu:** `sudo apt install mpv yt-dlp ffmpeg`
-          > - **Linux (local / no `PATH` edit):** Place `yt-dlp` (`chmod +x yt-dlp`) beside `./tuitube` or in `~/.config/tuitube/yt-dlp` (works for both standalone and `tuitube.so`), or set `"ytdlp_path"` in `tuitube.json`.
+          > - **Linux (local / no `PATH` edit):** Download [yt-dlp (`yt-dlp_linux`)](https://github.com/yt-dlp/yt-dlp/releases/latest), run `chmod +x`, and place it as `yt-dlp` beside `./tuitube` or in `~/.config/tuitube/yt-dlp` (works for both standalone and `tuitube.so`), or set `"ytdlp_path"` in `tuitube.json`.
 
           ### Included Bundles
-          - `tuitube-windows-x64.zip` — Standalone `tuitube.exe`, `mpv` plugin `tuitube.dll`, bundled MSYS2 UCRT64 runtime DLLs, starter `tuitube.json`, and `docs/CONFIGURATION.md`.
+          - `tuitube-windows-x64-bundled.zip` — All-in-one Windows bundle with `tuitube.exe`, `tuitube.dll`, MSYS2 UCRT64 runtime DLLs, bundled `mpv.exe` + `yt-dlp.exe`, `THIRD_PARTY_LICENSES.txt`, starter `tuitube.json`, and `docs/CONFIGURATION.md`.
+          - `tuitube-windows-x64.zip` — Slim Windows bundle (`tuitube.exe`, `tuitube.dll`, MSYS2 UCRT64 runtime DLLs, starter `tuitube.json`, and `docs/CONFIGURATION.md`; bring your own `mpv` & `yt-dlp`).
           - `tuitube-linux-x64.tar.gz` — Standalone `tuitube`, `mpv` plugin `tuitube.so`, starter `tuitube.json`, and `docs/CONFIGURATION.md`.
-          - `SHA256SUMS.txt` — SHA-256 checksums for both archives.
+          - `SHA256SUMS.txt` — SHA-256 checksums for all release archives.
 
           ### Quick Start & Customization
           - **Standalone:** Run `./tuitube` (Linux) or `tuitube.exe` (Windows).
-          - **`mpv` Plugin:** Copy `tuitube.so` to `~/.config/mpv/scripts/` (Linux) or `tuitube.dll` (+ runtime DLLs) to `%APPDATA%\mpv\scripts\` (Windows), then press `F12` inside `mpv`.
+          - **`mpv` Plugin:** Copy `tuitube.so` to `~/.config/mpv/scripts/` (Linux) or `tuitube.dll` (+ runtime DLLs) to `%APPDATA%\mpv\scripts\` (Windows), then press `F12` inside `mpv`. You can place `tuitube.json` directly in `mpv/script-opts/tuitube.json` or share `~/.config/tuitube/tuitube.json` (`%APPDATA%\tuitube\tuitube.json`).
           - **Configuration:** Edit the included `tuitube.json` (for example `"language": "auto"` or `"en"` / `"vi"`, `"ytdlp_path"`, `"theme"`, `"download_dir"`, etc.) — see `docs/CONFIGURATION.md` for all 27 options, `yt-dlp` placement rules, custom themes, and keybindings.
 
           > **Windows Security Note (Unsigned Binaries):** Release executables and DLLs are unsigned open-source builds.
-          > - **Microsoft Defender SmartScreen:** Click *More info -> Run anyway*, or run `Unblock-File .\tuitube-windows-x64.zip` before extracting.
+          > - **Microsoft Defender SmartScreen:** Click *More info -> Run anyway*, or run `Unblock-File .\tuitube-windows-x64*.zip` before extracting.
           > - **Windows 11 Smart App Control:** If SAC is **On**, unsigned binaries are blocked by Code Integrity unless SAC is turned **Off** in *Windows Security -> App & browser control -> Smart App Control settings*.
           EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" \
               release-assets/tuitube-windows-x64.zip \
+              release-assets/tuitube-windows-x64-bundled.zip \
               release-assets/tuitube-linux-x64.tar.gz \
               release-assets/SHA256SUMS.txt \
               --clobber
           else
             gh release create "$TAG" \
               release-assets/tuitube-windows-x64.zip \
+              release-assets/tuitube-windows-x64-bundled.zip \
               release-assets/tuitube-linux-x64.tar.gz \
               release-assets/SHA256SUMS.txt \
               --target "$COMMIT_SHA" \

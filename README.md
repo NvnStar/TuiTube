@@ -57,15 +57,16 @@ pacman -S --needed make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-binutils
 
 ## Download & Prebuilt Releases
 
-Prebuilt release archives (`tuitube-windows-x64.zip` with MSYS2 UCRT64 runtime DLLs, `tuitube-linux-x64.tar.gz`, and `SHA256SUMS.txt`) are available on the [GitHub Releases](https://github.com/NvnStar/TuiTube/releases) page (served directly over CDN without requiring a GitHub login). Both archives ship with a ready-to-edit `tuitube.json` and [docs/CONFIGURATION.md](docs/CONFIGURATION.md) beside the binaries.
+Prebuilt release archives (`tuitube-windows-x64-bundled.zip` with `mpv.exe` & `yt-dlp.exe` ready to run, slim `tuitube-windows-x64.zip` with MSYS2 UCRT64 runtime DLLs only, `tuitube-linux-x64.tar.gz`, and `SHA256SUMS.txt`) are available on the [GitHub Releases](https://github.com/NvnStar/TuiTube/releases) page (served directly over CDN without requiring a GitHub login). All archives ship with a ready-to-edit `tuitube.json` and [docs/CONFIGURATION.md](docs/CONFIGURATION.md) beside the binaries.
 
 > [!WARNING]
-> **Runtime Dependencies Required (`mpv` and `yt-dlp` are NOT bundled)**  
-> `tuitube-windows-x64.zip` and `tuitube-linux-x64.tar.gz` **do NOT include `mpv` or `yt-dlp`**. Both must be discoverable at runtime (`ffmpeg` is also recommended for merging high-resolution streams; `vlc` can be used as an alternative standalone player):
+> **Runtime Dependencies (`mpv` and `yt-dlp`)**  
+> `tuitube-windows-x64-bundled.zip` includes `mpv.exe` and `yt-dlp.exe` ready to run (run `.\yt-dlp.exe -U` later if YouTube breaks playback). Slim `tuitube-windows-x64.zip` and `tuitube-linux-x64.tar.gz` **do NOT include `mpv` or `yt-dlp`** — both must be discoverable at runtime (`ffmpeg` is also recommended for merging high-resolution streams; `vlc` can be used as an alternative standalone player):
 >
 > - **Package Managers (`PATH`):**
 >   - **Windows (`winget`):** `winget install shinchiro.mpv yt-dlp.yt-dlp Gyan.FFmpeg`
 >   - **Windows (`scoop`):** `scoop install mpv yt-dlp ffmpeg`
+>   - **Windows (direct downloads):** [mpv (shinchiro builds)](https://github.com/shinchiro/mpv-winbuild-cmake/releases) ([mpv.io](https://mpv.io/installation/)), [yt-dlp (`yt-dlp.exe`)](https://github.com/yt-dlp/yt-dlp/releases/latest), and optional [FFmpeg](https://www.gyan.dev/ffmpeg/builds/)
 >   - **Arch Linux:** `sudo pacman -S mpv yt-dlp ffmpeg`
 >   - **Debian / Ubuntu:** `sudo apt install mpv yt-dlp ffmpeg`
 > - **Local Drop-In Placement (no `PATH` edit required):**
