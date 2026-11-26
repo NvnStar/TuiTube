@@ -16,6 +16,7 @@
 #include <windows.h>
 #else
 #include <poll.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -1513,6 +1514,415 @@ static void test_player_launch_and_exe_resolution(void) {
     config_free(&cfg);
 }
 
+static void test_locale_parsing_and_innertube_headers(void) {
+    char hl[16], gl[8];
+
+    assert(tt_parse_locale_tag("vi_VN.UTF-8", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "vi") == 0 && strcmp(gl, "VN") == 0);
+
+    assert(tt_parse_locale_tag("vi-VN", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "vi") == 0 && strcmp(gl, "VN") == 0);
+
+    assert(tt_parse_locale_tag("vi", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "vi") == 0 && gl[0] == '\0');
+
+    assert(tt_parse_locale_tag("en_US.utf8@modern", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "en") == 0 && strcmp(gl, "US") == 0);
+
+    assert(tt_parse_locale_tag("en-GB", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "en-GB") == 0 && strcmp(gl, "GB") == 0);
+
+    assert(tt_parse_locale_tag("zh_TW.UTF-8", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "zh-TW") == 0 && strcmp(gl, "TW") == 0);
+
+    assert(tt_parse_locale_tag("zh-Hant-HK", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "zh-HK") == 0 && strcmp(gl, "HK") == 0);
+
+    assert(tt_parse_locale_tag("zh-Hans-CN", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "zh-CN") == 0 && strcmp(gl, "CN") == 0);
+
+    assert(tt_parse_locale_tag("pt_BR", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "pt-BR") == 0 && strcmp(gl, "BR") == 0);
+
+    assert(tt_parse_locale_tag("es-419", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "es-419") == 0 && gl[0] == '\0');
+
+    static const char *const invalid_locales[] = {
+        "", "C", "C.UTF-8", "POSIX", "auto",
+        "vi\r\nX-Injected: 1", "en;q=0.9", "123", "toolongsubtagvalue"
+    };
+    for (size_t i = 0; i < sizeof(invalid_locales) / sizeof(invalid_locales[0]); i++) {
+        assert(!tt_parse_locale_tag(invalid_locales[i], hl, sizeof(hl), gl, sizeof(gl)));
+    }
+
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_loc", tmpdir, sizeof(tmpdir));
+    char cfg_file[PATH_MAX + 32];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+
+    const char *vi_cfg = "{ \"language\": \"vi\" }\n";
+    assert(tt_write_file_atomic(cfg_file, vi_cfg, strlen(vi_cfg)));
+    TuiTubeConfig cfg;
+    assert(config_load(&cfg, tmpdir));
+    assert(strcmp(cfg.resolved_hl, "vi") == 0);
+    assert(strcmp(cfg.resolved_gl, "VN") == 0);
+    config_free(&cfg);
+
+    const char *vi_us_cfg = "{ \"language\": \"vi\", \"region\": \"us\" }\n";
+    assert(tt_write_file_atomic(cfg_file, vi_us_cfg, strlen(vi_us_cfg)));
+    assert(config_load(&cfg, tmpdir));
+    assert(strcmp(cfg.resolved_hl, "vi") == 0);
+    assert(strcmp(cfg.resolved_gl, "US") == 0);
+    config_free(&cfg);
+
+    /* Load examples/tuitube.json via temp copy */
+    size_t ex_len = 0;
+    char *ex_raw = tt_read_file("examples/tuitube.json", &ex_len);
+    assert(ex_raw != NULL && ex_len > 0);
+    assert(tt_write_file_atomic(cfg_file, ex_raw, ex_len));
+    free(ex_raw);
+    assert(config_load(&cfg, tmpdir));
+    assert(!cfg.has_video_format);
+    assert(!cfg.has_sub_language);
+    assert(!cfg.has_ytdlp_path);
+    assert(cfg.ytdlp_path && cfg.ytdlp_path[0] == '\0');
+    assert(cfg.language && strcmp(cfg.language, "auto") == 0);
+    config_free(&cfg);
+
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
+
+    innertube_set_locale("vi", "VN");
+    innertube_get_locale(hl, sizeof(hl), gl, sizeof(gl));
+    assert(strcmp(hl, "vi") == 0 && strcmp(gl, "VN") == 0);
+
+    char hdr[64];
+    assert(innertube_format_accept_language("vi", hdr, sizeof(hdr)));
+    assert(strcmp(hdr, "Accept-Language: vi,en;q=0.8") == 0);
+    assert(innertube_format_accept_language("en", hdr, sizeof(hdr)));
+    assert(strcmp(hdr, "Accept-Language: en-US,en;q=0.9") == 0);
+
+    innertube_set_locale("en", "US");
+}
+
+static void test_non_english_lockup_and_badges(void) {
+    const char *vi_browse =
+        "{"
+        "  \"header\": {\"pageHeaderRenderer\": {\"content\": {\"pageHeaderViewModel\": {\"title\": {\"dynamicTextViewModel\": {\"text\": {\"content\": \"Kenh Viet\"}}}}}}},"
+        "  \"contents\": {\"twoColumnBrowseResultsRenderer\": {\"tabs\": [{\"tabRenderer\": {\"selected\": true, \"content\": {"
+        "    \"richGridRenderer\": {\"contents\": ["
+        "      {\"richItemRenderer\": {\"content\": {\"lockupViewModel\": {"
+        "        \"contentId\": \"viMem01\","
+        "        \"contentType\": \"LOCKUP_CONTENT_TYPE_VIDEO\","
+        "        \"metadata\": {\"lockupMetadataViewModel\": {"
+        "          \"title\": {\"content\": \"Video Hoi Vien\"},"
+        "          \"badges\": [{\"badgeViewModel\": {\"badgeText\": \"D\\u00e0nh ri\\u00eang cho h\\u1ed9i vi\\u00ean\"}}],"
+        "          \"metadata\": {\"contentMetadataViewModel\": {\"metadataRows\": ["
+        "            {\"metadataParts\": ["
+        "              {\"text\": {\"content\": \"12 N l\\u01b0\\u1ee3t xem\"}},"
+        "              {\"text\": {\"content\": \"3 ng\\u00e0y tr\\u01b0\\u1edbc\"}}"
+        "            ]}"
+        "          ]}}"
+        "        }}"
+        "      }}}},"
+        "      {\"richItemRenderer\": {\"content\": {\"lockupViewModel\": {"
+        "        \"contentId\": \"viLive02\","
+        "        \"contentType\": \"LOCKUP_CONTENT_TYPE_VIDEO\","
+        "        \"metadata\": {\"lockupMetadataViewModel\": {"
+        "          \"title\": {\"content\": \"Phat Truc Tiep\"},"
+        "          \"badges\": [{\"badgeViewModel\": {\"badgeText\": \"TR\\u1ef0C TI\\u1ebeP\"}}],"
+        "          \"metadata\": {\"contentMetadataViewModel\": {\"metadataRows\": ["
+        "            {\"metadataParts\": ["
+        "              {\"text\": {\"content\": \"1,5 N ng\\u01b0\\u1eddi \\u0111ang xem\"}}"
+        "            ]}"
+        "          ]}}"
+        "        }}"
+        "      }}}}"
+        "    ]}"
+        "  }}}]}}"
+        "}";
+
+    MediaList ml;
+    media_list_init(&ml);
+    char err[128] = {0};
+    assert(innertube_parse_browse_json(vi_browse, strlen(vi_browse), &ml, err, sizeof(err)));
+    assert(ml.count == 2);
+
+    assert(strcmp(ml.items[0].id, "viMem01") == 0);
+    assert(ml.items[0].author == NULL);
+    assert(ml.items[0].view_count_text &&
+           strcmp(ml.items[0].view_count_text, "12 N l\xC6\xB0\xE1\xBB\xA3t xem") == 0);
+    assert(ml.items[0].published_text &&
+           strcmp(ml.items[0].published_text, "3 ng\xC3\xA0y tr\xC6\xB0\xE1\xBB\x9B" "c") == 0);
+    assert(ml.items[0].is_members_only == true);
+
+    assert(strcmp(ml.items[1].id, "viLive02") == 0);
+    assert(ml.items[1].author == NULL);
+    assert(ml.items[1].is_live == true);
+
+    media_list_free(&ml);
+}
+
+static void write_u16le(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void write_u32le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static void test_pe_subsystem_and_runtime_dep_checks(void) {
+    uint8_t pe[160];
+    memset(pe, 0, sizeof(pe));
+    pe[0] = 'M';
+    pe[1] = 'Z';
+    write_u32le(pe + 0x3C, 64u);
+    pe[64] = 'P';
+    pe[65] = 'E';
+    pe[66] = 0;
+    pe[67] = 0;
+
+    /* PE32+ GUI (Subsystem = 2) -> true; CUI (Subsystem = 3) -> false */
+    write_u16le(pe + 64u + 24u, 0x020Bu);
+    write_u16le(pe + 64u + 24u + 68u, 2u);
+    assert(tt_pe_is_gui_subsystem(pe, sizeof(pe)));
+
+    write_u16le(pe + 64u + 24u + 68u, 3u);
+    assert(!tt_pe_is_gui_subsystem(pe, sizeof(pe)));
+
+    /* PE32 GUI -> true */
+    write_u16le(pe + 64u + 24u, 0x010Bu);
+    write_u16le(pe + 64u + 24u + 68u, 2u);
+    assert(tt_pe_is_gui_subsystem(pe, sizeof(pe)));
+
+    /* Truncated / corrupt headers -> false */
+    assert(!tt_pe_is_gui_subsystem(pe, 150u));
+    assert(!tt_pe_is_gui_subsystem(NULL, sizeof(pe)));
+    pe[64] = 'X';
+    assert(!tt_pe_is_gui_subsystem(pe, sizeof(pe)));
+    pe[64] = 'P';
+    pe[0] = 'X';
+    assert(!tt_pe_is_gui_subsystem(pe, sizeof(pe)));
+
+    /* Runtime dependency checks */
+    TuiTubeConfig cfg;
+    config_init_defaults(&cfg);
+
+    bool has_player = true;
+    bool has_ytdlp = false;
+    free(cfg.player_path);
+    cfg.player_path = tt_strdup("tuitube_definitely_missing_player_99999");
+    player_check_deps(&cfg, &has_player, &has_ytdlp);
+    assert(!has_player);
+
+    free(cfg.player_path);
+#ifdef _WIN32
+    tt_win32_refresh_path();
+    char *cmd_exe = tt_win32_resolve_exe("cmd");
+    assert(cmd_exe != NULL && tt_file_exists(cmd_exe));
+    free(cmd_exe);
+    cfg.player_path = tt_strdup("where");
+#else
+    cfg.player_path = tt_strdup("true");
+#endif
+    has_player = false;
+    player_check_deps(&cfg, &has_player, NULL);
+    assert(has_player);
+
+    config_free(&cfg);
+}
+
+static void test_ytdlp_path_resolution_and_mpv_opts(void) {
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_ytdlp", tmpdir, sizeof(tmpdir));
+
+    char subdir[PATH_MAX + 32];
+    snprintf(subdir, sizeof(subdir), "%s/sub", tmpdir);
+    assert(tt_mkdir_p(subdir, 0755));
+
+    char missing_path[PATH_MAX + 64];
+    snprintf(missing_path, sizeof(missing_path), "%s/definitely_missing_ytdlp_99999", tmpdir);
+
+    /* 1. tt_dir_exists() checks */
+    assert(tt_dir_exists(tmpdir));
+    assert(tt_dir_exists(subdir));
+    assert(!tt_dir_exists(missing_path));
+
+    char dummy_file[PATH_MAX + 64];
+    snprintf(dummy_file, sizeof(dummy_file), "%s/regular.txt", tmpdir);
+    assert(tt_write_file_atomic(dummy_file, "hello", 5));
+    assert(tt_file_exists(dummy_file));
+    assert(!tt_dir_exists(dummy_file));
+    test_unlink_file(dummy_file);
+
+    /* 2. Config JSON parsing & trimming of ytdlp_path */
+    char cfg_file[PATH_MAX + 32];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+    const char *json_cfg = "{ \"ytdlp_path\": \"  \\\"/tmp/custom-ytdlp\\\"  \" }\n";
+    assert(tt_write_file_atomic(cfg_file, json_cfg, strlen(json_cfg)));
+    TuiTubeConfig loaded;
+    assert(config_load(&loaded, tmpdir));
+    assert(loaded.has_ytdlp_path);
+    assert(loaded.ytdlp_path && strcmp(loaded.ytdlp_path, "/tmp/custom-ytdlp") == 0);
+    config_free(&loaded);
+    test_unlink_file(cfg_file);
+
+    TuiTubeConfig cfg;
+    config_init_defaults(&cfg);
+    snprintf(cfg.config_dir, sizeof(cfg.config_dir), "%s", tmpdir);
+
+    /* 3. Auto <config_dir> discovery (ytdlp_path: "") */
+    char cfg_bin[PATH_MAX + 64];
+#ifdef _WIN32
+    snprintf(cfg_bin, sizeof(cfg_bin), "%s/yt-dlp.exe", tmpdir);
+    assert(tt_write_file_atomic(cfg_bin, "MZ", 2));
+#else
+    snprintf(cfg_bin, sizeof(cfg_bin), "%s/yt-dlp", tmpdir);
+    assert(tt_write_file_atomic(cfg_bin, "#!/bin/sh\nexit 0\n", 17));
+    assert(chmod(cfg_bin, 0755) == 0);
+#endif
+
+    bool needs_opt = false;
+    char *resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
+    assert(resolved != NULL);
+    assert(needs_opt);
+    assert(strcmp(resolved, cfg_bin) == 0);
+
+    bool has_ytdlp = false;
+    player_check_deps(&cfg, NULL, &has_ytdlp);
+    assert(has_ytdlp);
+
+    char opt[PATH_MAX + 64];
+    assert(player_build_mpv_ytdl_script_opt(&cfg, opt, sizeof(opt)));
+    char expected_opt[PATH_MAX + 128];
+    snprintf(expected_opt, sizeof(expected_opt), "ytdl_hook-ytdl_path=%s", resolved);
+    assert(strcmp(opt, expected_opt) == 0);
+    free(resolved);
+    test_unlink_file(cfg_bin);
+
+    /* 4. Explicit ytdlp_path file (with whitespace) & directory expansion */
+    char sub_custom[PATH_MAX + 64];
+#ifdef _WIN32
+    snprintf(sub_custom, sizeof(sub_custom), "%s/my-ytdlp.exe", subdir);
+    assert(tt_write_file_atomic(sub_custom, "MZ", 2));
+#else
+    snprintf(sub_custom, sizeof(sub_custom), "%s/my-ytdlp", subdir);
+    assert(tt_write_file_atomic(sub_custom, "#!/bin/sh\nexit 0\n", 17));
+    assert(chmod(sub_custom, 0755) == 0);
+#endif
+    free(cfg.ytdlp_path);
+    cfg.ytdlp_path = tt_asprintf("  %s  ", sub_custom);
+    needs_opt = false;
+    resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
+    assert(resolved != NULL && needs_opt);
+    assert(strcmp(resolved, sub_custom) == 0);
+    assert(player_build_mpv_ytdl_script_opt(&cfg, opt, sizeof(opt)));
+    snprintf(expected_opt, sizeof(expected_opt), "ytdl_hook-ytdl_path=%s", resolved);
+    assert(strcmp(opt, expected_opt) == 0);
+    free(resolved);
+
+    char sub_std[PATH_MAX + 64];
+#ifdef _WIN32
+    snprintf(sub_std, sizeof(sub_std), "%s/yt-dlp.exe", subdir);
+    assert(tt_write_file_atomic(sub_std, "MZ", 2));
+#else
+    snprintf(sub_std, sizeof(sub_std), "%s/yt-dlp", subdir);
+    assert(tt_write_file_atomic(sub_std, "#!/bin/sh\nexit 0\n", 17));
+    assert(chmod(sub_std, 0755) == 0);
+#endif
+    free(cfg.ytdlp_path);
+    cfg.ytdlp_path = tt_strdup(subdir);
+    needs_opt = false;
+    resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
+    assert(resolved != NULL && needs_opt);
+    assert(strcmp(resolved, sub_std) == 0);
+    free(resolved);
+
+    /* 5. Relative ytdlp_path under <config_dir> */
+    free(cfg.ytdlp_path);
+#ifdef _WIN32
+    cfg.ytdlp_path = tt_strdup("sub/my-ytdlp.exe");
+#else
+    cfg.ytdlp_path = tt_strdup("sub/my-ytdlp");
+#endif
+    needs_opt = false;
+    resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
+    assert(resolved != NULL && needs_opt);
+    assert(strcmp(resolved, sub_custom) == 0);
+    free(resolved);
+
+    test_unlink_file(sub_custom);
+    test_unlink_file(sub_std);
+
+    /* 6. Missing explicit ytdlp_path (strict no-fallback) */
+    MediaItem vid = {0};
+    vid.kind = ITEM_VIDEO;
+    snprintf(vid.id, sizeof(vid.id), "dQw4w9WgXcQ");
+    vid.title = tt_strdup("Test Video");
+
+    free(cfg.ytdlp_path);
+    cfg.ytdlp_path = tt_strdup(missing_path);
+    assert(player_resolve_ytdlp_path(&cfg, NULL) == NULL);
+    has_ytdlp = true;
+    player_check_deps(&cfg, NULL, &has_ytdlp);
+    assert(!has_ytdlp);
+
+    char err[256] = {0};
+    assert(!player_download_start(&cfg, &vid, NULL, 0, err, sizeof(err)));
+    assert(strstr(err, "ytdlp_path") != NULL);
+
+#ifndef _WIN32
+    /* 7. POSIX non-executable ytdlp_path */
+    char nonexec[PATH_MAX + 64];
+    snprintf(nonexec, sizeof(nonexec), "%s/nonexec_ytdlp", tmpdir);
+    assert(tt_write_file_atomic(nonexec, "#!/bin/sh\nexit 0\n", 17));
+    assert(chmod(nonexec, 0644) == 0);
+    free(cfg.ytdlp_path);
+    cfg.ytdlp_path = tt_strdup(nonexec);
+    assert(player_resolve_ytdlp_path(&cfg, NULL) == NULL);
+    memset(err, 0, sizeof(err));
+    assert(!player_download_start(&cfg, &vid, NULL, 0, err, sizeof(err)));
+    assert(strstr(err, "not executable") != NULL);
+    test_unlink_file(nonexec);
+#endif
+
+    /* 8. Delimiter / newline sanitization in player_build_mpv_ytdl_script_opt() */
+    free(cfg.ytdlp_path);
+    cfg.ytdlp_path = tt_strdup("bad\npath");
+    assert(!player_build_mpv_ytdl_script_opt(&cfg, opt, sizeof(opt)));
+
+    free(cfg.ytdlp_path);
+#ifdef _WIN32
+    cfg.ytdlp_path = tt_strdup("C:\\Tools\\a;b\\yt-dlp.exe");
+#else
+    cfg.ytdlp_path = tt_strdup("/tmp/a:b/yt-dlp");
+#endif
+    assert(!player_build_mpv_ytdl_script_opt(&cfg, opt, sizeof(opt)));
+
+    /* 9. InnerTube ytdlp_path setter / getter */
+    char it_buf[PATH_MAX];
+    innertube_set_ytdlp_path("/custom/yt-dlp");
+    innertube_get_ytdlp_path(it_buf, sizeof(it_buf));
+    assert(strcmp(it_buf, "/custom/yt-dlp") == 0);
+
+    innertube_set_ytdlp_path("bad\npath");
+    innertube_get_ytdlp_path(it_buf, sizeof(it_buf));
+    assert(strcmp(it_buf, "yt-dlp") == 0);
+
+    innertube_set_ytdlp_path(NULL);
+    innertube_get_ytdlp_path(it_buf, sizeof(it_buf));
+    assert(strcmp(it_buf, "yt-dlp") == 0);
+
+    media_item_free_fields(&vid);
+    config_free(&cfg);
+    test_rmdir(subdir);
+    test_rmdir(tmpdir);
+}
+
 int main(void) {
     RUN_TEST(test_util_utf8_and_entities);
     RUN_TEST(test_search_params_encoding);
@@ -1539,6 +1949,10 @@ int main(void) {
     RUN_TEST(test_ttf_family_name_parser);
     RUN_TEST(test_mpv_overlay_section_close_win_and_bindings);
     RUN_TEST(test_player_launch_and_exe_resolution);
+    RUN_TEST(test_locale_parsing_and_innertube_headers);
+    RUN_TEST(test_non_english_lockup_and_badges);
+    RUN_TEST(test_pe_subsystem_and_runtime_dep_checks);
+    RUN_TEST(test_ytdlp_path_resolution_and_mpv_opts);
 
     printf("\nAll %d tests passed!\n", g_tests_run);
     return 0;

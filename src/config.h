@@ -83,12 +83,18 @@ typedef struct {
 } KeyBinding;
 
 typedef struct {
+    char *language;
+    char *region;
+    char resolved_hl[16];
+    char resolved_gl[8];
     double scale;
     char *font;
     int font_size;
     int thumb_size;
     int playlist_width;
     char *player_path;
+    char *ytdlp_path;
+    bool has_ytdlp_path;
     char *video_format;
     bool has_video_format;
     char *sub_language;
@@ -135,6 +141,7 @@ bool config_build_mpv_overlay_section(const TuiTubeConfig *cfg,
                                       StrBuf *out);
 
 void config_init_defaults(TuiTubeConfig *cfg);
+void config_resolve_locale(TuiTubeConfig *cfg);
 bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir);
 bool config_apply_theme(TuiTubeConfig *cfg, const char *theme_name);
 double config_effective_ui_scale(const TuiTubeConfig *cfg);

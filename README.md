@@ -55,6 +55,26 @@ pacman -S --needed make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-binutils
 
 ---
 
+## Download & Prebuilt Releases
+
+Prebuilt release archives (`tuitube-windows-x64.zip` with MSYS2 UCRT64 runtime DLLs, `tuitube-linux-x64.tar.gz`, and `SHA256SUMS.txt`) are available on the [GitHub Releases](https://github.com/NvnStar/TuiTube/releases) page (served directly over CDN without requiring a GitHub login). Both archives ship with a ready-to-edit `tuitube.json` and [docs/CONFIGURATION.md](docs/CONFIGURATION.md) beside the binaries.
+
+> [!WARNING]
+> **Runtime Dependencies Required (`mpv` and `yt-dlp` are NOT bundled)**  
+> `tuitube-windows-x64.zip` and `tuitube-linux-x64.tar.gz` **do NOT include `mpv` or `yt-dlp`**. Both must be discoverable at runtime (`ffmpeg` is also recommended for merging high-resolution streams; `vlc` can be used as an alternative standalone player):
+>
+> - **Package Managers (`PATH`):**
+>   - **Windows (`winget`):** `winget install shinchiro.mpv yt-dlp.yt-dlp Gyan.FFmpeg`
+>   - **Windows (`scoop`):** `scoop install mpv yt-dlp ffmpeg`
+>   - **Arch Linux:** `sudo pacman -S mpv yt-dlp ffmpeg`
+>   - **Debian / Ubuntu:** `sudo apt install mpv yt-dlp ffmpeg`
+> - **Local Drop-In Placement (no `PATH` edit required):**
+>   - **Standalone (`tuitube.exe` / `./tuitube`):** Place `yt-dlp.exe` (and `mpv.exe`) beside `tuitube.exe` on Windows, or place `yt-dlp` (`chmod +x yt-dlp`) beside `./tuitube` on Linux — or inside TuiTube's config directory (`%APPDATA%\tuitube\yt-dlp.exe` / `~/.config/tuitube/yt-dlp`).
+>   - **`mpv` Plugin (`tuitube.dll` / `tuitube.so`):** Place `yt-dlp.exe` beside `mpv.exe` (Windows), or place `yt-dlp` / `yt-dlp.exe` in `~/.config/tuitube/` / `%APPDATA%\tuitube/` (or beside the plugin when using portable mode).
+> - **Custom Binary Override (`"ytdlp_path"` in `tuitube.json`):** Point `"ytdlp_path"` to any custom or nightly `yt-dlp` binary (or folder containing it) if a distro package is outdated or upstream YouTube breaks extraction.
+
+---
+
 ## Build
 
 `Makefile` auto-detects Linux vs Windows (MSYS2 UCRT64):
@@ -130,7 +150,20 @@ mpv.exe --idle --script=.\tuitube.dll
 
 ## Configuration & Keybindings
 
+Release archives include a starter `tuitube.json` beside the executable. See **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** for the full 27-key reference, `yt-dlp` placement & lookup order, locale/region behavior, portable mode, custom themes, and `key_bindings` documentation.
+
 Starter files: [examples/tuitube.json](examples/tuitube.json) · [examples/sample_theme.json](examples/sample_theme.json)
+
+| Key | Purpose | Default |
+| :--- | :--- | :--- |
+| `language` | UI/YouTube metadata language (`"auto"` detects OS locale, or `"vi"`, `"en"`, `"ja"`, `"zh-TW"`, etc.) | `"auto"` |
+| `region` | Optional 2-letter country override (`"US"`, `"VN"`, `"JP"`, etc.) | `""` |
+| `player_path` | Standalone external player (`"mpv"`, `"vlc"`, or full path) | `"mpv"` |
+| `ytdlp_path` | Custom `yt-dlp` binary or directory (`""` auto-detects config dir, app dir, and `PATH`) | `""` |
+| `video_format` | Quality/codec format (empty = `"1080p60"` standalone / `mpv.conf` in plugin) | `""` |
+| `sub_language` | Subtitle language (`--slang`; empty = `mpv.conf` pass-through in plugin) | `""` |
+| `theme` | `"dark"`, `"light"`, `"yuuka"`, or `"custom"` (with `theme_path`) | `"dark"` |
+| `download_dir` | Download folder for `Ctrl+S` (empty = system Downloads) | `""` |
 
 | Key / Input | Action |
 | :--- | :--- |
@@ -155,6 +188,7 @@ Starter files: [examples/tuitube.json](examples/tuitube.json) · [examples/sampl
 
 ## Documentation & Maintenance
 
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — Config lookup order, portable mode, all `tuitube.json` keys, custom themes, and keybindings.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Module map and concurrency model.
 - [docs/UPSTREAM_MAINTENANCE.md](docs/UPSTREAM_MAINTENANCE.md) — Guide for fixing YouTube / `yt-dlp` / `mpv` upstream changes.
 

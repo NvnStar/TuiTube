@@ -386,14 +386,83 @@ static int clamp_int(int v, int lo, int hi) {
     return v;
 }
 
+static const char *default_country_for_hl(const char *hl, const char *fallback_gl) {
+    static const struct { const char *hl; const char *gl; } map[] = {
+        {"vi",    "VN"},
+        {"en",    "US"},
+        {"ja",    "JP"},
+        {"ko",    "KR"},
+        {"zh-TW", "TW"},
+        {"zh-HK", "HK"},
+        {"zh-CN", "CN"},
+        {"fr",    "FR"},
+        {"de",    "DE"},
+        {"es",    "ES"},
+        {"pt-BR", "BR"},
+        {"pt-PT", "PT"},
+        {"ru",    "RU"},
+        {"id",    "ID"},
+        {"th",    "TH"},
+    };
+    if (hl) {
+        for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+            if (strcmp(hl, map[i].hl) == 0) return map[i].gl;
+        }
+    }
+    return (fallback_gl && fallback_gl[0]) ? fallback_gl : "US";
+}
+
+void config_resolve_locale(TuiTubeConfig *cfg) {
+    if (!cfg) return;
+
+    char sys_hl[16] = "en";
+    char sys_gl[8] = "US";
+    tt_detect_system_locale(sys_hl, sizeof(sys_hl), sys_gl, sizeof(sys_gl));
+
+    if (!cfg->language || !cfg->language[0] || tt_strcasecmp(cfg->language, "auto") == 0) {
+        snprintf(cfg->resolved_hl, sizeof(cfg->resolved_hl), "%s", sys_hl);
+        snprintf(cfg->resolved_gl, sizeof(cfg->resolved_gl), "%s", sys_gl);
+    } else {
+        char parsed_hl[16] = {0};
+        char parsed_gl[8] = {0};
+        if (tt_parse_locale_tag(cfg->language, parsed_hl, sizeof(parsed_hl),
+                                parsed_gl, sizeof(parsed_gl))) {
+            snprintf(cfg->resolved_hl, sizeof(cfg->resolved_hl), "%s", parsed_hl);
+            const char *gl = parsed_gl[0] ? parsed_gl : default_country_for_hl(parsed_hl, sys_gl);
+            snprintf(cfg->resolved_gl, sizeof(cfg->resolved_gl), "%s", gl);
+        } else {
+            snprintf(cfg->resolved_hl, sizeof(cfg->resolved_hl), "%s", sys_hl);
+            snprintf(cfg->resolved_gl, sizeof(cfg->resolved_gl), "%s", sys_gl);
+        }
+    }
+
+    if (cfg->region && cfg->region[0] && tt_strcasecmp(cfg->region, "auto") != 0) {
+        const char *p = cfg->region;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t len = strlen(p);
+        while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t')) len--;
+        if (len == 2 &&
+            isalpha((unsigned char)p[0]) &&
+            isalpha((unsigned char)p[1])) {
+            cfg->resolved_gl[0] = (char)toupper((unsigned char)p[0]);
+            cfg->resolved_gl[1] = (char)toupper((unsigned char)p[1]);
+            cfg->resolved_gl[2] = '\0';
+        }
+    }
+}
+
 void config_init_defaults(TuiTubeConfig *cfg) {
     memset(cfg, 0, sizeof(*cfg));
+    cfg->language = tt_strdup("auto");
+    cfg->region = tt_strdup("");
     cfg->scale = 0.0;
     cfg->font = tt_strdup("");
     cfg->font_size = 13;
     cfg->thumb_size = 72;
     cfg->playlist_width = 380;
     cfg->player_path = tt_strdup("mpv");
+    cfg->ytdlp_path = tt_strdup("");
+    cfg->has_ytdlp_path = false;
     cfg->video_format = tt_strdup("1080p60");
     cfg->has_video_format = false;
     cfg->sub_language = tt_strdup("en");
@@ -416,6 +485,7 @@ void config_init_defaults(TuiTubeConfig *cfg) {
     cfg->download_dir = tt_strdup("");
     add_default_keybindings(cfg);
     theme_init_builtin(&cfg->theme, "dark");
+    config_resolve_locale(cfg);
 }
 
 double config_effective_ui_scale(const TuiTubeConfig *cfg) {
@@ -427,7 +497,19 @@ double config_effective_ui_scale(const TuiTubeConfig *cfg) {
 
 char *config_resolve_asset_path(const TuiTubeConfig *cfg, const char *rel_or_abs) {
     if (!cfg || !rel_or_abs || !rel_or_abs[0]) return NULL;
-    return tt_path_join(cfg->config_dir, rel_or_abs);
+    char *primary = tt_path_join(cfg->config_dir, rel_or_abs);
+    if (!tt_is_abs_path(rel_or_abs) && (!primary || !tt_file_exists(primary)) && !cfg->portable_mode) {
+        char exe_dir[PATH_MAX];
+        if (tt_get_exe_dir(exe_dir, sizeof(exe_dir))) {
+            char *fallback = tt_path_join(exe_dir, rel_or_abs);
+            if (fallback && tt_file_exists(fallback)) {
+                free(primary);
+                return fallback;
+            }
+            free(fallback);
+        }
+    }
+    return primary;
 }
 
 char *config_resolve_download_dir(const TuiTubeConfig *cfg) {
@@ -501,6 +583,33 @@ static void replace_str_field(yyjson_val *obj, const char *key, char **dst) {
     }
 }
 
+static void trim_ascii_and_outer_quotes_inplace(char *s) {
+    if (!s) return;
+    size_t len = strlen(s);
+    size_t start = 0;
+    while (start < len && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n')) {
+        start++;
+    }
+    while (len > start && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r' || s[len - 1] == '\n')) {
+        len--;
+    }
+    if (len - start >= 2 && s[start] == '"' && s[len - 1] == '"') {
+        start++;
+        len--;
+        while (start < len && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n')) {
+            start++;
+        }
+        while (len > start && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r' || s[len - 1] == '\n')) {
+            len--;
+        }
+    }
+    size_t out_len = len - start;
+    if (start > 0 && out_len > 0) {
+        memmove(s, s + start, out_len);
+    }
+    s[out_len] = '\0';
+}
+
 static void read_bool_field(yyjson_val *obj, const char *key, bool *dst) {
     yyjson_val *v = yyjson_obj_get(obj, key);
     if (v && yyjson_is_bool(v)) {
@@ -521,6 +630,16 @@ bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
     size_t len = 0;
     char *raw = tt_read_file(cfg_path, &len);
     free(cfg_path);
+    if (!raw && (!cli_config_dir || !cli_config_dir[0]) && !cfg->portable_mode) {
+        char exe_dir[PATH_MAX];
+        if (tt_get_exe_dir(exe_dir, sizeof(exe_dir))) {
+            char *fallback_path = tt_path_join(exe_dir, "tuitube.json");
+            if (fallback_path) {
+                raw = tt_read_file(fallback_path, &len);
+                free(fallback_path);
+            }
+        }
+    }
     if (!raw) {
         return true; /* Missing config file -> use defaults cleanly */
     }
@@ -537,6 +656,9 @@ bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
         yyjson_doc_free(doc);
         return false;
     }
+
+    replace_str_field(root, "language", &cfg->language);
+    replace_str_field(root, "region", &cfg->region);
 
     yyjson_val *v = yyjson_obj_get(root, "scale");
     if (v && yyjson_is_num(v)) {
@@ -555,6 +677,9 @@ bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
     if (v && yyjson_is_num(v)) cfg->playlist_width = clamp_int((int)yyjson_get_sint(v), 200, 1200);
 
     replace_str_field(root, "player_path", &cfg->player_path);
+    replace_str_field(root, "ytdlp_path", &cfg->ytdlp_path);
+    trim_ascii_and_outer_quotes_inplace(cfg->ytdlp_path);
+    cfg->has_ytdlp_path = (cfg->ytdlp_path && cfg->ytdlp_path[0] != '\0');
     yyjson_val *vf = yyjson_obj_get(root, "video_format");
     if (vf && yyjson_is_str(vf) && yyjson_get_str(vf)[0] != '\0') {
         cfg->has_video_format = true;
@@ -622,13 +747,17 @@ bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
     if (!config_apply_theme(cfg, cfg->theme_name)) {
         theme_init_builtin(&cfg->theme, "dark");
     }
+    config_resolve_locale(cfg);
     return true;
 }
 
 void config_free(TuiTubeConfig *cfg) {
     if (!cfg) return;
+    free(cfg->language);
+    free(cfg->region);
     free(cfg->font);
     free(cfg->player_path);
+    free(cfg->ytdlp_path);
     free(cfg->video_format);
     free(cfg->sub_language);
     free(cfg->theme_name);

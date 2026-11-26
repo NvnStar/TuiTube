@@ -148,6 +148,441 @@ static bool is_vlc_path(const char *player_path) {
     return tt_strcasecmp(base, "vlc") == 0 || tt_strcasecmp(base, "vlc.exe") == 0;
 }
 
+#ifdef _WIN32
+static bool win32_file_is_gui_exe(const wchar_t *wpath) {
+    if (!wpath || !wpath[0]) return false;
+    FILE *f = _wfopen(wpath, L"rb");
+    if (!f) return false;
+    uint8_t buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    return tt_pe_is_gui_subsystem(buf, n);
+}
+
+static bool win32_has_path_sep_char(const char *s) {
+    if (!s) return false;
+    for (const char *p = s; *p; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':') return true;
+    }
+    return false;
+}
+
+static bool win32_is_in_process_path_env(const char *exe_name) {
+    DWORD need = GetEnvironmentVariableW(L"PATH", NULL, 0);
+    if (need == 0) return false;
+    wchar_t *env_path = malloc(((size_t)need + 1u) * sizeof(wchar_t));
+    if (!env_path) return false;
+    DWORD got = GetEnvironmentVariableW(L"PATH", env_path, need + 1u);
+    if (got == 0 || got > need) {
+        free(env_path);
+        return false;
+    }
+    env_path[got] = L'\0';
+    if (!env_path[0]) {
+        free(env_path);
+        return false;
+    }
+
+    const char *name = (exe_name && exe_name[0]) ? exe_name : "yt-dlp";
+    wchar_t *wname = tt_utf8_to_wide(name);
+    if (!wname) {
+        free(env_path);
+        return false;
+    }
+
+    static const wchar_t *const exts[] = {L".exe", L".com"};
+    bool found = false;
+    for (size_t i = 0; i < 2 && !found; i++) {
+        DWORD sz = SearchPathW(env_path, wname, exts[i], 0, NULL, NULL);
+        if (sz == 0) continue;
+        wchar_t *buf = malloc(((size_t)sz + 1u) * sizeof(wchar_t));
+        if (!buf) continue;
+        DWORD r = SearchPathW(env_path, wname, exts[i], sz + 1u, buf, NULL);
+        if (r > 0 && r <= sz) {
+            DWORD attr = GetFileAttributesW(buf);
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                found = true;
+            }
+        }
+        free(buf);
+    }
+
+    free(wname);
+    free(env_path);
+    return found;
+}
+#else
+static char *posix_resolve_exe(const char *name) {
+    if (!name || !name[0]) return NULL;
+    if (strchr(name, '/') != NULL) {
+        if (tt_dir_exists(name)) {
+            char *cand = tt_path_join(name, "yt-dlp");
+            if (cand && tt_file_exists(cand) && access(cand, X_OK) == 0) {
+                return cand;
+            }
+            free(cand);
+            return NULL;
+        }
+        if (tt_file_exists(name) && access(name, X_OK) == 0) {
+            return tt_strdup(name);
+        }
+        return NULL;
+    }
+    const char *path_env = getenv("PATH");
+    if (!path_env || !path_env[0]) {
+        path_env = "/usr/local/bin:/usr/bin:/bin";
+    }
+    const char *p = path_env;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        size_t slen = colon ? (size_t)(colon - p) : strlen(p);
+        char *seg = (slen > 0) ? tt_strndup(p, slen) : tt_strdup(".");
+        if (seg) {
+            char *cand = tt_path_join(seg, name);
+            free(seg);
+            if (cand) {
+                if (tt_file_exists(cand) && access(cand, X_OK) == 0) {
+                    return cand;
+                }
+                free(cand);
+            }
+        }
+        if (!colon) break;
+        p = colon + 1;
+    }
+    return NULL;
+}
+
+static bool posix_dir_is_in_path_env(const char *dir) {
+    if (!dir || !dir[0]) return false;
+    const char *path_env = getenv("PATH");
+    if (!path_env || !path_env[0]) return false;
+
+    size_t dlen = strlen(dir);
+    while (dlen > 1 && dir[dlen - 1] == '/') dlen--;
+
+    const char *p = path_env;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        size_t slen = colon ? (size_t)(colon - p) : strlen(p);
+        while (slen > 1 && p[slen - 1] == '/') slen--;
+        if (slen == dlen && strncmp(p, dir, dlen) == 0) {
+            return true;
+        }
+        if (!colon) break;
+        p = colon + 1;
+    }
+    return false;
+}
+#endif
+
+static char *normalize_ytdlp_spec(const char *raw) {
+    if (!raw) return tt_strdup("");
+    const char *s = raw;
+    size_t len = strlen(s);
+    size_t start = 0;
+    while (start < len && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n')) {
+        start++;
+    }
+    while (len > start && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r' || s[len - 1] == '\n')) {
+        len--;
+    }
+    if (len - start >= 2 && s[start] == '"' && s[len - 1] == '"') {
+        start++;
+        len--;
+        while (start < len && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n')) {
+            start++;
+        }
+        while (len > start && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r' || s[len - 1] == '\n')) {
+            len--;
+        }
+    }
+    for (size_t i = start; i < len; i++) {
+        if (s[i] == '\r' || s[i] == '\n') return NULL;
+    }
+    return tt_strndup(s + start, len - start);
+}
+
+static char *expand_home_spec(const char *spec) {
+    if (!spec) return NULL;
+    if (strcmp(spec, "~") == 0 ||
+        (spec[0] == '~' && (spec[1] == '/' || spec[1] == '\\'))) {
+        const char *env_home = getenv("HOME");
+#ifdef _WIN32
+        if (!env_home || !env_home[0]) env_home = getenv("USERPROFILE");
+        if (!env_home || !env_home[0]) env_home = getenv("TEMP");
+#endif
+        const char *home = (env_home && env_home[0]) ? env_home : "/tmp";
+        if (spec[1] == '\0') return tt_strdup(home);
+        return tt_path_join(home, spec + 2);
+    }
+    return tt_strdup(spec);
+}
+
+static bool spec_has_path_sep(const char *s) {
+    if (!s) return false;
+#ifdef _WIN32
+    return win32_has_path_sep_char(s);
+#else
+    return strchr(s, '/') != NULL;
+#endif
+}
+
+static char *probe_ytdlp_in_dir(const char *dir) {
+    if (!dir || !dir[0]) return NULL;
+#ifdef _WIN32
+    static const char *const bins[] = {"yt-dlp.exe", "yt-dlp.com"};
+    for (size_t i = 0; i < 2; i++) {
+        char *cand = tt_path_join(dir, bins[i]);
+        if (!cand) continue;
+        if (tt_file_exists(cand)) {
+            char *res = tt_win32_resolve_exe(cand);
+            free(cand);
+            if (res) return res;
+        } else {
+            free(cand);
+        }
+    }
+    return NULL;
+#else
+    char *cand = tt_path_join(dir, "yt-dlp");
+    if (cand && tt_file_exists(cand) && access(cand, X_OK) == 0) {
+        return cand;
+    }
+    free(cand);
+    return NULL;
+#endif
+}
+
+static char *probe_ytdlp_candidate(const char *cand) {
+    if (!cand || !cand[0]) return NULL;
+    if (tt_dir_exists(cand)) {
+        return probe_ytdlp_in_dir(cand);
+    }
+#ifdef _WIN32
+    if (win32_has_path_sep_char(cand)) {
+        return tt_win32_resolve_exe(cand);
+    }
+    if (tt_file_exists(cand)) {
+        return tt_strdup(cand);
+    }
+    return NULL;
+#else
+    if (tt_file_exists(cand) && access(cand, X_OK) == 0) {
+        return tt_strdup(cand);
+    }
+    return NULL;
+#endif
+}
+
+static char *extract_parent_dir(const char *path) {
+    if (!path || !path[0]) return NULL;
+    const char *last_sep = NULL;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') last_sep = p;
+    }
+    if (!last_sep) return NULL;
+    if (last_sep == path) return tt_strdup("/");
+    size_t dlen = (size_t)(last_sep - path);
+#ifdef _WIN32
+    if (dlen == 2 && isalpha((unsigned char)path[0]) && path[1] == ':') {
+        dlen = 3;
+    }
+#endif
+    return tt_strndup(path, dlen);
+}
+
+char *player_resolve_ytdlp_path(const TuiTubeConfig *cfg, bool *out_needs_mpv_opt) {
+    if (out_needs_mpv_opt) *out_needs_mpv_opt = false;
+
+    char *explicit_spec = normalize_ytdlp_spec(cfg ? cfg->ytdlp_path : NULL);
+    if (!explicit_spec) return NULL;
+
+    char exe_dir[PATH_MAX];
+    bool have_exe_dir = tt_get_exe_dir(exe_dir, sizeof(exe_dir));
+
+    /* Case A: Explicit ytdlp_path */
+    if (explicit_spec[0] != '\0') {
+        char *expanded = expand_home_spec(explicit_spec);
+        free(explicit_spec);
+        if (!expanded) return NULL;
+
+        char *resolved = NULL;
+        if (spec_has_path_sep(expanded)) {
+            if (tt_is_abs_path(expanded)) {
+                resolved = probe_ytdlp_candidate(expanded);
+            } else if (cfg && cfg->config_dir[0]) {
+                char *cand = config_resolve_asset_path(cfg, expanded);
+                resolved = probe_ytdlp_candidate(cand);
+                free(cand);
+                if (!resolved && !cfg->portable_mode && have_exe_dir) {
+                    char *exe_cand = tt_path_join(exe_dir, expanded);
+                    resolved = probe_ytdlp_candidate(exe_cand);
+                    free(exe_cand);
+                }
+            } else {
+                resolved = probe_ytdlp_candidate(expanded);
+                if (!resolved && have_exe_dir) {
+                    char *exe_cand = tt_path_join(exe_dir, expanded);
+                    resolved = probe_ytdlp_candidate(exe_cand);
+                    free(exe_cand);
+                }
+            }
+        } else {
+            if (cfg && cfg->config_dir[0]) {
+                char *cfg_cand = tt_path_join(cfg->config_dir, expanded);
+                resolved = probe_ytdlp_candidate(cfg_cand);
+                free(cfg_cand);
+            }
+            if (!resolved && have_exe_dir) {
+                char *exe_cand = tt_path_join(exe_dir, expanded);
+                resolved = probe_ytdlp_candidate(exe_cand);
+                free(exe_cand);
+            }
+            if (!resolved) {
+#ifdef _WIN32
+                resolved = tt_win32_resolve_exe(expanded);
+#else
+                resolved = posix_resolve_exe(expanded);
+#endif
+            }
+        }
+        free(expanded);
+        if (resolved) {
+            if (out_needs_mpv_opt) *out_needs_mpv_opt = true;
+        }
+        return resolved;
+    }
+    free(explicit_spec);
+
+    /* Case B: Default auto-discovery */
+    /* 1. <config_dir> drop-in binary */
+    if (cfg && cfg->config_dir[0]) {
+        char *found = probe_ytdlp_in_dir(cfg->config_dir);
+        if (found) {
+            if (out_needs_mpv_opt) *out_needs_mpv_opt = true;
+            return found;
+        }
+    }
+
+#ifdef _WIN32
+    /* 3. Standard PATH & Windows package-manager discovery (includes <exe_dir>) */
+    char *win_found = tt_win32_resolve_exe("yt-dlp");
+    if (win_found) {
+        if (out_needs_mpv_opt) {
+            *out_needs_mpv_opt = !win32_is_in_process_path_env("yt-dlp");
+        }
+        return win_found;
+    }
+#else
+    /* 2. Standalone <exe_dir> drop-in binary (POSIX non-PATH dir) */
+    if (have_exe_dir && !posix_dir_is_in_path_env(exe_dir)) {
+        char *found = probe_ytdlp_in_dir(exe_dir);
+        if (found) {
+            if (out_needs_mpv_opt) *out_needs_mpv_opt = true;
+            return found;
+        }
+    }
+
+    /* 3. Standard PATH */
+    char *posix_found = posix_resolve_exe("yt-dlp");
+    if (posix_found) {
+        if (out_needs_mpv_opt) *out_needs_mpv_opt = false;
+        return posix_found;
+    }
+    if (have_exe_dir) {
+        char *found = probe_ytdlp_in_dir(exe_dir);
+        if (found) {
+            if (out_needs_mpv_opt) *out_needs_mpv_opt = true;
+            return found;
+        }
+    }
+#endif
+
+    /* 4. Player sibling directory fallback */
+    const char *player = (cfg && cfg->player_path && cfg->player_path[0]) ? cfg->player_path : "mpv";
+#ifdef _WIN32
+    char *resolved_player = tt_win32_resolve_exe(player);
+#else
+    char *resolved_player = posix_resolve_exe(player);
+#endif
+    if (resolved_player) {
+        char *player_dir = extract_parent_dir(resolved_player);
+        free(resolved_player);
+        if (player_dir) {
+            char *found = probe_ytdlp_in_dir(player_dir);
+            free(player_dir);
+            if (found) {
+                if (out_needs_mpv_opt) *out_needs_mpv_opt = true;
+                return found;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+bool player_build_mpv_ytdl_script_opt(const TuiTubeConfig *cfg, char *out, size_t out_cap) {
+    if (out && out_cap > 0) out[0] = '\0';
+    if (!cfg || !out || out_cap == 0) return false;
+
+    char *explicit_spec = normalize_ytdlp_spec(cfg->ytdlp_path);
+    if (!explicit_spec) return false;
+
+    bool needs_opt = false;
+    char *resolved = player_resolve_ytdlp_path(cfg, &needs_opt);
+    const char *target = NULL;
+    if (resolved && needs_opt) {
+        target = resolved;
+    } else if (!resolved && explicit_spec[0] != '\0') {
+        target = explicit_spec;
+    } else {
+        free(resolved);
+        free(explicit_spec);
+        return false;
+    }
+
+#ifdef _WIN32
+    const char forbidden_delim = ';';
+#else
+    const char forbidden_delim = ':';
+#endif
+    for (const char *p = target; *p; p++) {
+        if (*p == '\r' || *p == '\n' || *p == forbidden_delim) {
+            free(resolved);
+            free(explicit_spec);
+            return false;
+        }
+    }
+
+    int n = snprintf(out, out_cap, "ytdl_hook-ytdl_path=%s", target);
+    free(resolved);
+    free(explicit_spec);
+    if (n <= 0 || (size_t)n >= out_cap) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+void player_check_deps(const TuiTubeConfig *cfg, bool *out_has_player, bool *out_has_ytdlp) {
+    const char *player = (cfg && cfg->player_path && cfg->player_path[0]) ? cfg->player_path : "mpv";
+    if (out_has_player) {
+#ifdef _WIN32
+        char *resolved_player = tt_win32_resolve_exe(player);
+#else
+        char *resolved_player = posix_resolve_exe(player);
+#endif
+        *out_has_player = (resolved_player != NULL);
+        free(resolved_player);
+    }
+    if (out_has_ytdlp) {
+        char *ytdlp = player_resolve_ytdlp_path(cfg, NULL);
+        *out_has_ytdlp = (ytdlp != NULL);
+        free(ytdlp);
+    }
+}
+
 #ifndef _WIN32
 static bool make_cloexec_pipe(int fds[2]) {
     if (pipe(fds) != 0) return false;
@@ -180,22 +615,36 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
     char *arg_slang = (cfg->sub_language && cfg->sub_language[0])
                           ? tt_asprintf("--slang=%s", cfg->sub_language)
                           : NULL;
+    char ytdl_script_opt[PATH_MAX + 64];
+    char *arg_ytdl_path = player_build_mpv_ytdl_script_opt(cfg, ytdl_script_opt, sizeof(ytdl_script_opt))
+                              ? tt_asprintf("--script-opts-append=%s", ytdl_script_opt)
+                              : NULL;
 
 #ifdef _WIN32
     char *resolved_player = tt_win32_resolve_exe(player);
     const char *launch_exe = (resolved_player && resolved_player[0]) ? resolved_player : player;
+    bool is_vlc = is_vlc_path(launch_exe);
+    if (!is_vlc) {
+        char *resolved_ytdlp = player_resolve_ytdlp_path(cfg, NULL);
+        if (resolved_ytdlp) {
+            tt_win32_ensure_dir_in_path(resolved_ytdlp);
+            free(resolved_ytdlp);
+        }
+    }
     char *cmdline = NULL;
-    if (is_vlc_path(launch_exe)) {
+    if (is_vlc) {
         const char *argv_vlc[] = {launch_exe, arg_title_vlc, url, NULL};
         cmdline = tt_win32_build_cmdline(argv_vlc);
     } else {
-        const char *argv_mpv[8];
+        const char *argv_mpv[12];
         int idx = 0;
         argv_mpv[idx++] = launch_exe;
         argv_mpv[idx++] = "--ytdl=yes";
+        argv_mpv[idx++] = "--force-window=immediate";
         argv_mpv[idx++] = arg_fmt;
         argv_mpv[idx++] = arg_title_mpv;
         if (arg_slang) argv_mpv[idx++] = arg_slang;
+        if (arg_ytdl_path) argv_mpv[idx++] = arg_ytdl_path;
         argv_mpv[idx++] = url;
         argv_mpv[idx] = NULL;
         cmdline = tt_win32_build_cmdline(argv_mpv);
@@ -205,6 +654,7 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
     free(arg_title_mpv);
     free(arg_title_vlc);
     free(arg_slang);
+    free(arg_ytdl_path);
 
     if (!cmdline) {
         free(resolved_player);
@@ -246,12 +696,15 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
     memset(&si, 0, sizeof(si));
     memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_SHOWNORMAL;
 
-    /* CREATE_NO_WINDOW suppresses console flashes for shims/mpv.com while
-       GUI apps like mpv.exe ignore it; never combine with DETACHED_PROCESS
-       (mutually exclusive -> ERROR_INVALID_PARAMETER). */
+    /* Omit CREATE_NO_WINDOW for GUI subsystem binaries (e.g., mpv.exe); retain it
+       for console wrappers/shims so no stray console window flashes. */
+    DWORD create_flags = CREATE_UNICODE_ENVIRONMENT |
+                         ((wapp && win32_file_is_gui_exe(wapp)) ? 0 : CREATE_NO_WINDOW);
     BOOL ok = CreateProcessW(wapp, wcmd, NULL, NULL, FALSE,
-                             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                             create_flags,
                              NULL, wcwd, &si, &pi);
     DWORD last_err = ok ? 0 : GetLastError();
     free(wcwd);
@@ -269,6 +722,19 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
         return false;
     }
 
+    if (WaitForSingleObject(pi.hProcess, 50) == WAIT_OBJECT_0) {
+        DWORD ec = 0;
+        if (GetExitCodeProcess(pi.hProcess, &ec) && ec >= 0xC0000000u) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            if (err_buf && err_cap) {
+                snprintf(err_buf, err_cap, "Failed to start player: %s (error 0x%08lX)",
+                         player, (unsigned long)ec);
+            }
+            return false;
+        }
+    }
+
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return true;
@@ -279,6 +745,7 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
         free(arg_title_mpv);
         free(arg_title_vlc);
         free(arg_slang);
+        free(arg_ytdl_path);
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to create pipe");
         return false;
     }
@@ -292,6 +759,7 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
         free(arg_title_mpv);
         free(arg_title_vlc);
         free(arg_slang);
+        free(arg_ytdl_path);
         if (err_buf && err_cap) {
             snprintf(err_buf, err_cap, "Failed to launch player: %s", strerror(saved));
         }
@@ -319,13 +787,15 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
             };
             execvp(player, argv_vlc);
         } else {
-            char *argv_mpv[8];
+            char *argv_mpv[12];
             int idx = 0;
             argv_mpv[idx++] = (char *)player;
             argv_mpv[idx++] = "--ytdl=yes";
+            argv_mpv[idx++] = "--force-window=immediate";
             argv_mpv[idx++] = arg_fmt;
             argv_mpv[idx++] = arg_title_mpv;
             if (arg_slang) argv_mpv[idx++] = arg_slang;
+            if (arg_ytdl_path) argv_mpv[idx++] = arg_ytdl_path;
             argv_mpv[idx++] = url;
             argv_mpv[idx] = NULL;
             execvp(player, argv_mpv);
@@ -342,6 +812,7 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
     free(arg_title_mpv);
     free(arg_title_vlc);
     free(arg_slang);
+    free(arg_ytdl_path);
 
     int child_errno = 0;
     ssize_t n = read(err_pipe[0], &child_errno, sizeof(child_errno));
@@ -613,8 +1084,46 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
         return false;
     }
 
+    char *explicit_spec = normalize_ytdlp_spec(cfg->ytdlp_path);
+    char *resolved_ytdlp = player_resolve_ytdlp_path(cfg, NULL);
+    if (!resolved_ytdlp && (!explicit_spec || explicit_spec[0] != '\0')) {
+        if (err_buf && err_cap) {
+            const char *display_spec = (explicit_spec && explicit_spec[0])
+                                           ? explicit_spec
+                                           : (cfg->ytdlp_path ? cfg->ytdlp_path : "");
+#ifndef _WIN32
+            char *expanded = explicit_spec ? expand_home_spec(explicit_spec) : NULL;
+            const char *check_path = expanded;
+            char *rel_cand = NULL;
+            if (expanded && !tt_is_abs_path(expanded) && cfg->config_dir[0]) {
+                rel_cand = tt_path_join(cfg->config_dir, expanded);
+                if (rel_cand && tt_file_exists(rel_cand)) check_path = rel_cand;
+            }
+            if (check_path && tt_file_exists(check_path) && access(check_path, X_OK) != 0) {
+                snprintf(err_buf, err_cap,
+                         "Failed to launch yt-dlp: '%s' is not executable (run chmod +x)",
+                         display_spec);
+            } else {
+                snprintf(err_buf, err_cap,
+                         "Failed to launch yt-dlp: ytdlp_path '%s' not found",
+                         display_spec);
+            }
+            free(rel_cand);
+            free(expanded);
+#else
+            snprintf(err_buf, err_cap,
+                     "Failed to launch yt-dlp: ytdlp_path '%s' not found",
+                     display_spec);
+#endif
+        }
+        free(explicit_spec);
+        return false;
+    }
+    free(explicit_spec);
+
     char *dir = config_resolve_download_dir(cfg);
     if (!dir || !tt_mkdir_p(dir, 0755)) {
+        free(resolved_ytdlp);
         free(dir);
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to create download directory");
         return false;
@@ -631,7 +1140,9 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
     snprintf(url, sizeof(url), "https://www.youtube.com/watch?v=%s", video->id);
 
 #ifdef _WIN32
-    char *resolved_ytdlp = tt_win32_resolve_exe("yt-dlp");
+    if (resolved_ytdlp) {
+        tt_win32_ensure_dir_in_path(resolved_ytdlp);
+    }
     const char *ytdlp_exe = (resolved_ytdlp && resolved_ytdlp[0]) ? resolved_ytdlp : "yt-dlp";
     const char *argv[] = {
         ytdlp_exe,
@@ -710,7 +1221,8 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
         free(dir);
         if (err_buf && err_cap) {
             if (last_err == ERROR_FILE_NOT_FOUND || last_err == ERROR_PATH_NOT_FOUND) {
-                snprintf(err_buf, err_cap, "Failed to launch yt-dlp (not found in PATH)");
+                snprintf(err_buf, err_cap,
+                         "Failed to launch yt-dlp (install yt-dlp or set ytdlp_path in tuitube.json)");
             } else {
                 snprintf(err_buf, err_cap, "Failed to launch yt-dlp (error %lu)",
                          (unsigned long)last_err);
@@ -737,6 +1249,7 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
 #else
     int err_pipe[2];
     if (!make_cloexec_pipe(err_pipe)) {
+        free(resolved_ytdlp);
         free(dir);
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to create pipe");
         return false;
@@ -746,6 +1259,7 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
     if (!make_cloexec_pipe(out_pipe)) {
         close(err_pipe[0]);
         close(err_pipe[1]);
+        free(resolved_ytdlp);
         free(dir);
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to create output pipe");
         return false;
@@ -764,6 +1278,7 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
         close(err_pipe[1]);
         close(out_pipe[0]);
         close(out_pipe[1]);
+        free(resolved_ytdlp);
         free(dir);
         if (err_buf && err_cap) {
             snprintf(err_buf, err_cap, "Failed to launch yt-dlp: %s", strerror(saved));
@@ -789,8 +1304,9 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
 
         setenv("PYTHONUNBUFFERED", "1", 1);
 
+        const char *ytdlp_exe = (resolved_ytdlp && resolved_ytdlp[0]) ? resolved_ytdlp : "yt-dlp";
         char *argv[] = {
-            "yt-dlp",
+            (char *)ytdlp_exe,
             "--no-playlist",
             "--no-simulate",
             "--progress",
@@ -806,7 +1322,7 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
             url,
             NULL
         };
-        execvp("yt-dlp", argv);
+        execvp(ytdlp_exe, argv);
 
         int err_no = errno;
         ssize_t wr = write(err_pipe[1], &err_no, sizeof(err_no));
@@ -816,6 +1332,7 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
 
     close(err_pipe[1]);
     close(out_pipe[1]);
+    free(resolved_ytdlp);
     int child_errno = 0;
     ssize_t n = read(err_pipe[0], &child_errno, sizeof(child_errno));
     close(err_pipe[0]);
@@ -828,7 +1345,10 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
         g_dl_slots[slot].progress = -1.0;
         sigprocmask(SIG_SETMASK, &oldmask, NULL);
         free(dir);
-        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to launch yt-dlp");
+        if (err_buf && err_cap) {
+            snprintf(err_buf, err_cap,
+                     "Failed to launch yt-dlp (install yt-dlp or set ytdlp_path in tuitube.json)");
+        }
         return false;
     }
 

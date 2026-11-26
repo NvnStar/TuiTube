@@ -477,9 +477,18 @@ static bool mpv_host_play_video(void *play_ctx, const TuiTubeConfig *cfg,
 
     const char *title = (video->title && video->title[0]) ? video->title : video->id;
     char ytdl_fmt[512];
+    char ytdl_script_opt[PATH_MAX + 64];
 
-    char *opt_keys[3];
-    mpv_node opt_vals[3];
+#ifdef _WIN32
+    char *resolved_ytdlp = player_resolve_ytdlp_path(cfg, NULL);
+    if (resolved_ytdlp) {
+        tt_win32_ensure_dir_in_path(resolved_ytdlp);
+        free(resolved_ytdlp);
+    }
+#endif
+
+    char *opt_keys[4];
+    mpv_node opt_vals[4];
     int opt_count = 0;
 
     opt_keys[opt_count] = "force-media-title";
@@ -500,6 +509,13 @@ static bool mpv_host_play_video(void *play_ctx, const TuiTubeConfig *cfg,
         opt_keys[opt_count] = "slang";
         opt_vals[opt_count].format = MPV_FORMAT_STRING;
         opt_vals[opt_count].u.string = cfg->sub_language;
+        opt_count++;
+    }
+
+    if (player_build_mpv_ytdl_script_opt(cfg, ytdl_script_opt, sizeof(ytdl_script_opt))) {
+        opt_keys[opt_count] = "script-opts-append";
+        opt_vals[opt_count].format = MPV_FORMAT_STRING;
+        opt_vals[opt_count].u.string = ytdl_script_opt;
         opt_count++;
     }
 

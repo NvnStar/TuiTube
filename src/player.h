@@ -21,6 +21,9 @@ typedef struct {
 } DownloadEvent;
 
 void player_install_sigchld_handler(void);
+void player_check_deps(const TuiTubeConfig *cfg, bool *out_has_player, bool *out_has_ytdlp);
+char *player_resolve_ytdlp_path(const TuiTubeConfig *cfg, bool *out_needs_mpv_opt);
+bool player_build_mpv_ytdl_script_opt(const TuiTubeConfig *cfg, char *out, size_t out_cap);
 
 bool player_map_video_format(const char *video_format, bool allow_hdr, bool all_codecs,
                              char *out, size_t out_cap);

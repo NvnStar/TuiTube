@@ -53,8 +53,10 @@ jobs:
 
       - name: Package Linux tarball
         run: |
-          mkdir -p dist/tuitube-linux-x64/examples
+          mkdir -p dist/tuitube-linux-x64/docs dist/tuitube-linux-x64/examples
           cp tuitube tuitube.so README.md LICENSE dist/tuitube-linux-x64/
+          cp examples/tuitube.json dist/tuitube-linux-x64/tuitube.json
+          cp docs/CONFIGURATION.md dist/tuitube-linux-x64/docs/CONFIGURATION.md
           cp examples/tuitube.json examples/sample_theme.json dist/tuitube-linux-x64/examples/
           tar -C dist -czf dist/tuitube-linux-x64.tar.gz tuitube-linux-x64
 
@@ -99,8 +101,10 @@ jobs:
 
       - name: Package Windows portable zip
         run: |
-          mkdir -p dist/tuitube-windows-x64/examples
+          mkdir -p dist/tuitube-windows-x64/docs dist/tuitube-windows-x64/examples
           cp tuitube.exe tuitube.dll README.md LICENSE dist/tuitube-windows-x64/
+          cp examples/tuitube.json dist/tuitube-windows-x64/tuitube.json
+          cp docs/CONFIGURATION.md dist/tuitube-windows-x64/docs/CONFIGURATION.md
           cp examples/tuitube.json examples/sample_theme.json dist/tuitube-windows-x64/examples/
           ldd ./tuitube.exe ./tuitube.dll | awk '/\/ucrt64\/bin\// {print $3}' | sort -u | xargs -r cp -t dist/tuitube-windows-x64/
           (cd dist && zip -r9 tuitube-windows-x64.zip tuitube-windows-x64)
@@ -157,6 +161,35 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
 
+          cat > release-notes.md << 'EOF'
+          Lightweight, pure-C17 YouTube client for **Linux (Wayland)** and **Windows (Win32)** — available as both a standalone desktop application and a native `mpv` C plugin.
+
+          > [!WARNING]
+          > **Runtime Dependencies Required (`mpv` and `yt-dlp` are NOT bundled)**
+          > Both `tuitube-windows-x64.zip` and `tuitube-linux-x64.tar.gz` **require `mpv` (or `vlc` for standalone) and `yt-dlp` at runtime** (`ffmpeg` is recommended for merging high-resolution streams and downloads).
+          >
+          > - **Windows (`winget`):** `winget install shinchiro.mpv yt-dlp.yt-dlp Gyan.FFmpeg`
+          > - **Windows (`scoop`):** `scoop install mpv yt-dlp ffmpeg`
+          > - **Windows (local / portable):** Place `mpv.exe` & `yt-dlp.exe` beside `tuitube.exe`, or place `yt-dlp.exe` in `%APPDATA%\tuitube\` (works for both standalone and the `mpv` plugin).
+          > - **Arch Linux:** `sudo pacman -S mpv yt-dlp ffmpeg`
+          > - **Debian / Ubuntu:** `sudo apt install mpv yt-dlp ffmpeg`
+          > - **Linux (local / no `PATH` edit):** Place `yt-dlp` (`chmod +x yt-dlp`) beside `./tuitube` or in `~/.config/tuitube/yt-dlp` (works for both standalone and `tuitube.so`), or set `"ytdlp_path"` in `tuitube.json`.
+
+          ### Included Bundles
+          - `tuitube-windows-x64.zip` — Standalone `tuitube.exe`, `mpv` plugin `tuitube.dll`, bundled MSYS2 UCRT64 runtime DLLs, starter `tuitube.json`, and `docs/CONFIGURATION.md`.
+          - `tuitube-linux-x64.tar.gz` — Standalone `tuitube`, `mpv` plugin `tuitube.so`, starter `tuitube.json`, and `docs/CONFIGURATION.md`.
+          - `SHA256SUMS.txt` — SHA-256 checksums for both archives.
+
+          ### Quick Start & Customization
+          - **Standalone:** Run `./tuitube` (Linux) or `tuitube.exe` (Windows).
+          - **`mpv` Plugin:** Copy `tuitube.so` to `~/.config/mpv/scripts/` (Linux) or `tuitube.dll` (+ runtime DLLs) to `%APPDATA%\mpv\scripts\` (Windows), then press `F12` inside `mpv`.
+          - **Configuration:** Edit the included `tuitube.json` (for example `"language": "auto"` or `"en"` / `"vi"`, `"ytdlp_path"`, `"theme"`, `"download_dir"`, etc.) — see `docs/CONFIGURATION.md` for all 27 options, `yt-dlp` placement rules, custom themes, and keybindings.
+
+          > **Windows Security Note (Unsigned Binaries):** Release executables and DLLs are unsigned open-source builds.
+          > - **Microsoft Defender SmartScreen:** Click *More info -> Run anyway*, or run `Unblock-File .\tuitube-windows-x64.zip` before extracting.
+          > - **Windows 11 Smart App Control:** If SAC is **On**, unsigned binaries are blocked by Code Integrity unless SAC is turned **Off** in *Windows Security -> App & browser control -> Smart App Control settings*.
+          EOF
+
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" \
               release-assets/tuitube-windows-x64.zip \
@@ -170,6 +203,7 @@ jobs:
               release-assets/SHA256SUMS.txt \
               --target "$COMMIT_SHA" \
               --title "TuiTube $TAG" \
+              --notes-file release-notes.md \
               --generate-notes \
               $PRERELEASE_FLAG
           fi
