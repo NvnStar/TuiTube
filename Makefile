@@ -72,19 +72,21 @@ lint:
 
 build/win-release/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(WIN_CFLAGS_RELEASE) -c -o $@ $<
+	$(CC) $(WIN_CFLAGS_RELEASE) -MMD -MP -c -o $@ $<
 
 build/win-debug/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(WIN_CFLAGS_DEBUG) -c -o $@ $<
+	$(CC) $(WIN_CFLAGS_DEBUG) -MMD -MP -c -o $@ $<
 
 build/win-plugin/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(WIN_PLUGIN_CFLAGS) -c -o $@ $<
+	$(CC) $(WIN_PLUGIN_CFLAGS) -MMD -MP -c -o $@ $<
 
 build/win-test/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(WIN_CFLAGS_DEBUG) -c -o $@ $<
+	$(CC) $(WIN_CFLAGS_DEBUG) -MMD -MP -c -o $@ $<
+
+-include $(REL_OBJS_WIN:.o=.d) $(DBG_OBJS_WIN:.o=.d) $(PLG_OBJS_WIN:.o=.d) $(TST_OBJS_WIN:.o=.d)
 
 else
 
@@ -189,19 +191,21 @@ $(GEN_DIR)/fractional-scale-v1-client-protocol.c: $(FRAC_SCALE_XML)
 
 build/release/%.o: %.c $(GEN_HDRS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS_RELEASE) -c -o $@ $<
+	$(CC) $(CFLAGS_RELEASE) -MMD -MP -c -o $@ $<
 
 build/debug/%.o: %.c $(GEN_HDRS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS_DEBUG) -c -o $@ $<
+	$(CC) $(CFLAGS_DEBUG) -MMD -MP -c -o $@ $<
 
 build/plugin/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(PLUGIN_CFLAGS) -c -o $@ $<
+	$(CC) $(PLUGIN_CFLAGS) -MMD -MP -c -o $@ $<
 
 build/test/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS_DEBUG) -c -o $@ $<
+	$(CC) $(CFLAGS_DEBUG) -MMD -MP -c -o $@ $<
+
+-include $(REL_OBJS:.o=.d) $(DBG_OBJS:.o=.d) $(PLG_OBJS:.o=.d) $(TST_OBJS:.o=.d)
 
 endif
 
