@@ -7,6 +7,7 @@
 #include "util.h"
 
 #include <assert.h>
+#include <math.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -869,6 +870,258 @@ static void test_config_members_only_and_download(void) {
     assert(!player_parse_ytdlp_progress_line("other line", &p));
 }
 
+static void test_wayland_shm_sizing_and_scaling(void) {
+    int pw = 0, ph = 0;
+
+    /* 4K @ 125% (scale_120 = 150) -> exact 3840 x 2160 */
+    assert(tt_shm_target_dims(3072, 1728, 150u, 2, &pw, &ph));
+    assert(pw == 3840 && ph == 2160);
+
+    /* 1440p @ 125% (scale_120 = 150) -> exact 2560 x 1440 */
+    assert(tt_shm_target_dims(2048, 1152, 150u, 2, &pw, &ph));
+    assert(pw == 2560 && ph == 1440);
+
+    /* 1440p @ 150% (scale_120 = 180) and 175% (scale_120 = 210) */
+    assert(tt_shm_target_dims(1707, 960, 180u, 2, &pw, &ph));
+    assert(pw == 2561 && ph == 1440);
+    assert(tt_shm_target_dims(1463, 823, 210u, 2, &pw, &ph));
+    assert(pw == 2560 && ph == 1440);
+
+    /* Halfway-away-from-zero rounding: 102*1.25 = 127.5 -> 128, 50*1.25 = 62.5 -> 63 */
+    assert(tt_shm_target_dims(102, 50, 150u, 1, &pw, &ph));
+    assert(pw == 128 && ph == 63);
+
+    /* Scale_120 clamping: [60, 480] */
+    assert(tt_shm_target_dims(100, 100, 10u, 2, &pw, &ph));
+    assert(pw == 50 && ph == 50);
+    assert(tt_shm_target_dims(100, 100, 999u, 1, &pw, &ph));
+    assert(pw == 400 && ph == 400);
+
+    /* Integer fallback (scale_120 == 0) with int_scale clamped to [1, 4] */
+    assert(tt_shm_target_dims(1024, 640, 0u, 0, &pw, &ph));
+    assert(pw == 1024 && ph == 640);
+    assert(tt_shm_target_dims(1024, 640, 0u, 2, &pw, &ph));
+    assert(pw == 2048 && ph == 1280);
+    assert(tt_shm_target_dims(500, 300, 0u, 8, &pw, &ph));
+    assert(pw == 2000 && ph == 1200);
+
+    /* Invalid & INT32_MAX overflow bounds */
+    assert(!tt_shm_target_dims(0, 640, 120u, 1, &pw, &ph));
+    assert(!tt_shm_target_dims(640, -1, 120u, 1, &pw, &ph));
+    assert(!tt_shm_target_dims(640, 480, 120u, 1, NULL, &ph));
+    assert(!tt_shm_target_dims(640, 480, 120u, 1, &pw, NULL));
+    assert(!tt_shm_target_dims(32768, 100, 0u, 1, &pw, &ph));
+    assert(!tt_shm_target_dims(25000, 25000, 0u, 1, &pw, &ph));
+
+    /* 256 KiB alignment without power-of-two bloat */
+    assert(tt_shm_pool_capacity(0) == 0);
+    assert(tt_shm_pool_capacity((size_t)INT32_MAX + 1u) == 0);
+    assert(tt_shm_pool_capacity(1) == TT_SHM_ALIGN_BYTES);
+    assert(tt_shm_pool_capacity(TT_SHM_ALIGN_BYTES) == TT_SHM_ALIGN_BYTES);
+    assert(tt_shm_pool_capacity(TT_SHM_ALIGN_BYTES + 1u) == 2u * TT_SHM_ALIGN_BYTES);
+    size_t uhd_bytes = 3840u * 2160u * 4u; /* 33,177,600 bytes */
+    size_t uhd_cap = tt_shm_pool_capacity(uhd_bytes);
+    assert(uhd_cap >= uhd_bytes);
+    assert(uhd_cap % TT_SHM_ALIGN_BYTES == 0);
+    assert(uhd_cap - uhd_bytes < TT_SHM_ALIGN_BYTES);
+    assert(tt_shm_pool_capacity((size_t)INT32_MAX) == (size_t)INT32_MAX);
+
+    /* 512 KiB shrink threshold */
+    assert(!tt_shm_should_shrink(0, 1024u * 1024u));
+    assert(!tt_shm_should_shrink(1024u * 1024u, 1024u * 1024u));
+    assert(!tt_shm_should_shrink(512u * 1024u + 1u, 1024u * 1024u));
+    assert(tt_shm_should_shrink(512u * 1024u, 1024u * 1024u));
+    assert(tt_shm_should_shrink(1024u * 640u * 4u, uhd_cap));
+}
+
+static void test_mpv_osd_dims_and_script_opts(void) {
+    int pw = 0, ph = 0, lw = 0, lh = 0;
+
+    /* 1080p @ 1.0x */
+    assert(tt_mpv_osd_dims(1920, 1080, 1.0, &pw, &ph, &lw, &lh));
+    assert(pw == 1920 && ph == 1080 && lw == 1920 && lh == 1080);
+
+    /* 4K @ 1.5x -> logical 2560x1440 */
+    assert(tt_mpv_osd_dims(3840, 2160, 1.5, &pw, &ph, &lw, &lh));
+    assert(pw == 3840 && ph == 2160 && lw == 2560 && lh == 1440);
+
+    /* Clamping [0.5, 4.0] and NaN/Inf/non-positive fallback to 1.0 */
+    assert(tt_mpv_osd_dims(1000, 500, 0.1, &pw, &ph, &lw, &lh));
+    assert(lw == 2000 && lh == 1000);
+    assert(tt_mpv_osd_dims(1000, 500, 10.0, &pw, &ph, &lw, &lh));
+    assert(lw == 250 && lh == 125);
+    assert(tt_mpv_osd_dims(1000, 500, -2.0, &pw, &ph, &lw, &lh));
+    assert(lw == 1000 && lh == 500);
+    assert(tt_mpv_osd_dims(1000, 500, NAN, &pw, &ph, &lw, &lh));
+    assert(lw == 1000 && lh == 500);
+    assert(tt_mpv_osd_dims(1000, 500, INFINITY, &pw, &ph, &lw, &lh));
+    assert(lw == 1000 && lh == 500);
+
+    /* Bounds rejections */
+    assert(!tt_mpv_osd_dims(0, 720, 1.0, &pw, &ph, &lw, &lh));
+    assert(!tt_mpv_osd_dims(1280, -1, 1.0, &pw, &ph, &lw, &lh));
+    assert(!tt_mpv_osd_dims(32768, 100, 1.0, &pw, &ph, &lw, &lh));
+    assert(!tt_mpv_osd_dims(25000, 25000, 1.0, &pw, &ph, &lw, &lh));
+    assert(!tt_mpv_osd_dims(1280, 720, 1.0, NULL, &ph, &lw, &lh));
+
+    /* script-opts parsing */
+    char dir[PATH_MAX];
+    assert(!tt_mpv_parse_script_opt_config_dir(NULL, dir, sizeof(dir)));
+    assert(!tt_mpv_parse_script_opt_config_dir("uosc-color=fg,other=1", dir, sizeof(dir)));
+    assert(tt_mpv_parse_script_opt_config_dir("uosc-color=1,tuitube-config_dir=/tmp/tt_cfg,other=2", dir, sizeof(dir)));
+    assert(strcmp(dir, "/tmp/tt_cfg") == 0);
+
+    /* Length-prefixed %<len>% value with embedded comma */
+    assert(tt_mpv_parse_script_opt_config_dir("foo=bar,tuitube-config_dir=%12%/a,b/tuitube,baz=9", dir, sizeof(dir)));
+    assert(strcmp(dir, "/a,b/tuitube") == 0);
+
+    /* Underscore key & ~ expansion */
+    assert(tt_mpv_parse_script_opt_config_dir("tuitube_config_dir=~/my_tuitube", dir, sizeof(dir)));
+    assert(strstr(dir, "/my_tuitube") != NULL && dir[0] == '/');
+
+    /* Buffer too small */
+    char tiny[8];
+    assert(!tt_mpv_parse_script_opt_config_dir("tuitube-config_dir=/very/long/path", tiny, sizeof(tiny)));
+    assert(tiny[0] == '\0');
+}
+
+static void test_mpv_key_mouse_and_unicode_parsing(void) {
+    TtMpvKeyEvent ev;
+
+    /* Invalid states / args */
+    assert(!tt_mpv_parse_key_event(NULL, "ESC", "", NULL, &ev));
+    assert(!tt_mpv_parse_key_event("x-m", "ESC", "", NULL, &ev));
+    assert(!tt_mpv_parse_key_event("d-m", "", "", NULL, &ev));
+
+    /* Named key & canceled state */
+    assert(tt_mpv_parse_key_event("d-m", "ESC", "", NULL, &ev));
+    assert(ev.kind == TT_MPV_INPUT_KEY && ev.pressed && !ev.repeat && ev.keysym == XKB_KEY_Escape && ev.mods == 0);
+
+    assert(tt_mpv_parse_key_event("d-c", "ESC", "", NULL, &ev));
+    assert(ev.kind == TT_MPV_INPUT_KEY && !ev.pressed);
+
+    /* Modifiers & shifted uppercase letter */
+    assert(tt_mpv_parse_key_event("d-m", "Ctrl+Alt+f", "", NULL, &ev));
+    assert(ev.kind == TT_MPV_INPUT_KEY && ev.pressed);
+    assert(ev.mods == (TT_MOD_CTRL | TT_MOD_ALT) && ev.keysym == 'f' && ev.utf8[0] == '\0');
+
+    assert(tt_mpv_parse_key_event("r-m", "J", "J", NULL, &ev));
+    assert(ev.kind == TT_MPV_INPUT_KEY && ev.pressed && ev.repeat);
+    assert((ev.mods & TT_MOD_SHIFT) != 0 && ev.keysym == 'J' && strcmp(ev.utf8, "J") == 0);
+
+    assert(tt_mpv_parse_key_event("d-m", "Meta+Left", "", NULL, &ev));
+    assert(ev.mods == TT_MOD_SUPER && ev.keysym == XKB_KEY_Left);
+
+    assert(tt_mpv_parse_key_event("d-m", "SHARP", "", NULL, &ev));
+    assert(ev.keysym == '#' && strcmp(ev.utf8, "#") == 0);
+
+    assert(tt_mpv_parse_key_event("d-m", "KP_DIVIDE", "", NULL, &ev));
+    assert(ev.keysym == XKB_KEY_slash && strcmp(ev.utf8, "/") == 0);
+
+    /* Mouse buttons & press pulse */
+    assert(tt_mpv_parse_key_event("p-m", "MBTN_LEFT", "", NULL, &ev));
+    assert(ev.kind == TT_MPV_INPUT_BUTTON && ev.mouse_btn == 1 && ev.pressed && ev.is_press_pulse && !ev.double_click);
+
+    assert(tt_mpv_parse_key_event("d-m", "MBTN_LEFT_DBL", "", NULL, &ev));
+    assert(ev.kind == TT_MPV_INPUT_BUTTON && ev.mouse_btn == 1 && ev.double_click);
+    assert(!tt_mpv_parse_key_event("u-m", "MBTN_LEFT_DBL", "", NULL, &ev));
+
+    assert(tt_mpv_parse_key_event("d-m", "MBTN_BACK", "", NULL, &ev));
+    assert(ev.kind == TT_MPV_INPUT_BUTTON && ev.mouse_btn == 4);
+
+    /* Wheel direction & scale */
+    assert(tt_mpv_parse_key_event("d-m", "WHEEL_DOWN", "", "2.0", &ev));
+    assert(ev.kind == TT_MPV_INPUT_WHEEL && ev.wheel_dy > 0.0 && ev.wheel_dy == 30.0);
+    assert(tt_mpv_parse_key_event("d-m", "WHEEL_UP", "", "1.0", &ev));
+    assert(ev.kind == TT_MPV_INPUT_WHEEL && ev.wheel_dy < 0.0 && ev.wheel_dy == -15.0);
+    assert(!tt_mpv_parse_key_event("u-m", "WHEEL_DOWN", "", "1.0", &ev));
+
+    /* ANY_UNICODE: single ASCII shortcut vs multi-byte Vietnamese UTF-8 */
+    assert(tt_mpv_parse_key_event("d-m", "ANY_UNICODE", "?", NULL, &ev));
+    assert(ev.kind == TT_MPV_INPUT_KEY && ev.keysym == XKB_KEY_question && strcmp(ev.utf8, "?") == 0);
+
+    assert(tt_mpv_parse_key_event("d-m", "ANY_UNICODE", "\xE1\xBA\xBF", NULL, &ev));
+    assert(ev.kind == TT_MPV_INPUT_KEY && ev.keysym == XKB_KEY_NoSymbol);
+    assert(strcmp(ev.utf8, "\xE1\xBA\xBF") == 0);
+
+    assert(tt_mpv_parse_key_event("d-m", "ANY_UNICODE", "Ti\xE1\xBA\xBFng Vi\xE1\xBB\x87t", NULL, &ev));
+    assert(ev.kind == TT_MPV_INPUT_KEY && ev.keysym == XKB_KEY_NoSymbol);
+    assert(strcmp(ev.utf8, "Ti\xE1\xBA\xBFng Vi\xE1\xBB\x87t") == 0);
+}
+
+static void test_config_explicit_format_and_slang_flags(void) {
+    char tmpdir[] = "/tmp/tuitube_test_mpvcfg_XXXXXX";
+    assert(mkdtemp(tmpdir) != NULL);
+
+    char cfg_file[256];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+
+    /* Absent -> has_video_format == false, has_sub_language == false */
+    const char *empty_cfg = "{ \"theme\": \"dark\" }\n";
+    assert(tt_write_file_atomic(cfg_file, empty_cfg, strlen(empty_cfg)));
+    TuiTubeConfig cfg;
+    assert(config_load(&cfg, tmpdir));
+    assert(!cfg.has_video_format);
+    assert(!cfg.has_sub_language);
+    config_free(&cfg);
+
+    /* Empty strings -> still false */
+    const char *blank_cfg = "{ \"video_format\": \"\", \"sub_language\": \"\" }\n";
+    assert(tt_write_file_atomic(cfg_file, blank_cfg, strlen(blank_cfg)));
+    assert(config_load(&cfg, tmpdir));
+    assert(!cfg.has_video_format);
+    assert(!cfg.has_sub_language);
+    config_free(&cfg);
+
+    /* Explicit non-empty strings -> true */
+    const char *set_cfg = "{ \"video_format\": \"720p\", \"sub_language\": \"ja,en\" }\n";
+    assert(tt_write_file_atomic(cfg_file, set_cfg, strlen(set_cfg)));
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.has_video_format);
+    assert(cfg.has_sub_language);
+    assert(strcmp(cfg.video_format, "720p") == 0);
+    assert(strcmp(cfg.sub_language, "ja,en") == 0);
+    config_free(&cfg);
+
+    unlink(cfg_file);
+    rmdir(tmpdir);
+}
+
+static void test_thumb_cache_flush_ram_and_drop_jobs(void) {
+    char tmpdir[] = "/tmp/tuitube_test_tc_XXXXXX";
+    assert(mkdtemp(tmpdir) != NULL);
+
+    ThumbCache *tc = thumb_cache_create(tmpdir);
+    assert(tc != NULL);
+
+    const uint8_t dummy[] = {1, 2, 3, 4};
+    assert(thumb_disk_save(tmpdir, "k1", dummy, sizeof(dummy)));
+
+    cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 16, 16);
+    thumb_cache_put(tc, "k1", s);
+    cairo_surface_destroy(s);
+    assert(thumb_cache_get(tc, "k1") != NULL);
+
+    /* Flush RAM only: in-memory surface evicted, disk cache preserved */
+    thumb_cache_flush_ram(tc);
+    assert(thumb_cache_get(tc, "k1") == NULL);
+
+    size_t dlen = 0;
+    uint8_t *disk = thumb_disk_load(tmpdir, "k1", &dlen);
+    assert(disk != NULL && dlen == sizeof(dummy));
+    free(disk);
+
+    thumb_cache_clear(tc);
+    thumb_cache_destroy(tc);
+    rmdir(tmpdir);
+
+    /* Drop queued thumbnail jobs cleanly */
+    HttpPool *pool = http_pool_create(1);
+    assert(pool != NULL);
+    http_pool_drop_thumbnails(pool);
+    http_pool_destroy(pool);
+}
+
 int main(void) {
     RUN_TEST(test_util_utf8_and_entities);
     RUN_TEST(test_search_params_encoding);
@@ -885,6 +1138,11 @@ int main(void) {
     RUN_TEST(test_live_shelf_lockup_engagement_and_members_only);
     RUN_TEST(test_http_pool_detail_gen_independence);
     RUN_TEST(test_config_members_only_and_download);
+    RUN_TEST(test_wayland_shm_sizing_and_scaling);
+    RUN_TEST(test_mpv_osd_dims_and_script_opts);
+    RUN_TEST(test_mpv_key_mouse_and_unicode_parsing);
+    RUN_TEST(test_config_explicit_format_and_slang_flags);
+    RUN_TEST(test_thumb_cache_flush_ram_and_drop_jobs);
 
     printf("\nAll %d tests passed!\n", g_tests_run);
     return 0;

@@ -1,32 +1,31 @@
 # TuiTube
 
-A lightweight, zero-bloat native Wayland YouTube client written in pure C17.
+A lightweight, pure-C17 YouTube client that builds as both a **standalone native Wayland app (`./tuitube`)** and a **native `mpv` C plugin (`./tuitube.so`)**.
 
-No Electron, no GTK, no Qt — just `wayland-client`, `wl_shm` + Cairo/PangoCairo, `libcurl`, `yyjson`, `libjpeg`/`libpng`, and external playback via `mpv` (powered by `yt-dlp`).
+No Electron, no GTK, no Qt — just Cairo/PangoCairo, `libcurl`, `yyjson`, `libjpeg`/`libpng`, and playback via `mpv` + `yt-dlp`.
+
+---
 
 ## Features
 
-- **Native Wayland GUI:** Double-buffered `wl_shm` rendering with `xdg-shell`, HiDPI scaling, server-side decorations (`xdg-decoration`) with automatic slim CSD fallback, `xkbcommon` keyboard + repeat, and Wayland clipboard copy/paste.
-- **YouTube Search & Browsing:** Direct InnerTube v1 (`search`, `browse`, `next`, `navigation/resolve_url`) with sort/type/live filters, Channel `Videos` / `Live` tabs, pagination (`Next Page` + optional `infinite_scroll`), direct URL / `@handle` paste resolution (including `/streams` and `/live`), and an automatic `yt-dlp --flat-playlist` fallback for search.
-- **Video Downloading & Members-Only Filtering:** Non-blocking background `yt-dlp` video downloads via the Detail pane `Download` button, right-click `Download Video`, or `Ctrl+S` (configurable `"download_dir"`), plus `"hide_members_only"` in `tuitube.json` to filter channel-membership-only videos (note: YouTube's Atom RSS feeds lack membership metadata, so pair `"hide_members_only": true` with `"feed_use_rss": false` to filter Subscription Feed items as well).
-- **Subscriptions, Feed & History:** Channel/playlist favorites (`favlist.json`), chronological subscription Feed via YouTube Atom RSS (with InnerTube fallback, configurable `max_feed_videos_per_channel` and `max_feed_age`), and deduplicated watch history (`history.json`) with watched-video dimming.
-- **Fast Thumbnail Pipeline:** Priority 4-thread `libcurl` worker pool, `libjpeg`/`libpng` decoding, disk cache + 256-entry LRU Cairo surface cache.
-- **Customizable & Portable:** `ikatube`-compatible JSON config (`tuitube.json`), custom TTF/OTF fonts via Fontconfig, custom mascot image, built-in WCAG AA themes (`dark` default, `light`, `yuuka`) + custom theme JSON (supports comments & trailing commas), custom keybindings, and portable mode (`tuitube_portable_mode.txt`).
+- **Dual Native Targets:**
+  - **Standalone Wayland (`./tuitube`):** `wl_shm` rendering with `xdg-shell`, fractional HiDPI scaling (`wp_fractional_scale_v1` / `wp_viewporter`), SSD/CSD negotiation, `text-input-v3` IME, and Wayland clipboard.
+  - **`mpv` C Plugin (`./tuitube.so`):** Single-file OSD overlay (`overlay-add`) playing videos directly in the host `mpv` instance (respects your `mpv.conf` by default, zero `libmpv-dev` build dependency, zero Wayland linkage, flushes decoded thumbnail/framebuffer RAM when hidden).
+- **YouTube Search & Browsing:** InnerTube v1 (`search`, `browse`, `next`, `navigation/resolve_url`) with sort/type/live filters, Channel **Videos** / **Live** tabs, pagination (`Next Page` + optional `infinite_scroll`), direct URL / `@handle` resolution (including `/streams` and `/live`), and `yt-dlp --flat-playlist` fallback.
+- **Subscriptions, Feed & History:** Channel/playlist favorites (`favlist.json`), chronological Subscription Feed via Atom RSS (or InnerTube), and watch history (`history.json`) with watched-video dimming.
+- **Background Downloads & Filtering:** Non-blocking `yt-dlp` video downloads (`Ctrl+S` or detail/context menu) and `"hide_members_only"` filtering (pair with `"feed_use_rss": false` to filter Subscription Feed items as well).
+- **Fast Thumbnail Pipeline:** 4-thread priority `libcurl` worker pool, `libjpeg`/`libpng` decoding, disk cache (`~/.cache/tuitube/thumbs`), and LRU Cairo surface cache.
+- **Customizable & Portable:** JSON config (`tuitube.json`), custom TTF/OTF fonts, custom mascot image, built-in WCAG AA themes (`dark`, `light`, `yuuka`) + custom theme JSON, custom keybindings, and portable mode (`tuitube_portable_mode.txt`).
+
+---
 
 ## Dependencies
 
-### Build-time
-- C17 compiler (`gcc` or `clang`) and `pkg-config`
-- `wayland-scanner` and `wayland-protocols`
-- Development headers for: `wayland-client`, `wayland-cursor`, `xkbcommon`, `cairo`, `pangocairo`, `fontconfig`, `libcurl`, `yyjson`, `libjpeg`, `libpng`
-
-### Runtime
-- A Wayland compositor
-- `mpv` (or `vlc`) and `yt-dlp` on `$PATH`
-- Optional: `wl-copy` (`wl-clipboard`) so copied URLs/titles persist after closing TuiTube
+**Runtime:** `mpv` (or `vlc` for standalone), `yt-dlp`, and optionally `wl-copy` (`wl-clipboard`).  
+**Build-time:** C17 compiler (`gcc`/`clang`), `pkg-config`, and dev headers for `xkbcommon`, `cairo`, `pangocairo`, `fontconfig`, `libcurl`, `yyjson`, `libjpeg`, `libpng` (plus `wayland-scanner`, `wayland-protocols`, `wayland-client`, `wayland-cursor` for standalone `./tuitube`; `libmpv-dev` is **not** required for `./tuitube.so`).
 
 <details>
-<summary>Install dependencies on Arch Linux / Debian / Ubuntu</summary>
+<summary>Install commands (Arch Linux / Debian / Ubuntu)</summary>
 
 **Arch Linux:**
 ```bash
@@ -44,78 +43,106 @@ sudo apt install build-essential pkg-config libwayland-bin wayland-protocols \
 
 </details>
 
-## Building & Running
+---
+
+## Build
 
 ```bash
-# Release binary (./tuitube)
-make release
-
-# Debug binary with ASan/UBSan (./tuitube-debug)
-make debug
-
-# Strict compiler lint (-Wall -Wextra -Wpedantic -Werror)
-make lint
-
-# Run offline unit tests under ASan/UBSan
-make test
-
-# Run
-./tuitube
-# Or override config directory:
-./tuitube --config-dir ~/.config/tuitube
+make release   # Build both ./tuitube and ./tuitube.so
+make plugin    # Build only ./tuitube.so (no Wayland or libmpv-dev needed)
+make debug     # Build ./tuitube-debug with ASan + UBSan
+make test      # Run offline ASan/UBSan unit tests + plugin symbol/linkage checks
+make lint      # Strict -Wall -Wextra -Wpedantic -Werror syntax check
 ```
 
-### Portable Mode
-Place an empty file named `tuitube_portable_mode.txt` in the same directory as the `tuitube` executable to store `tuitube.json`, `favlist.json`, `history.json`, and `cache/thumbs/` alongside the binary.
+---
+
+## Usage
+
+### Standalone Wayland (`./tuitube`)
+
+```bash
+./tuitube
+./tuitube --config-dir ~/.config/tuitube   # Override config directory
+```
+
+### Native `mpv` C Plugin (`./tuitube.so`)
+
+```bash
+# Install for automatic loading in mpv
+mkdir -p ~/.config/mpv/scripts
+cp ./tuitube.so ~/.config/mpv/scripts/tuitube.so
+mpv --idle
+
+# Or load directly without installing
+mpv --idle --script=./tuitube.so
+```
+
+- **Toggle Overlay:** Press `F12` by default, or bind your own key in `~/.config/mpv/input.conf`:
+  ```conf
+  Tab script-message tuitube-toggle
+  ```
+  (`script-binding tuitube/toggle`, `script-message tuitube-open`, and `script-message tuitube-close` are also supported.)
+- **Playback Behavior:** Videos play directly in the host `mpv` window via `loadfile`, respecting your `mpv.conf` unless `"video_format"` or `"sub_language"` are explicitly set in `tuitube.json`.
+- **Override Config Dir:** Pass `--script-opts=tuitube-config_dir=/path/to/dir`.
+
+### Shared State & Portable Mode
+
+Both targets share `~/.config/tuitube/{tuitube.json,favlist.json,history.json}` and `~/.cache/tuitube/thumbs`.  
+To run in **portable mode**, place an empty `tuitube_portable_mode.txt` beside `./tuitube` or `./tuitube.so`.
+
+---
 
 ## Configuration & Keybindings
 
-See [examples/tuitube.json](examples/tuitube.json) and [examples/sample_theme.json](examples/sample_theme.json) for starter configuration and custom theme syntax.
+Starter files: [examples/tuitube.json](examples/tuitube.json) · [examples/sample_theme.json](examples/sample_theme.json)
 
-Default keybindings (when search input is not focused, or with modifiers):
-- `Ctrl+Q` — Quit
-- `Ctrl+L` or `/` — Focus search input (`Escape` moves focus to list, `Ctrl+U` / `Ctrl+BackSpace` clear/delete word)
-- `Tab` / `Shift+Tab` — Cycle focus across Search, List, and Detail panes
-- `Enter` — Play selected video / open selected channel or playlist
-- `Ctrl+S` — Download selected video (`yt-dlp` into `download_dir`, default `$XDG_DOWNLOAD_DIR` / `~/Downloads`)
-- `Alt+Left` / `BackSpace` / Mouse Back — Navigate back in history
-- `Up` / `Down` / `j` / `k` / `PageUp` / `PageDown` / `Home` / `End` — Navigate list (or scroll description when Detail pane is focused)
-- `Shift+Up` / `Shift+Down` (`K` / `J`) — Scroll description while in list
-- `Right-Click` — Open item context menu (Play, Download Video, Channel, Recommended, Favorite, Copy URL/Title/Description)
-- `F1` or `?` — Toggle keyboard & mouse shortcut overlay
-- `Ctrl+F` — Show Favorites
-- `Ctrl+R` — Show Subscription Feed
-- `Ctrl+H` — Show Watch History
-- `Ctrl+D` — Add/remove selected item/channel to Favorites
-- `Ctrl+Y` — Copy video/item URL
-- `Ctrl+N` — Load next page
-- `Ctrl+]` / `Ctrl+[` — Widen / narrow left list pane
-
----
-
-## Credits & Acknowledgments
-
-If you enjoy TuiTube, please consider thanking or supporting the upstream projects and authors that made it possible:
-
-- **[ikatube](https://chino-chan.gitlab.io/programs.html#s2)** by **chino-chan** *(original UX inspiration)* — TuiTube's two-pane layout, portable mode convention (`ikatk` toolkit), `tuitube.json` options, 8-value RGBA theme schema, and keybinding design are inspired by `ikatube` (`ikatube2-wl`) and its configuration reference. Thank you to `chino-chan` for designing such a clean, no-nonsense YouTube desktop workflow!
-- **[mpv](https://mpv.io/)** ([GitHub](https://github.com/mpv-player/mpv)) & **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — Do the heavy lifting of stream extraction, adaptive muxing, downloads, and hardware-accelerated video playback. Please star `yt-dlp` and support the `mpv` developers!
-- **Core C Libraries:** [Wayland](https://wayland.freedesktop.org/), [libxkbcommon](https://xkbcommon.org/), [Cairo](https://www.cairographics.org/), [Pango](https://pango.gnome.org/), [Fontconfig](https://www.freedesktop.org/wiki/Software/fontconfig/), [libcurl](https://curl.se/libcurl/), [yyjson](https://github.com/ibireme/yyjson), [libjpeg-turbo](https://libjpeg-turbo.org/), and [libpng](https://www.libpng.org/pub/png/libpng.html).
-
-*How to show appreciation:* Star the open-source upstream repositories (`yt-dlp/yt-dlp`, `mpv-player/mpv`, `ibireme/yyjson`), check out `chino-chan`'s programs at [chino-chan.gitlab.io](https://chino-chan.gitlab.io/programs.html#s2), report reproducible issues with logs/fixtures, and keep `yt-dlp` updated when YouTube changes player signatures.
+| Key / Input | Action |
+| :--- | :--- |
+| `F12` *(plugin)* | Toggle TuiTube overlay inside `mpv` |
+| `Ctrl+Q` | Quit (`./tuitube`) / Hide overlay (`tuitube.so`) |
+| `Ctrl+L` or `/` | Focus search box (`Esc` returns to list, `Ctrl+U`/`Ctrl+BackSpace` edit) |
+| `Tab` / `Shift+Tab` | Cycle focus across Search, List, and Detail panes |
+| `Enter` / Double-Click | Play selected video or open channel/playlist |
+| `Up`/`Down`, `j`/`k`, `PgUp`/`PgDn`, `Home`/`End` | Navigate list (or scroll description in Detail pane) |
+| `Shift+Up` / `Shift+Down` (`K` / `J`) | Scroll description while in list |
+| `Alt+Left` / `BackSpace` / Mouse Back | Navigate back |
+| `Right-Click` | Context menu (Play, Download, Channel, Recommended, Favorite, Copy) |
+| `Ctrl+S` | Download selected video via `yt-dlp` |
+| `Ctrl+F` / `Ctrl+R` / `Ctrl+H` | Show Favorites / Subscription Feed / Watch History |
+| `Ctrl+D` | Add/remove channel or playlist in Favorites |
+| `Ctrl+Y` | Copy item URL |
+| `Ctrl+N` | Load next page |
+| `Ctrl+]` / `Ctrl+[` | Widen / narrow list pane |
+| `F1` or `?` | Toggle shortcut help overlay |
 
 ---
 
-## Upstream Tracking & Where to Fix Breakage
+## Documentation & Maintenance
 
-YouTube and external media tools evolve frequently. Use this map to jump straight to the right file when something breaks upstream (see [docs/UPSTREAM_MAINTENANCE.md](docs/UPSTREAM_MAINTENANCE.md) for detailed instructions):
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Module map and concurrency model.
+- [docs/UPSTREAM_MAINTENANCE.md](docs/UPSTREAM_MAINTENANCE.md) — Guide for fixing YouTube / `yt-dlp` / `mpv` upstream changes.
 
-| Upstream Component | Symptom | Where to Fix in TuiTube |
+<details>
+<summary>Quick map: where to fix upstream breakage</summary>
+
+| Upstream Component | Symptom | Where to Fix |
 | :--- | :--- | :--- |
-| **YouTube InnerTube client version / context** | Search, Browse, or Next returns HTTP 400/403 | `INNERTUBE_CLIENT_VER` and `add_innertube_context()` in [src/innertube.c](src/innertube.c) |
-| **YouTube Search / Browse / Next JSON schema** | Missing titles, durations, descriptions, or 0 results | `parse_video_renderer`, `parse_lockup_view_model`, `innertube_parse_*_json` in [src/innertube.c](src/innertube.c) |
-| **YouTube Search protobuf filter params** | Sort/Type/Live filters stop filtering | `innertube_encode_search_params()` in [src/innertube.c](src/innertube.c) |
-| **YouTube Atom RSS feeds** | Subscription Feed stops parsing entries or dates | `innertube_parse_rss_xml()` and `innertube_fetch_feed()` in [src/innertube.c](src/innertube.c) (or set `"feed_use_rss": false` in `tuitube.json`) |
-| **YouTube thumbnail URLs / WebP changes** | Thumbnails fail to load or show placeholders | `image_resolve_thumb_url()` in [src/image.c](src/image.c) |
-| **`yt-dlp` format selector or search fallback** | Playback fails on format selection or fallback search breaks | `player_map_video_format()` in [src/player.c](src/player.c) and `search_ytdlp_fallback()` in [src/innertube.c](src/innertube.c) |
-| **`mpv` / `vlc` CLI options** | Player fails to launch with unknown flag error | `player_launch()` in [src/player.c](src/player.c) |
-| **Wayland compositor / protocol updates** | Decorations, clipboard, or key repeat issues | `src/wayland.c` and protocol XML paths in [Makefile](Makefile) |
+| **InnerTube client version / context** | Search, Browse, or Next returns HTTP 400/403 | `INNERTUBE_CLIENT_VER` / `add_innertube_context()` in [src/innertube.c](src/innertube.c) |
+| **YouTube JSON schema** | Missing metadata or 0 results | `parse_video_renderer`, `parse_lockup_view_model`, `innertube_parse_*_json` in [src/innertube.c](src/innertube.c) |
+| **Search filter protobuf params** | Sort/Type/Live filters stop working | `innertube_encode_search_params()` in [src/innertube.c](src/innertube.c) |
+| **Atom RSS feeds** | Subscription Feed stops parsing entries/dates | `innertube_parse_rss_xml()` in [src/innertube.c](src/innertube.c) (or set `"feed_use_rss": false`) |
+| **Thumbnail URLs** | Thumbnails fail to load | `image_resolve_thumb_url()` in [src/image.c](src/image.c) |
+| **`yt-dlp` format / search fallback** | Format selection or fallback search breaks | `player_map_video_format()` in [src/player.c](src/player.c), `search_ytdlp_fallback()` in [src/innertube.c](src/innertube.c) |
+| **`mpv` / `vlc` CLI or C plugin ABI** | Playback or overlay issues | `player_launch()` in [src/player.c](src/player.c), [src/mpv_plugin.c](src/mpv_plugin.c), [src/mpv_cplugin.h](src/mpv_cplugin.h) |
+| **Wayland protocols** | Scaling, decorations, IME, or clipboard issues | [src/wayland.c](src/wayland.c) and protocol paths in [Makefile](Makefile) |
+
+</details>
+
+---
+
+## Credits
+
+- **[ikatube](https://chino-chan.gitlab.io/programs.html#s2)** by **chino-chan** — UX, layout, theme, and config inspiration.
+- **[mpv](https://mpv.io/)** & **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — Playback, stream extraction, and downloads.
+- **C Libraries:** Wayland, libxkbcommon, Cairo, Pango, Fontconfig, libcurl, yyjson, libjpeg-turbo, and libpng.

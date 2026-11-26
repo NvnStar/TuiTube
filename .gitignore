@@ -2,6 +2,7 @@
 build/
 tuitube
 tuitube-debug
+tuitube.so
 *.o
 *.tmp.*
 

@@ -31,6 +31,7 @@ ThumbCache *thumb_cache_create(const char *cache_dir);
 void thumb_cache_destroy(ThumbCache *tc);
 cairo_surface_t *thumb_cache_get(ThumbCache *tc, const char *key);
 void thumb_cache_put(ThumbCache *tc, const char *key, cairo_surface_t *surf);
+void thumb_cache_flush_ram(ThumbCache *tc);
 void thumb_cache_clear(ThumbCache *tc);
 
 uint8_t *thumb_disk_load(const char *cache_dir, const char *key, size_t *out_len);

@@ -581,6 +581,20 @@ bool player_poll_download_event(DownloadEvent *out_ev) {
     sigprocmask(SIG_BLOCK, &blk, &oldmask);
 
     for (int i = 0; i < MAX_ACTIVE_DOWNLOADS; i++) {
+        if (g_dl_slots[i].active == 1 && g_dl_slots[i].done == 0 && g_dl_slots[i].pid > 0) {
+            int wstatus = 0;
+            pid_t wp = waitpid((pid_t)g_dl_slots[i].pid, &wstatus, WNOHANG);
+            if (wp == (pid_t)g_dl_slots[i].pid) {
+                g_dl_slots[i].exit_status = (sig_atomic_t)wstatus;
+                g_dl_slots[i].done = 1;
+            } else if (wp < 0 && errno == ECHILD) {
+                g_dl_slots[i].exit_status = 0;
+                g_dl_slots[i].done = 1;
+            }
+        }
+    }
+
+    for (int i = 0; i < MAX_ACTIVE_DOWNLOADS; i++) {
         if (g_dl_slots[i].active == 1 && g_dl_slots[i].done == 1) {
             drain_slot_stdout(&g_dl_slots[i]);
             if (g_dl_slots[i].out_fd >= 0) {

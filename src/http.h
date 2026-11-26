@@ -60,6 +60,7 @@ bool http_pool_submit(HttpPool *pool, HttpJobType type, uint64_t request_gen,
                       void *arg, HttpWorkFn work_fn,
                       HttpFreeFn free_arg, HttpFreeFn free_res);
 bool http_pool_should_cancel(HttpPool *pool, uint64_t request_gen);
+void http_pool_drop_thumbnails(HttpPool *pool);
 void http_pool_set_active_gen(HttpPool *pool, uint64_t gen);
 void http_pool_set_active_detail_gen(HttpPool *pool, uint64_t gen);
 void http_pool_post_progress(HttpPool *pool, HttpJobType type, uint64_t gen, const char *msg);

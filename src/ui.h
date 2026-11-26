@@ -70,6 +70,8 @@ void ui_set_search_text(UiState *ui, const char *text);
 double ui_get_list_scroll(const UiState *ui);
 ssize_t ui_get_selected_index(const UiState *ui);
 void ui_restore_list_state(UiState *ui, MediaList *restored, ssize_t selected_idx, double scroll_y);
+bool ui_can_escape_internally(const UiState *ui);
+void ui_release_hidden_caches(UiState *ui);
 
 /* Wayland event handlers */
 void ui_on_render(void *ctx, cairo_t *cr, int width, int height);

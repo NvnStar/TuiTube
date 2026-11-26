@@ -386,6 +386,11 @@ void thumb_cache_put(ThumbCache *tc, const char *key, cairo_surface_t *surf) {
     tc->count++;
 }
 
+void thumb_cache_flush_ram(ThumbCache *tc) {
+    if (!tc) return;
+    thumb_cache_flush_mem(tc);
+}
+
 void thumb_cache_clear(ThumbCache *tc) {
     if (!tc) return;
     thumb_cache_flush_mem(tc);
