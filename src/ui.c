@@ -3,8 +3,12 @@
 #include "util.h"
 
 #include <ctype.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <fontconfig/fontconfig.h>
 #include <fontconfig/fcfreetype.h>
+#endif
 #include <math.h>
 #include <pango/pangocairo.h>
 
@@ -151,6 +155,9 @@ struct UiState {
     int win_h;
 
     char *font_family;
+#ifdef _WIN32
+    wchar_t *win_loaded_font_path;
+#endif
     PangoLayout *measure_pl;
     cairo_surface_t *mascot_surf;
 
@@ -968,6 +975,13 @@ UiState *ui_create(TuiTubeConfig *cfg, WaylandApp *wl, ThumbCache *thumbs,
 void ui_destroy(UiState *ui) {
     if (!ui) return;
     if (ui->measure_pl) g_object_unref(ui->measure_pl);
+#ifdef _WIN32
+    if (ui->win_loaded_font_path) {
+        RemoveFontResourceExW(ui->win_loaded_font_path, FR_PRIVATE, NULL);
+        free(ui->win_loaded_font_path);
+        ui->win_loaded_font_path = NULL;
+    }
+#endif
     free(ui->font_family);
     if (ui->mascot_surf) cairo_surface_destroy(ui->mascot_surf);
     free(ui->search_buf);
@@ -984,6 +998,33 @@ void ui_reload_font(UiState *ui) {
     free(ui->font_family);
     ui->font_family = NULL;
 
+#ifdef _WIN32
+    if (ui->win_loaded_font_path) {
+        RemoveFontResourceExW(ui->win_loaded_font_path, FR_PRIVATE, NULL);
+        free(ui->win_loaded_font_path);
+        ui->win_loaded_font_path = NULL;
+    }
+    if (ui->cfg->font && ui->cfg->font[0]) {
+        char *resolved = config_resolve_asset_path(ui->cfg, ui->cfg->font);
+        if (resolved && tt_file_exists(resolved)) {
+            size_t flen = 0;
+            char *fdata = tt_read_file(resolved, &flen);
+            char fam[128] = {0};
+            if (fdata && tt_ttf_read_family_name((const uint8_t *)fdata, flen, fam, sizeof(fam))) {
+                wchar_t *wpath = tt_utf8_to_wide(resolved);
+                if (wpath && AddFontResourceExW(wpath, FR_PRIVATE, NULL) > 0) {
+                    ui->win_loaded_font_path = wpath;
+                    ui->font_family = tt_strdup(fam);
+                } else {
+                    free(wpath);
+                }
+            }
+            free(fdata);
+        }
+        free(resolved);
+    }
+    if (!ui->font_family) ui->font_family = tt_strdup("Segoe UI");
+#else
     if (ui->cfg->font && ui->cfg->font[0]) {
         char *resolved = config_resolve_asset_path(ui->cfg, ui->cfg->font);
         if (resolved && tt_file_exists(resolved)) {
@@ -1002,6 +1043,7 @@ void ui_reload_font(UiState *ui) {
         free(resolved);
     }
     if (!ui->font_family) ui->font_family = tt_strdup("Sans");
+#endif
     if (ui->measure_pl) pango_layout_context_changed(ui->measure_pl);
 }
 

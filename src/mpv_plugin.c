@@ -1,32 +1,40 @@
+#ifndef _WIN32
 #define _GNU_SOURCE
+#endif
 
 #include "app.h"
 #include "config.h"
 #include "http.h"
 #include "mpv_cplugin.h"
 #include "player.h"
+#include "tt_keysyms.h"
 #include "ui.h"
 #include "util.h"
 #include "wayland.h"
 
 #include <cairo.h>
 #include <ctype.h>
-#include <dlfcn.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
 #include <math.h>
-#include <poll.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <inttypes.h>
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#include <fcntl.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+#include <poll.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <xkbcommon/xkbcommon-keysyms.h>
+#endif
 
 enum {
     TT_OVERLAY_ID = 61
@@ -55,20 +63,38 @@ struct WaylandApp {
     int logical_h;
     double mouse_phys_x;
     double mouse_phys_y;
+#ifdef _WIN32
+    bool overlay_active;
+    HANDLE wakeup_event;
+#else
     int fb_fd;
+    int wakeup_pipe[2];
+#endif
     void *fb_data;
     size_t fb_cap;
     AppState *app;
     char client_name[64];
-    int wakeup_pipe[2];
 };
 
+#ifdef _WIN32
+static INIT_ONCE g_curl_once = INIT_ONCE_STATIC_INIT;
+static bool g_curl_ok = false;
+
+static BOOL CALLBACK plugin_curl_init_once_cb(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once;
+    (void)param;
+    (void)ctx;
+    g_curl_ok = http_global_init();
+    return TRUE;
+}
+#else
 static pthread_once_t g_curl_once = PTHREAD_ONCE_INIT;
 static bool g_curl_ok = false;
 
 static void plugin_curl_init_once(void) {
     g_curl_ok = http_global_init();
 }
+#endif
 
 static const int s_plugin_anchor = 0;
 
@@ -102,6 +128,20 @@ static void trim_process_heap(void) {
 
 static void release_fb(WaylandApp *wl) {
     if (!wl) return;
+#ifdef _WIN32
+    if (wl->overlay_active && wl->mpv && !wl->quit) {
+        char id_str[16];
+        snprintf(id_str, sizeof(id_str), "%d", TT_OVERLAY_ID);
+        const char *rem_cmd[] = {"overlay-remove", id_str, NULL};
+        mpv_command(wl->mpv, rem_cmd);
+        wl->overlay_active = false;
+    }
+    if (wl->fb_data) {
+        VirtualFree(wl->fb_data, 0, MEM_RELEASE);
+        wl->fb_data = NULL;
+    }
+    wl->fb_cap = 0;
+#else
     if (wl->fb_data && wl->fb_data != MAP_FAILED && wl->fb_cap > 0) {
         munmap(wl->fb_data, wl->fb_cap);
     }
@@ -111,12 +151,24 @@ static void release_fb(WaylandApp *wl) {
         close(wl->fb_fd);
         wl->fb_fd = -1;
     }
+#endif
 }
 
 static bool ensure_fb_capacity(WaylandApp *wl, size_t needed) {
     size_t target_cap = tt_shm_pool_capacity(needed);
     if (target_cap == 0) return false;
 
+#ifdef _WIN32
+    if (wl->fb_data && needed <= wl->fb_cap && !tt_shm_should_shrink(needed, wl->fb_cap)) {
+        return true;
+    }
+    release_fb(wl);
+    void *data = VirtualAlloc(NULL, target_cap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!data) return false;
+    wl->fb_data = data;
+    wl->fb_cap = target_cap;
+    return true;
+#else
     if (wl->fb_fd >= 0 && wl->fb_data && !tt_shm_should_shrink(needed, wl->fb_cap)) {
         if (needed <= wl->fb_cap) {
             return true;
@@ -147,6 +199,7 @@ static bool ensure_fb_capacity(WaylandApp *wl, size_t needed) {
     wl->fb_data = data;
     wl->fb_cap = target_cap;
     return true;
+#endif
 }
 
 static void update_mouse_pos_node(WaylandApp *wl, const mpv_node *node) {
@@ -235,20 +288,27 @@ static void mpv_overlay_set_visible(WaylandApp *wl, bool show) {
         wl->visible = false;
         wl->dirty = false;
 
-        const char *dis_cmd[] = {"disable-section", "tuitube_overlay", NULL};
-        mpv_command(wl->mpv, dis_cmd);
-        mpv_unobserve_property(wl->mpv, OBS_MOUSE);
-        sync_host_ime(wl);
+        if (!wl->quit) {
+            const char *dis_cmd[] = {"disable-section", "tuitube_overlay", NULL};
+            mpv_command(wl->mpv, dis_cmd);
+            mpv_unobserve_property(wl->mpv, OBS_MOUSE);
+            sync_host_ime(wl);
 
-        char id_str[16];
-        snprintf(id_str, sizeof(id_str), "%d", TT_OVERLAY_ID);
-        const char *rem_cmd[] = {"overlay-remove", id_str, NULL};
-        mpv_command(wl->mpv, rem_cmd);
-        release_fb(wl);
-        if (wl->app) {
-            app_release_hidden_resources(wl->app);
+            char id_str[16];
+            snprintf(id_str, sizeof(id_str), "%d", TT_OVERLAY_ID);
+            const char *rem_cmd[] = {"overlay-remove", id_str, NULL};
+            mpv_command(wl->mpv, rem_cmd);
         }
-        trim_process_heap();
+#ifdef _WIN32
+        wl->overlay_active = false;
+#endif
+        release_fb(wl);
+        if (!wl->quit) {
+            if (wl->app) {
+                app_release_hidden_resources(wl->app);
+            }
+            trim_process_heap();
+        }
     }
 }
 
@@ -294,13 +354,16 @@ static void mpv_overlay_render_if_needed(WaylandApp *wl) {
     cairo_surface_destroy(surf);
     wl->dirty = false;
 
+    char id_arg[16], fd_arg[48], pw_arg[16], ph_arg[16], stride_arg[32];
+    snprintf(id_arg, sizeof(id_arg), "%d", TT_OVERLAY_ID);
+#ifdef _WIN32
+    snprintf(fd_arg, sizeof(fd_arg), "&%" PRIuPTR, (uintptr_t)wl->fb_data);
+#else
     if (lseek(wl->fb_fd, 0, SEEK_SET) < 0) {
         return;
     }
-
-    char id_arg[16], fd_arg[32], pw_arg[16], ph_arg[16], stride_arg[32];
-    snprintf(id_arg, sizeof(id_arg), "%d", TT_OVERLAY_ID);
     snprintf(fd_arg, sizeof(fd_arg), "@%d", wl->fb_fd);
+#endif
     snprintf(pw_arg, sizeof(pw_arg), "%d", pw);
     snprintf(ph_arg, sizeof(ph_arg), "%d", ph);
     snprintf(stride_arg, sizeof(stride_arg), "%zu", stride);
@@ -310,6 +373,9 @@ static void mpv_overlay_render_if_needed(WaylandApp *wl) {
         pw_arg, ph_arg, stride_arg, NULL
     };
     mpv_command(wl->mpv, cmd);
+#ifdef _WIN32
+    wl->overlay_active = true;
+#endif
 }
 
 /* Host WaylandApp shim functions required by ui.c / app.c */
@@ -411,9 +477,18 @@ static bool mpv_host_play_video(void *play_ctx, const TuiTubeConfig *cfg,
 
     const char *title = (video->title && video->title[0]) ? video->title : video->id;
     char ytdl_fmt[512];
+    char ytdl_script_opt[PATH_MAX + 64];
 
-    char *opt_keys[3];
-    mpv_node opt_vals[3];
+#ifdef _WIN32
+    char *resolved_ytdlp = player_resolve_ytdlp_path(cfg, NULL);
+    if (resolved_ytdlp) {
+        tt_win32_ensure_dir_in_path(resolved_ytdlp);
+        free(resolved_ytdlp);
+    }
+#endif
+
+    char *opt_keys[4];
+    mpv_node opt_vals[4];
     int opt_count = 0;
 
     opt_keys[opt_count] = "force-media-title";
@@ -434,6 +509,13 @@ static bool mpv_host_play_video(void *play_ctx, const TuiTubeConfig *cfg,
         opt_keys[opt_count] = "slang";
         opt_vals[opt_count].format = MPV_FORMAT_STRING;
         opt_vals[opt_count].u.string = cfg->sub_language;
+        opt_count++;
+    }
+
+    if (player_build_mpv_ytdl_script_opt(cfg, ytdl_script_opt, sizeof(ytdl_script_opt))) {
+        opt_keys[opt_count] = "script-opts-append";
+        opt_vals[opt_count].format = MPV_FORMAT_STRING;
+        opt_vals[opt_count].u.string = ytdl_script_opt;
         opt_count++;
     }
 
@@ -491,9 +573,33 @@ static bool mpv_host_play_video(void *play_ctx, const TuiTubeConfig *cfg,
     return true;
 }
 
-static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out_cap) {
+static void find_mpv_script_opts_config(mpv_handle *mpv, char *out_file, size_t out_cap) {
+    if (!out_file || out_cap == 0) return;
+    out_file[0] = '\0';
+    if (!mpv) return;
+#ifdef MPV_CPLUGIN_DYNAMIC_SYM
+    if (!mpv_command_ret || !mpv_free_node_contents) return;
+#endif
+    const char *args[] = {"expand-path", "~~/script-opts", NULL};
+    mpv_node res;
+    memset(&res, 0, sizeof(res));
+    if (mpv_command_ret(mpv, args, &res) >= 0) {
+        if (res.format == MPV_FORMAT_STRING && res.u.string && res.u.string[0]) {
+            char *cand = tt_path_join(res.u.string, "tuitube.json");
+            if (cand && tt_file_exists(cand) && strlen(cand) < out_cap) {
+                snprintf(out_file, out_cap, "%s", cand);
+            }
+            free(cand);
+        }
+        mpv_free_node_contents(&res);
+    }
+}
+
+static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out_cap,
+                                      char *out_override_cfg, size_t out_override_cap) {
     if (!out_dir || out_cap == 0) return false;
     out_dir[0] = '\0';
+    if (out_override_cfg && out_override_cap > 0) out_override_cfg[0] = '\0';
 
     char *sopts = mpv_get_property_string(mpv, "script-opts");
     if (sopts) {
@@ -502,6 +608,60 @@ static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out
         if (ok) return true;
     }
 
+#ifdef _WIN32
+    HMODULE hm = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)(const void *)&s_plugin_anchor, &hm) && hm) {
+        wchar_t wdll[4096];
+        DWORD n = GetModuleFileNameW(hm, wdll, (DWORD)(sizeof(wdll) / sizeof(wdll[0])));
+        if (n > 0 && n < (DWORD)(sizeof(wdll) / sizeof(wdll[0]))) {
+            char *dll_path = tt_wide_to_utf8(wdll);
+            if (dll_path) {
+                char *slash = NULL;
+                for (char *p = dll_path; *p; p++) {
+                    if (*p == '/' || *p == '\\') slash = p;
+                }
+                if (slash) {
+                    if ((size_t)(slash - dll_path) == 2 &&
+                        isalpha((unsigned char)dll_path[0]) && dll_path[1] == ':') {
+                        slash[1] = '\0';
+                    } else if (slash == dll_path) {
+                        slash[1] = '\0';
+                    } else {
+                        *slash = '\0';
+                    }
+                    char *marker = tt_path_join(dll_path, "tuitube_portable_mode.txt");
+                    bool exists = marker && tt_file_exists(marker);
+                    free(marker);
+                    if (exists && strlen(dll_path) < out_cap) {
+                        snprintf(out_dir, out_cap, "%s", dll_path);
+                        free(dll_path);
+                        return true;
+                    }
+                }
+                free(dll_path);
+            }
+        }
+    }
+
+    find_mpv_script_opts_config(mpv, out_override_cfg, out_override_cap);
+
+    const char *xdg_cfg = getenv("XDG_CONFIG_HOME");
+    const char *appdata = getenv("APPDATA");
+    const char *userprofile = getenv("USERPROFILE");
+    if (!userprofile || !userprofile[0]) userprofile = getenv("HOME");
+    if (!userprofile || !userprofile[0]) userprofile = getenv("TEMP");
+    if (!userprofile || !userprofile[0]) userprofile = ".";
+    if (xdg_cfg && xdg_cfg[0]) {
+        snprintf(out_dir, out_cap, "%s/tuitube", xdg_cfg);
+    } else if (appdata && appdata[0]) {
+        snprintf(out_dir, out_cap, "%s/tuitube", appdata);
+    } else {
+        snprintf(out_dir, out_cap, "%s/AppData/Roaming/tuitube", userprofile);
+    }
+    return true;
+#else
     Dl_info dli;
     if (dladdr(&s_plugin_anchor, &dli) != 0 && dli.dli_fname && dli.dli_fname[0]) {
         const char *slash = strrchr(dli.dli_fname, '/');
@@ -525,6 +685,8 @@ static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out
         }
     }
 
+    find_mpv_script_opts_config(mpv, out_override_cfg, out_override_cap);
+
     const char *xdg_cfg = getenv("XDG_CONFIG_HOME");
     const char *home = getenv("HOME");
     if (!home || !home[0]) home = "/tmp";
@@ -534,6 +696,7 @@ static bool resolve_plugin_config_dir(mpv_handle *mpv, char *out_dir, size_t out
         snprintf(out_dir, out_cap, "%s/.config/tuitube", home);
     }
     return true;
+#endif
 }
 
 static void sanitize_client_name(const char *raw, char *out, size_t cap) {
@@ -555,55 +718,99 @@ static void sanitize_client_name(const char *raw, char *out, size_t cap) {
     if (j == 0) snprintf(out, cap, "tuitube");
 }
 
-static bool mpv_key_name_from_keysym(xkb_keysym_t sym, char *out, size_t cap) {
-    if (!out || cap == 0) return false;
-    if (sym >= XKB_KEY_A && sym <= XKB_KEY_Z) {
-        snprintf(out, cap, "%c", (char)(sym - XKB_KEY_A + 'a'));
-        return true;
+static bool lookup_default_close_win_cmd(mpv_handle *mpv, char *out, size_t out_cap) {
+    if (!mpv || !out || out_cap == 0) return false;
+    out[0] = '\0';
+#ifdef MPV_CPLUGIN_DYNAMIC_SYM
+    if (!mpv_get_property || !mpv_free_node_contents) return false;
+#endif
+
+    mpv_node bnode;
+    memset(&bnode, 0, sizeof(bnode));
+    if (mpv_get_property(mpv, "input-bindings", MPV_FORMAT_NODE, &bnode) < 0) {
+        return false;
     }
-    if (sym >= XKB_KEY_a && sym <= XKB_KEY_z) {
-        snprintf(out, cap, "%c", (char)sym);
-        return true;
+
+    bool found = false;
+    if (bnode.format == MPV_FORMAT_NODE_ARRAY && bnode.u.list) {
+        const char *best_cmd = NULL;
+        bool best_is_weak = true;
+        int64_t best_priority = INT64_MIN;
+        bool has_best = false;
+
+        for (int i = 0; i < bnode.u.list->num; i++) {
+            const mpv_node *entry = &bnode.u.list->values[i];
+            if (entry->format != MPV_FORMAT_NODE_MAP || !entry->u.list) continue;
+
+            const char *key = NULL;
+            const char *cmd = NULL;
+            const char *section = NULL;
+            bool has_priority = false;
+            int64_t priority = 0;
+            bool is_weak = false;
+
+            const mpv_node_list *map = entry->u.list;
+            for (int j = 0; j < map->num; j++) {
+                const char *mk = map->keys ? map->keys[j] : NULL;
+                const mpv_node *mv = &map->values[j];
+                if (!mk) continue;
+                if (strcmp(mk, "key") == 0 && mv->format == MPV_FORMAT_STRING) {
+                    key = mv->u.string;
+                } else if (strcmp(mk, "cmd") == 0 && mv->format == MPV_FORMAT_STRING) {
+                    cmd = mv->u.string;
+                } else if (strcmp(mk, "section") == 0 && mv->format == MPV_FORMAT_STRING) {
+                    section = mv->u.string;
+                } else if (strcmp(mk, "priority") == 0 && mv->format == MPV_FORMAT_INT64) {
+                    has_priority = true;
+                    priority = mv->u.int64;
+                } else if (strcmp(mk, "is_weak") == 0 && mv->format == MPV_FORMAT_FLAG) {
+                    is_weak = (mv->u.flag != 0);
+                }
+            }
+
+            if (!key || tt_strcasecmp(key, "CLOSE_WIN") != 0) continue;
+            if (section && section[0] != '\0' && strcmp(section, "default") != 0) continue;
+            if (!cmd || !cmd[0]) continue;
+            if (has_priority && priority < 0) continue;
+
+            bool bad_nl = false;
+            for (const char *p = cmd; *p != '\0'; p++) {
+                if (*p == '\n' || *p == '\r') {
+                    bad_nl = true;
+                    break;
+                }
+            }
+            if (bad_nl) continue;
+
+            const char *tstart = cmd;
+            while (*tstart == ' ' || *tstart == '\t') tstart++;
+            size_t tlen = strlen(tstart);
+            while (tlen > 0 && (tstart[tlen - 1] == ' ' || tstart[tlen - 1] == '\t')) tlen--;
+            if (tlen == 0) continue;
+            if (tlen == 6 && tt_strncasecmp(tstart, "ignore", 6) == 0) continue;
+
+            if (!has_best ||
+                (!is_weak && best_is_weak) ||
+                (is_weak == best_is_weak && priority >= best_priority)) {
+                best_cmd = cmd;
+                best_is_weak = is_weak;
+                best_priority = priority;
+                has_best = true;
+            }
+        }
+
+        if (has_best && best_cmd) {
+            int n = snprintf(out, out_cap, "%s", best_cmd);
+            if (n >= 0 && (size_t)n < out_cap) {
+                found = true;
+            } else {
+                out[0] = '\0';
+            }
+        }
     }
-    if (sym >= XKB_KEY_0 && sym <= XKB_KEY_9) {
-        snprintf(out, cap, "%c", (char)sym);
-        return true;
-    }
-    if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F12) {
-        snprintf(out, cap, "F%u", (unsigned)(sym - XKB_KEY_F1 + 1));
-        return true;
-    }
-    switch (sym) {
-        case XKB_KEY_Escape:       snprintf(out, cap, "ESC"); return true;
-        case XKB_KEY_Return:
-        case XKB_KEY_KP_Enter:     snprintf(out, cap, "ENTER"); return true;
-        case XKB_KEY_Tab:          snprintf(out, cap, "TAB"); return true;
-        case XKB_KEY_BackSpace:    snprintf(out, cap, "BS"); return true;
-        case XKB_KEY_Delete:       snprintf(out, cap, "DEL"); return true;
-        case XKB_KEY_Insert:       snprintf(out, cap, "INS"); return true;
-        case XKB_KEY_Left:         snprintf(out, cap, "LEFT"); return true;
-        case XKB_KEY_Right:        snprintf(out, cap, "RIGHT"); return true;
-        case XKB_KEY_Up:           snprintf(out, cap, "UP"); return true;
-        case XKB_KEY_Down:         snprintf(out, cap, "DOWN"); return true;
-        case XKB_KEY_Page_Up:      snprintf(out, cap, "PGUP"); return true;
-        case XKB_KEY_Page_Down:    snprintf(out, cap, "PGDWN"); return true;
-        case XKB_KEY_Home:         snprintf(out, cap, "HOME"); return true;
-        case XKB_KEY_End:          snprintf(out, cap, "END"); return true;
-        case XKB_KEY_space:        snprintf(out, cap, "SPACE"); return true;
-        case XKB_KEY_apostrophe:   snprintf(out, cap, "'"); return true;
-        case XKB_KEY_comma:        snprintf(out, cap, ","); return true;
-        case XKB_KEY_minus:        snprintf(out, cap, "-"); return true;
-        case XKB_KEY_period:       snprintf(out, cap, "."); return true;
-        case XKB_KEY_slash:        snprintf(out, cap, "/"); return true;
-        case XKB_KEY_question:     snprintf(out, cap, "?"); return true;
-        case XKB_KEY_semicolon:    snprintf(out, cap, ";"); return true;
-        case XKB_KEY_equal:        snprintf(out, cap, "="); return true;
-        case XKB_KEY_bracketleft:  snprintf(out, cap, "["); return true;
-        case XKB_KEY_bracketright: snprintf(out, cap, "]"); return true;
-        case XKB_KEY_backslash:    snprintf(out, cap, "\\"); return true;
-        case XKB_KEY_grave:        snprintf(out, cap, "`"); return true;
-        default:                   return false;
-    }
+
+    mpv_free_node_contents(&bnode);
+    return found;
 }
 
 static void setup_input_sections(WaylandApp *wl, const TuiTubeConfig *cfg) {
@@ -619,86 +826,12 @@ static void setup_input_sections(WaylandApp *wl, const TuiTubeConfig *cfg) {
     const char *en_def_cmd[] = {"enable-section", "tuitube_default", NULL};
     mpv_command(wl->mpv, en_def_cmd);
 
+    char close_cmd[512];
+    lookup_default_close_win_cmd(wl->mpv, close_cmd, sizeof(close_cmd));
+
     StrBuf ov_sb;
     sb_init(&ov_sb);
-
-    /* Mouse bindings */
-    sb_appendf(&ov_sb, "MOUSE_MOVE script-binding %s/mouse_move\n", cname);
-    sb_appendf(&ov_sb, "MOUSE_LEAVE script-binding %s/mouse_leave\n", cname);
-    static const char *const mouse_btns[] = {
-        "MBTN_LEFT", "MBTN_LEFT_DBL", "MBTN_RIGHT",
-        "MBTN_MID", "MBTN_BACK", "MBTN_FORWARD"
-    };
-    for (size_t i = 0; i < sizeof(mouse_btns) / sizeof(mouse_btns[0]); i++) {
-        sb_appendf(&ov_sb, "%s script-binding %s/input\n", mouse_btns[i], cname);
-    }
-    static const char *const wheel_btns[] = {
-        "WHEEL_UP", "WHEEL_DOWN", "WHEEL_LEFT", "WHEEL_RIGHT"
-    };
-    for (size_t i = 0; i < sizeof(wheel_btns) / sizeof(wheel_btns[0]); i++) {
-        sb_appendf(&ov_sb, "%s repeatable script-binding %s/input\n", wheel_btns[i], cname);
-    }
-
-    /* Toggle shortcut inside overlay */
-    sb_appendf(&ov_sb, "F12 script-binding %s/toggle\n", cname);
-
-    /* Printable / Unicode / IME */
-    sb_appendf(&ov_sb, "ANY_UNICODE repeatable script-binding %s/input\n", cname);
-    sb_appendf(&ov_sb, "SPACE repeatable script-binding %s/input\n", cname);
-    sb_appendf(&ov_sb, "SHARP repeatable script-binding %s/input\n", cname);
-    sb_appendf(&ov_sb, "KP_DIVIDE repeatable script-binding %s/input\n", cname);
-
-    /* Navigation & editing keys across modifier prefixes */
-    static const char *const mod_prefixes[] = {
-        "", "Shift+", "Ctrl+", "Alt+", "Ctrl+Shift+", "Ctrl+Alt+"
-    };
-    static const struct { const char *key; bool rep; } nav_keys[] = {
-        {"ESC", false}, {"ENTER", false}, {"KP_ENTER", false}, {"TAB", false},
-        {"BS", true}, {"DEL", true}, {"INS", false},
-        {"UP", true}, {"DOWN", true}, {"LEFT", true}, {"RIGHT", true},
-        {"PGUP", true}, {"PGDWN", true}, {"HOME", false}, {"END", false},
-        {"F1", false}, {"F2", false}, {"F3", false}, {"F4", false},
-        {"F5", false}, {"F6", false}, {"F7", false}, {"F8", false},
-        {"F9", false}, {"F10", false}, {"F11", false}
-    };
-    for (size_t m = 0; m < sizeof(mod_prefixes) / sizeof(mod_prefixes[0]); m++) {
-        for (size_t k = 0; k < sizeof(nav_keys) / sizeof(nav_keys[0]); k++) {
-            sb_appendf(&ov_sb, "%s%s%s script-binding %s/input\n",
-                       mod_prefixes[m], nav_keys[k].key,
-                       nav_keys[k].rep ? " repeatable" : "", cname);
-        }
-    }
-
-    /* Modified printable shortcuts */
-    for (char c = 'a'; c <= 'z'; c++) {
-        sb_appendf(&ov_sb, "Ctrl+%c script-binding %s/input\n", c, cname);
-        sb_appendf(&ov_sb, "Ctrl+Shift+%c script-binding %s/input\n", c, cname);
-    }
-    static const char *const ctrl_punct[] = {
-        "[", "]", "/", "-", "=", "\\", ";", "'", ",", "."
-    };
-    for (size_t i = 0; i < sizeof(ctrl_punct) / sizeof(ctrl_punct[0]); i++) {
-        sb_appendf(&ov_sb, "Ctrl+%s script-binding %s/input\n", ctrl_punct[i], cname);
-    }
-
-    /* Additional configured modifier+key combinations */
-    if (cfg) {
-        for (size_t i = 0; i < cfg->key_binding_count; i++) {
-            const KeyBinding *kb = &cfg->key_bindings[i];
-            if (kb->mods == 0) continue;
-            char kname[16];
-            if (!mpv_key_name_from_keysym(kb->keysym, kname, sizeof(kname))) continue;
-            sb_appendf(&ov_sb, "%s%s%s%s%s script-binding %s/input\n",
-                       (kb->mods & TT_MOD_CTRL) ? "Ctrl+" : "",
-                       (kb->mods & TT_MOD_ALT) ? "Alt+" : "",
-                       (kb->mods & TT_MOD_SHIFT) ? "Shift+" : "",
-                       (kb->mods & TT_MOD_SUPER) ? "Meta+" : "",
-                       kname, cname);
-        }
-    }
-
-    /* Catch-all so unmapped keys never leak to mpv while exclusive */
-    sb_appendf(&ov_sb, "UNMAPPED repeatable script-binding %s/noop\n", cname);
+    config_build_mpv_overlay_section(cfg, cname, close_cmd[0] ? close_cmd : NULL, &ov_sb);
 
     const char *ov_cmd[] = {"define-section", "tuitube_overlay", ov_sb.data ? ov_sb.data : "", "force", NULL};
     mpv_command(wl->mpv, ov_cmd);
@@ -805,10 +938,15 @@ static void handle_client_message(WaylandApp *wl, const mpv_event_client_message
 
 static void mpv_wakeup_cb(void *d) {
     WaylandApp *wl = d;
+#ifdef _WIN32
+    if (!wl || !wl->wakeup_event) return;
+    SetEvent(wl->wakeup_event);
+#else
     if (!wl || wl->wakeup_pipe[1] < 0) return;
     char b = 1;
     ssize_t r = write(wl->wakeup_pipe[1], &b, 1);
     (void)r;
+#endif
 }
 
 static void drain_mpv_events(WaylandApp *wl) {
@@ -851,15 +989,30 @@ static void drain_mpv_events(WaylandApp *wl) {
 }
 
 TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
+#ifdef MPV_CPLUGIN_DYNAMIC_SYM
+    if (!mpv_wait_event || !mpv_command || !mpv_command_node) {
+        return -1;
+    }
+#endif
     if (!mpv) return -1;
 
+#ifdef _WIN32
+    InitOnceExecuteOnce(&g_curl_once, plugin_curl_init_once_cb, NULL, NULL);
+#else
     pthread_once(&g_curl_once, plugin_curl_init_once);
+#endif
     if (!g_curl_ok) return -1;
 
     WaylandApp wl;
     memset(&wl, 0, sizeof(wl));
     wl.mpv = mpv;
     wl.hidpi_scale = 1.0;
+#ifdef _WIN32
+    wl.wakeup_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!wl.wakeup_event) {
+        return -1;
+    }
+#else
     wl.fb_fd = -1;
     wl.wakeup_pipe[0] = -1;
     wl.wakeup_pipe[1] = -1;
@@ -867,16 +1020,24 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
     if (pipe2(wl.wakeup_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
         return -1;
     }
+#endif
 
     sanitize_client_name(mpv_client_name(mpv), wl.client_name, sizeof(wl.client_name));
 
     char cfg_dir[PATH_MAX] = {0};
-    resolve_plugin_config_dir(mpv, cfg_dir, sizeof(cfg_dir));
+    char override_cfg_file[PATH_MAX] = {0};
+    resolve_plugin_config_dir(mpv, cfg_dir, sizeof(cfg_dir),
+                              override_cfg_file, sizeof(override_cfg_file));
 
     AppState app;
-    if (!app_init(&app, cfg_dir, &wl, mpv_host_play_video, &wl, "mpv")) {
+    if (!app_init_ex(&app, cfg_dir, override_cfg_file[0] ? override_cfg_file : NULL,
+                     &wl, mpv_host_play_video, &wl, "mpv")) {
+#ifdef _WIN32
+        CloseHandle(wl.wakeup_event);
+#else
         close(wl.wakeup_pipe[0]);
         close(wl.wakeup_pipe[1]);
+#endif
         return -1;
     }
     wl.app = &app;
@@ -888,7 +1049,11 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
     setup_input_sections(&wl, &app.cfg);
     mpv_set_wakeup_callback(mpv, mpv_wakeup_cb, &wl);
 
+#ifdef _WIN32
+    HANDLE notify_h = (HANDLE)app_notify_handle(&app);
+#else
     int notify_fd = app_notify_fd(&app);
+#endif
 
     while (!wl.quit) {
         drain_mpv_events(&wl);
@@ -897,6 +1062,28 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
         app_poll_downloads(&app);
         mpv_overlay_render_if_needed(&wl);
 
+#ifdef _WIN32
+        HANDLE handles[2];
+        DWORD hcount = 0;
+        handles[hcount++] = wl.wakeup_event;
+        if (notify_h) {
+            handles[hcount++] = notify_h;
+        }
+        DWORD timeout_ms = (player_get_active_download_summary(NULL, NULL, 0) > 0) ? 250u : INFINITE;
+        DWORD wr = WaitForMultipleObjects(hcount, handles, FALSE, timeout_ms);
+        if (wr == WAIT_FAILED) {
+            break;
+        }
+        if (notify_h && ((hcount > 1 && wr == WAIT_OBJECT_0 + 1) ||
+                         WaitForSingleObject(notify_h, 0) == WAIT_OBJECT_0)) {
+            app_process_async_results(&app);
+            if (!wl.visible) {
+                ui_release_hidden_caches(app.ui);
+                trim_process_heap();
+            }
+        }
+        app_poll_downloads(&app);
+#else
         struct pollfd pfds[2];
         nfds_t nfds = 0;
         pfds[nfds].fd = wl.wakeup_pipe[0];
@@ -931,15 +1118,22 @@ TT_MPV_EXPORT int mpv_open_cplugin(mpv_handle *mpv) {
             }
         }
         app_poll_downloads(&app);
+#endif
     }
 
     mpv_set_wakeup_callback(mpv, NULL, NULL);
     mpv_overlay_set_visible(&wl, false);
-    mpv_unobserve_property(mpv, OBS_OSD_W);
-    mpv_unobserve_property(mpv, OBS_OSD_H);
-    mpv_unobserve_property(mpv, OBS_HIDPI);
+    if (!wl.quit) {
+        mpv_unobserve_property(mpv, OBS_OSD_W);
+        mpv_unobserve_property(mpv, OBS_OSD_H);
+        mpv_unobserve_property(mpv, OBS_HIDPI);
+    }
     app_destroy(&app);
+#ifdef _WIN32
+    CloseHandle(wl.wakeup_event);
+#else
     close(wl.wakeup_pipe[0]);
     close(wl.wakeup_pipe[1]);
+#endif
     return 0;
 }

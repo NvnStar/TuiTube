@@ -1,10 +1,25 @@
 #ifndef TUITUBE_UTIL_H
 #define TUITUBE_UTIL_H
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#ifdef _WIN32
+#include <basetsd.h>
+#include <wchar.h>
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+typedef SSIZE_T ssize_t;
+#endif
+#else
 #include <sys/types.h>
+#endif
 
 typedef struct {
     char *data;
@@ -40,12 +55,32 @@ char *tt_xml_unescape(const char *s);
 bool tt_parse_age_seconds(const char *spec, int64_t *out_seconds);
 bool tt_parse_iso8601_utc(const char *s, int64_t *out_epoch);
 
-bool tt_mkdir_p(const char *path, mode_t mode);
+bool tt_mkdir_p(const char *path, unsigned int mode);
 bool tt_file_exists(const char *path);
+bool tt_dir_exists(const char *path);
 char *tt_read_file(const char *path, size_t *out_len);
 bool tt_write_file_atomic(const char *path, const void *data, size_t len);
+bool tt_is_abs_path(const char *path);
 char *tt_path_join(const char *base, const char *rel);
 void tt_sanitize_filename(const char *key, char *out, size_t out_cap);
+
+bool tt_get_exe_dir(char *out, size_t cap);
+bool tt_parse_locale_tag(const char *raw, char *out_hl, size_t hl_cap, char *out_gl, size_t gl_cap);
+void tt_detect_system_locale(char *out_hl, size_t hl_cap, char *out_gl, size_t gl_cap);
+bool tt_pe_is_gui_subsystem(const uint8_t *data, size_t len);
+
+#ifdef _WIN32
+wchar_t *tt_utf8_to_wide(const char *utf8);
+char *tt_wide_to_utf8(const wchar_t *wide);
+void tt_win32_refresh_path(void);
+char *tt_win32_resolve_exe(const char *exe);
+void tt_win32_ensure_dir_in_path(const char *file_path);
+#endif
+
+bool tt_win32_quote_arg(const char *arg, StrBuf *out);
+char *tt_win32_build_cmdline(const char *const *argv);
+bool tt_ttf_read_family_name(const uint8_t *data, size_t len, char *out, size_t out_cap);
+bool tt_spawn_capture_stdout(const char *const *argv, size_t max_bytes, StrBuf *out_stdout);
 
 bool tt_resolve_paths(const char *cli_config_dir,
                       char *out_config_dir, size_t cfg_cap,

@@ -3,6 +3,10 @@ build/
 tuitube
 tuitube-debug
 tuitube.so
+tuitube.exe
+tuitube-debug.exe
+tuitube.dll
+dist/
 *.o
 *.tmp.*
 

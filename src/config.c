@@ -386,14 +386,83 @@ static int clamp_int(int v, int lo, int hi) {
     return v;
 }
 
+static const char *default_country_for_hl(const char *hl, const char *fallback_gl) {
+    static const struct { const char *hl; const char *gl; } map[] = {
+        {"vi",    "VN"},
+        {"en",    "US"},
+        {"ja",    "JP"},
+        {"ko",    "KR"},
+        {"zh-TW", "TW"},
+        {"zh-HK", "HK"},
+        {"zh-CN", "CN"},
+        {"fr",    "FR"},
+        {"de",    "DE"},
+        {"es",    "ES"},
+        {"pt-BR", "BR"},
+        {"pt-PT", "PT"},
+        {"ru",    "RU"},
+        {"id",    "ID"},
+        {"th",    "TH"},
+    };
+    if (hl) {
+        for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+            if (strcmp(hl, map[i].hl) == 0) return map[i].gl;
+        }
+    }
+    return (fallback_gl && fallback_gl[0]) ? fallback_gl : "US";
+}
+
+void config_resolve_locale(TuiTubeConfig *cfg) {
+    if (!cfg) return;
+
+    char sys_hl[16] = "en";
+    char sys_gl[8] = "US";
+    tt_detect_system_locale(sys_hl, sizeof(sys_hl), sys_gl, sizeof(sys_gl));
+
+    if (!cfg->language || !cfg->language[0] || tt_strcasecmp(cfg->language, "auto") == 0) {
+        snprintf(cfg->resolved_hl, sizeof(cfg->resolved_hl), "%s", sys_hl);
+        snprintf(cfg->resolved_gl, sizeof(cfg->resolved_gl), "%s", sys_gl);
+    } else {
+        char parsed_hl[16] = {0};
+        char parsed_gl[8] = {0};
+        if (tt_parse_locale_tag(cfg->language, parsed_hl, sizeof(parsed_hl),
+                                parsed_gl, sizeof(parsed_gl))) {
+            snprintf(cfg->resolved_hl, sizeof(cfg->resolved_hl), "%s", parsed_hl);
+            const char *gl = parsed_gl[0] ? parsed_gl : default_country_for_hl(parsed_hl, sys_gl);
+            snprintf(cfg->resolved_gl, sizeof(cfg->resolved_gl), "%s", gl);
+        } else {
+            snprintf(cfg->resolved_hl, sizeof(cfg->resolved_hl), "%s", sys_hl);
+            snprintf(cfg->resolved_gl, sizeof(cfg->resolved_gl), "%s", sys_gl);
+        }
+    }
+
+    if (cfg->region && cfg->region[0] && tt_strcasecmp(cfg->region, "auto") != 0) {
+        const char *p = cfg->region;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t len = strlen(p);
+        while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t')) len--;
+        if (len == 2 &&
+            isalpha((unsigned char)p[0]) &&
+            isalpha((unsigned char)p[1])) {
+            cfg->resolved_gl[0] = (char)toupper((unsigned char)p[0]);
+            cfg->resolved_gl[1] = (char)toupper((unsigned char)p[1]);
+            cfg->resolved_gl[2] = '\0';
+        }
+    }
+}
+
 void config_init_defaults(TuiTubeConfig *cfg) {
     memset(cfg, 0, sizeof(*cfg));
+    cfg->language = tt_strdup("auto");
+    cfg->region = tt_strdup("");
     cfg->scale = 0.0;
     cfg->font = tt_strdup("");
     cfg->font_size = 13;
     cfg->thumb_size = 72;
     cfg->playlist_width = 380;
     cfg->player_path = tt_strdup("mpv");
+    cfg->ytdlp_path = tt_strdup("");
+    cfg->has_ytdlp_path = false;
     cfg->video_format = tt_strdup("1080p60");
     cfg->has_video_format = false;
     cfg->sub_language = tt_strdup("en");
@@ -416,6 +485,7 @@ void config_init_defaults(TuiTubeConfig *cfg) {
     cfg->download_dir = tt_strdup("");
     add_default_keybindings(cfg);
     theme_init_builtin(&cfg->theme, "dark");
+    config_resolve_locale(cfg);
 }
 
 double config_effective_ui_scale(const TuiTubeConfig *cfg) {
@@ -427,21 +497,45 @@ double config_effective_ui_scale(const TuiTubeConfig *cfg) {
 
 char *config_resolve_asset_path(const TuiTubeConfig *cfg, const char *rel_or_abs) {
     if (!cfg || !rel_or_abs || !rel_or_abs[0]) return NULL;
-    return tt_path_join(cfg->config_dir, rel_or_abs);
+    if (!tt_is_abs_path(rel_or_abs) && cfg->config_file_dir[0]) {
+        char *from_cfg_file = tt_path_join(cfg->config_file_dir, rel_or_abs);
+        if (from_cfg_file && tt_file_exists(from_cfg_file)) {
+            return from_cfg_file;
+        }
+        free(from_cfg_file);
+    }
+    char *primary = tt_path_join(cfg->config_dir, rel_or_abs);
+    if (!tt_is_abs_path(rel_or_abs) && (!primary || !tt_file_exists(primary)) && !cfg->portable_mode) {
+        char exe_dir[PATH_MAX];
+        if (tt_get_exe_dir(exe_dir, sizeof(exe_dir))) {
+            char *fallback = tt_path_join(exe_dir, rel_or_abs);
+            if (fallback && tt_file_exists(fallback)) {
+                free(primary);
+                return fallback;
+            }
+            free(fallback);
+        }
+    }
+    return primary;
 }
 
 char *config_resolve_download_dir(const TuiTubeConfig *cfg) {
     const char *env_home = getenv("HOME");
+#ifdef _WIN32
+    if (!env_home || !env_home[0]) env_home = getenv("USERPROFILE");
+    if (!env_home || !env_home[0]) env_home = getenv("TEMP");
+#endif
     const char *home = (env_home && env_home[0]) ? env_home : "/tmp";
 
     if (cfg && cfg->download_dir && cfg->download_dir[0]) {
         if (strcmp(cfg->download_dir, "~") == 0) {
             return tt_strdup(home);
         }
-        if (strncmp(cfg->download_dir, "~/", 2) == 0) {
+        if (cfg->download_dir[0] == '~' &&
+            (cfg->download_dir[1] == '/' || cfg->download_dir[1] == '\\')) {
             return tt_path_join(home, cfg->download_dir + 2);
         }
-        if (cfg->download_dir[0] == '/') {
+        if (tt_is_abs_path(cfg->download_dir)) {
             return tt_strdup(cfg->download_dir);
         }
         return tt_path_join(cfg->config_dir, cfg->download_dir);
@@ -452,7 +546,7 @@ char *config_resolve_download_dir(const TuiTubeConfig *cfg) {
     }
 
     const char *xdg_dl = getenv("XDG_DOWNLOAD_DIR");
-    if (xdg_dl && xdg_dl[0] == '/') {
+    if (xdg_dl && tt_is_abs_path(xdg_dl)) {
         return tt_strdup(xdg_dl);
     }
     return tt_path_join(home, "Downloads");
@@ -496,6 +590,33 @@ static void replace_str_field(yyjson_val *obj, const char *key, char **dst) {
     }
 }
 
+static void trim_ascii_and_outer_quotes_inplace(char *s) {
+    if (!s) return;
+    size_t len = strlen(s);
+    size_t start = 0;
+    while (start < len && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n')) {
+        start++;
+    }
+    while (len > start && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r' || s[len - 1] == '\n')) {
+        len--;
+    }
+    if (len - start >= 2 && s[start] == '"' && s[len - 1] == '"') {
+        start++;
+        len--;
+        while (start < len && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n')) {
+            start++;
+        }
+        while (len > start && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r' || s[len - 1] == '\n')) {
+            len--;
+        }
+    }
+    size_t out_len = len - start;
+    if (start > 0 && out_len > 0) {
+        memmove(s, s + start, out_len);
+    }
+    s[out_len] = '\0';
+}
+
 static void read_bool_field(yyjson_val *obj, const char *key, bool *dst) {
     yyjson_val *v = yyjson_obj_get(obj, key);
     if (v && yyjson_is_bool(v)) {
@@ -503,19 +624,69 @@ static void read_bool_field(yyjson_val *obj, const char *key, bool *dst) {
     }
 }
 
+static void copy_parent_dir(const char *path, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return;
+    out[0] = '\0';
+    if (!path || !path[0]) return;
+    const char *last_sep = NULL;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') last_sep = p;
+    }
+    if (!last_sep) return;
+    size_t dlen = (size_t)(last_sep - path);
+    if (dlen == 0) {
+        if (out_cap >= 2) {
+            out[0] = '/';
+            out[1] = '\0';
+        }
+        return;
+    }
+#ifdef _WIN32
+    if (dlen == 2 && isalpha((unsigned char)path[0]) && path[1] == ':') {
+        dlen = 3;
+    }
+#endif
+    if (dlen >= out_cap) return;
+    memcpy(out, path, dlen);
+    out[dlen] = '\0';
+}
+
 bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
+    return config_load_from(cfg, cli_config_dir, NULL);
+}
+
+bool config_load_from(TuiTubeConfig *cfg, const char *cli_config_dir,
+                      const char *override_config_file) {
     config_init_defaults(cfg);
     tt_resolve_paths(cli_config_dir,
                      cfg->config_dir, sizeof(cfg->config_dir),
                      cfg->cache_dir, sizeof(cfg->cache_dir),
                      &cfg->portable_mode);
 
-    char *cfg_path = tt_path_join(cfg->config_dir, "tuitube.json");
-    if (!cfg_path) return false;
-
     size_t len = 0;
-    char *raw = tt_read_file(cfg_path, &len);
-    free(cfg_path);
+    char *raw = NULL;
+    if (override_config_file && override_config_file[0]) {
+        raw = tt_read_file(override_config_file, &len);
+        if (raw) {
+            copy_parent_dir(override_config_file, cfg->config_file_dir, sizeof(cfg->config_file_dir));
+        }
+    }
+    if (!raw) {
+        char *cfg_path = tt_path_join(cfg->config_dir, "tuitube.json");
+        if (!cfg_path) return false;
+        raw = tt_read_file(cfg_path, &len);
+        free(cfg_path);
+    }
+    if (!raw && (!cli_config_dir || !cli_config_dir[0]) && !cfg->portable_mode) {
+        char exe_dir[PATH_MAX];
+        if (tt_get_exe_dir(exe_dir, sizeof(exe_dir))) {
+            char *fallback_path = tt_path_join(exe_dir, "tuitube.json");
+            if (fallback_path) {
+                raw = tt_read_file(fallback_path, &len);
+                free(fallback_path);
+            }
+        }
+    }
     if (!raw) {
         return true; /* Missing config file -> use defaults cleanly */
     }
@@ -532,6 +703,9 @@ bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
         yyjson_doc_free(doc);
         return false;
     }
+
+    replace_str_field(root, "language", &cfg->language);
+    replace_str_field(root, "region", &cfg->region);
 
     yyjson_val *v = yyjson_obj_get(root, "scale");
     if (v && yyjson_is_num(v)) {
@@ -550,6 +724,9 @@ bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
     if (v && yyjson_is_num(v)) cfg->playlist_width = clamp_int((int)yyjson_get_sint(v), 200, 1200);
 
     replace_str_field(root, "player_path", &cfg->player_path);
+    replace_str_field(root, "ytdlp_path", &cfg->ytdlp_path);
+    trim_ascii_and_outer_quotes_inplace(cfg->ytdlp_path);
+    cfg->has_ytdlp_path = (cfg->ytdlp_path && cfg->ytdlp_path[0] != '\0');
     yyjson_val *vf = yyjson_obj_get(root, "video_format");
     if (vf && yyjson_is_str(vf) && yyjson_get_str(vf)[0] != '\0') {
         cfg->has_video_format = true;
@@ -617,13 +794,17 @@ bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir) {
     if (!config_apply_theme(cfg, cfg->theme_name)) {
         theme_init_builtin(&cfg->theme, "dark");
     }
+    config_resolve_locale(cfg);
     return true;
 }
 
 void config_free(TuiTubeConfig *cfg) {
     if (!cfg) return;
+    free(cfg->language);
+    free(cfg->region);
     free(cfg->font);
     free(cfg->player_path);
+    free(cfg->ytdlp_path);
     free(cfg->video_format);
     free(cfg->sub_language);
     free(cfg->theme_name);
@@ -633,4 +814,194 @@ void config_free(TuiTubeConfig *cfg) {
     free(cfg->download_dir);
     free(cfg->key_bindings);
     memset(cfg, 0, sizeof(*cfg));
+}
+
+bool config_mpv_key_name(xkb_keysym_t sym, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return false;
+    out[0] = '\0';
+
+    int n = -1;
+    if (sym >= XKB_KEY_A && sym <= XKB_KEY_Z) {
+        n = snprintf(out, out_cap, "%c", (char)(sym - XKB_KEY_A + 'a'));
+    } else if (sym >= XKB_KEY_a && sym <= XKB_KEY_z) {
+        n = snprintf(out, out_cap, "%c", (char)sym);
+    } else if (sym >= XKB_KEY_0 && sym <= XKB_KEY_9) {
+        n = snprintf(out, out_cap, "%c", (char)sym);
+    } else if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F12) {
+        n = snprintf(out, out_cap, "F%u", (unsigned)(sym - XKB_KEY_F1 + 1));
+    } else {
+        const char *named = NULL;
+        switch (sym) {
+            case XKB_KEY_Escape:       named = "ESC"; break;
+            case XKB_KEY_Return:
+            case XKB_KEY_KP_Enter:     named = "ENTER"; break;
+            case XKB_KEY_Tab:          named = "TAB"; break;
+            case XKB_KEY_BackSpace:    named = "BS"; break;
+            case XKB_KEY_Delete:       named = "DEL"; break;
+            case XKB_KEY_Insert:       named = "INS"; break;
+            case XKB_KEY_Left:         named = "LEFT"; break;
+            case XKB_KEY_Right:        named = "RIGHT"; break;
+            case XKB_KEY_Up:           named = "UP"; break;
+            case XKB_KEY_Down:         named = "DOWN"; break;
+            case XKB_KEY_Page_Up:      named = "PGUP"; break;
+            case XKB_KEY_Page_Down:    named = "PGDWN"; break;
+            case XKB_KEY_Home:         named = "HOME"; break;
+            case XKB_KEY_End:          named = "END"; break;
+            case XKB_KEY_space:        named = "SPACE"; break;
+            case XKB_KEY_apostrophe:   named = "'"; break;
+            case XKB_KEY_comma:        named = ","; break;
+            case XKB_KEY_minus:        named = "-"; break;
+            case XKB_KEY_period:       named = "."; break;
+            case XKB_KEY_slash:        named = "/"; break;
+            case XKB_KEY_question:     named = "?"; break;
+            case XKB_KEY_semicolon:    named = ";"; break;
+            case XKB_KEY_equal:        named = "="; break;
+            case XKB_KEY_bracketleft:  named = "["; break;
+            case XKB_KEY_bracketright: named = "]"; break;
+            case XKB_KEY_backslash:    named = "\\"; break;
+            case XKB_KEY_grave:        named = "`"; break;
+            default:                   return false;
+        }
+        n = snprintf(out, out_cap, "%s", named);
+    }
+
+    if (n < 0 || (size_t)n >= out_cap) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static void sanitize_close_win_cmd(const char *close_win_cmd,
+                                   const char **out_start,
+                                   size_t *out_len) {
+    static const char fallback[] = "quit";
+    *out_start = fallback;
+    *out_len = sizeof(fallback) - 1u;
+
+    if (!close_win_cmd) return;
+
+    for (const char *p = close_win_cmd; *p != '\0'; p++) {
+        if (*p == '\n' || *p == '\r') return;
+    }
+
+    const char *start = close_win_cmd;
+    while (*start == ' ' || *start == '\t') start++;
+
+    size_t len = strlen(start);
+    while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t')) {
+        len--;
+    }
+
+    if (len == 0 || start[0] == '#') return;
+    if (len == 6 && tt_strncasecmp(start, "ignore", 6) == 0) return;
+    if (len == 4 && tt_strncasecmp(start, "noop", 4) == 0) return;
+    if (len >= 5 && tt_strncasecmp(start + (len - 5), "/noop", 5) == 0) return;
+
+    *out_start = start;
+    *out_len = len;
+}
+
+bool config_build_mpv_overlay_section(const TuiTubeConfig *cfg,
+                                      const char *client_name,
+                                      const char *close_win_cmd,
+                                      StrBuf *out) {
+    if (!out) return false;
+    sb_clear(out);
+
+    const char *cname = (client_name && client_name[0]) ? client_name : "tuitube";
+
+    const char *close_slice = NULL;
+    size_t close_len = 0;
+    sanitize_close_win_cmd(close_win_cmd, &close_slice, &close_len);
+
+    bool ok = sb_append(out, "CLOSE_WIN ") &&
+              sb_append_n(out, close_slice, close_len) &&
+              sb_append_char(out, '\n');
+
+    /* Mouse bindings */
+    ok = ok && sb_appendf(out, "MOUSE_MOVE script-binding %s/mouse_move\n", cname);
+    ok = ok && sb_appendf(out, "MOUSE_LEAVE script-binding %s/mouse_leave\n", cname);
+
+    static const char *const mouse_btns[] = {
+        "MBTN_LEFT", "MBTN_LEFT_DBL", "MBTN_RIGHT",
+        "MBTN_MID", "MBTN_BACK", "MBTN_FORWARD"
+    };
+    for (size_t i = 0; ok && i < sizeof(mouse_btns) / sizeof(mouse_btns[0]); i++) {
+        ok = sb_appendf(out, "%s script-binding %s/input\n", mouse_btns[i], cname);
+    }
+
+    static const char *const wheel_btns[] = {
+        "WHEEL_UP", "WHEEL_DOWN", "WHEEL_LEFT", "WHEEL_RIGHT"
+    };
+    for (size_t i = 0; ok && i < sizeof(wheel_btns) / sizeof(wheel_btns[0]); i++) {
+        ok = sb_appendf(out, "%s repeatable script-binding %s/input\n", wheel_btns[i], cname);
+    }
+
+    /* Toggle shortcut inside overlay */
+    ok = ok && sb_appendf(out, "F12 script-binding %s/toggle\n", cname);
+
+    /* Printable / Unicode / IME */
+    ok = ok && sb_appendf(out, "ANY_UNICODE repeatable script-binding %s/input\n", cname);
+    ok = ok && sb_appendf(out, "SPACE repeatable script-binding %s/input\n", cname);
+    ok = ok && sb_appendf(out, "SHARP repeatable script-binding %s/input\n", cname);
+    ok = ok && sb_appendf(out, "KP_DIVIDE repeatable script-binding %s/input\n", cname);
+
+    /* Navigation & editing keys across modifier prefixes */
+    static const char *const mod_prefixes[] = {
+        "", "Shift+", "Ctrl+", "Alt+", "Ctrl+Shift+", "Ctrl+Alt+"
+    };
+    static const struct { const char *key; bool rep; } nav_keys[] = {
+        {"ESC", false}, {"ENTER", false}, {"KP_ENTER", false}, {"TAB", false},
+        {"BS", true}, {"DEL", true}, {"INS", false},
+        {"UP", true}, {"DOWN", true}, {"LEFT", true}, {"RIGHT", true},
+        {"PGUP", true}, {"PGDWN", true}, {"HOME", false}, {"END", false},
+        {"F1", false}, {"F2", false}, {"F3", false}, {"F4", false},
+        {"F5", false}, {"F6", false}, {"F7", false}, {"F8", false},
+        {"F9", false}, {"F10", false}, {"F11", false}
+    };
+    for (size_t m = 0; ok && m < sizeof(mod_prefixes) / sizeof(mod_prefixes[0]); m++) {
+        for (size_t k = 0; ok && k < sizeof(nav_keys) / sizeof(nav_keys[0]); k++) {
+            ok = sb_appendf(out, "%s%s%s script-binding %s/input\n",
+                            mod_prefixes[m], nav_keys[k].key,
+                            nav_keys[k].rep ? " repeatable" : "", cname);
+        }
+    }
+
+    /* Modified printable shortcuts */
+    for (char c = 'a'; ok && c <= 'z'; c++) {
+        ok = sb_appendf(out, "Ctrl+%c script-binding %s/input\n", c, cname) &&
+             sb_appendf(out, "Ctrl+Shift+%c script-binding %s/input\n", c, cname);
+    }
+    static const char *const ctrl_punct[] = {
+        "[", "]", "/", "-", "=", "\\", ";", "'", ",", "."
+    };
+    for (size_t i = 0; ok && i < sizeof(ctrl_punct) / sizeof(ctrl_punct[0]); i++) {
+        ok = sb_appendf(out, "Ctrl+%s script-binding %s/input\n", ctrl_punct[i], cname);
+    }
+
+    /* Additional configured modifier+key combinations (no WM shortcuts hardcoded) */
+    if (cfg) {
+        for (size_t i = 0; ok && i < cfg->key_binding_count; i++) {
+            const KeyBinding *kb = &cfg->key_bindings[i];
+            if (kb->mods == 0) continue;
+            char kname[16];
+            if (!config_mpv_key_name(kb->keysym, kname, sizeof(kname))) continue;
+            ok = sb_appendf(out, "%s%s%s%s%s script-binding %s/input\n",
+                            (kb->mods & TT_MOD_CTRL) ? "Ctrl+" : "",
+                            (kb->mods & TT_MOD_ALT) ? "Alt+" : "",
+                            (kb->mods & TT_MOD_SHIFT) ? "Shift+" : "",
+                            (kb->mods & TT_MOD_SUPER) ? "Meta+" : "",
+                            kname, cname);
+        }
+    }
+
+    /* Catch-all so unmapped keys never leak to mpv while exclusive */
+    ok = ok && sb_appendf(out, "UNMAPPED repeatable script-binding %s/noop\n", cname);
+
+    if (!ok || !out->data) {
+        sb_free(out);
+        return false;
+    }
+    return true;
 }

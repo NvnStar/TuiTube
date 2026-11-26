@@ -629,6 +629,16 @@ static void cb_select_item(void *ctx, size_t index) {
     }
 }
 
+static bool is_vlc_player_name(const char *player_path) {
+    if (!player_path) return false;
+    const char *slash = strrchr(player_path, '/');
+    const char *bslash = strrchr(player_path, '\\');
+    const char *sep = slash;
+    if (bslash && (!sep || bslash > sep)) sep = bslash;
+    const char *base = sep ? sep + 1 : player_path;
+    return tt_strcasecmp(base, "vlc") == 0 || tt_strcasecmp(base, "vlc.exe") == 0;
+}
+
 static void cb_activate_item(void *ctx, size_t index) {
     AppState *app = ctx;
     MediaList *ml = ui_get_list(app->ui);
@@ -641,9 +651,25 @@ static void cb_activate_item(void *ctx, size_t index) {
             const char *pname = app->player_label[0]
                                     ? app->player_label
                                     : (app->cfg.player_path ? app->cfg.player_path : "mpv");
-            ui_set_status(app->ui, "Launched %s: %s",
-                          pname,
-                          (it->title && it->title[0]) ? it->title : it->id);
+            const char *vtitle = (it->title && it->title[0]) ? it->title : it->id;
+            bool warn_ytdlp = false;
+            bool has_custom_ytdlp = (app->cfg.ytdlp_path && app->cfg.ytdlp_path[0] != '\0');
+            if ((!app->player_label[0] && !is_vlc_player_name(pname)) || has_custom_ytdlp) {
+                bool has_ytdlp = true;
+                player_check_deps(&app->cfg, NULL, &has_ytdlp);
+                warn_ytdlp = !has_ytdlp;
+            }
+            if (warn_ytdlp && has_custom_ytdlp) {
+                ui_set_status(app->ui,
+                              "Launched %s: %s (warning: ytdlp_path '%s' not found)",
+                              pname, vtitle, app->cfg.ytdlp_path);
+            } else if (warn_ytdlp) {
+                ui_set_status(app->ui,
+                              "Launched %s: %s (warning: yt-dlp not found — install yt-dlp or set ytdlp_path)",
+                              pname, vtitle);
+            } else {
+                ui_set_status(app->ui, "Launched %s: %s", pname, vtitle);
+            }
             if (app->cfg.save_history) {
                 history_record(&app->history, it, (int64_t)time(NULL));
                 char *hp = history_path(app);
@@ -832,6 +858,12 @@ static void cb_request_thumb(void *ctx, const char *key, const char *url) {
 
 bool app_init(AppState *app, const char *cli_config_dir, WaylandApp *wl,
               AppPlayVideoFn play_fn, void *play_ctx, const char *player_display_name) {
+    return app_init_ex(app, cli_config_dir, NULL, wl, play_fn, play_ctx, player_display_name);
+}
+
+bool app_init_ex(AppState *app, const char *cli_config_dir, const char *override_config_file,
+                 WaylandApp *wl, AppPlayVideoFn play_fn, void *play_ctx,
+                 const char *player_display_name) {
     if (!app) return false;
     memset(app, 0, sizeof(*app));
     app->wl = wl;
@@ -842,9 +874,19 @@ bool app_init(AppState *app, const char *cli_config_dir, WaylandApp *wl,
     }
 
     nav_stack_init(&app->nav_stack);
-    if (!config_load(&app->cfg, cli_config_dir)) {
+    if (!config_load_from(&app->cfg, cli_config_dir, override_config_file)) {
         fprintf(stderr, "Warning: failed to parse config file, using defaults\n");
     }
+    innertube_set_locale(app->cfg.resolved_hl, app->cfg.resolved_gl);
+    char *resolved_ytdlp = player_resolve_ytdlp_path(&app->cfg, NULL);
+    if (resolved_ytdlp) {
+        innertube_set_ytdlp_path(resolved_ytdlp);
+    } else if (app->cfg.ytdlp_path && app->cfg.ytdlp_path[0]) {
+        innertube_set_ytdlp_path(app->cfg.ytdlp_path);
+    } else {
+        innertube_set_ytdlp_path(NULL);
+    }
+    free(resolved_ytdlp);
 
     favlist_init(&app->favs);
     char *fp = favlist_path(app);
@@ -893,6 +935,40 @@ bool app_init(AppState *app, const char *cli_config_dir, WaylandApp *wl,
     }
 
     sync_ui_nav(app);
+
+    bool has_player = true;
+    bool has_ytdlp = true;
+    player_check_deps(&app->cfg, &has_player, &has_ytdlp);
+    bool is_plugin = (app->player_label[0] != '\0');
+    const char *pname = is_plugin
+                            ? app->player_label
+                            : ((app->cfg.player_path && app->cfg.player_path[0]) ? app->cfg.player_path : "mpv");
+    bool is_vlc = !is_plugin && is_vlc_player_name(pname);
+    bool has_custom_ytdlp = (app->cfg.ytdlp_path && app->cfg.ytdlp_path[0] != '\0');
+
+    if (has_custom_ytdlp && !has_ytdlp) {
+        if (!is_plugin && !has_player) {
+            ui_set_status(app->ui,
+                          "Warning: %s and ytdlp_path '%s' not found — check tuitube.json",
+                          pname, app->cfg.ytdlp_path);
+        } else {
+            ui_set_status(app->ui,
+                          "Warning: ytdlp_path '%s' not found — check tuitube.json",
+                          app->cfg.ytdlp_path);
+        }
+    } else if (!is_plugin && !has_player && !has_ytdlp) {
+        ui_set_status(app->ui,
+                      "Warning: %s and yt-dlp not found — install both to play and download videos",
+                      pname);
+    } else if (!is_plugin && !has_player) {
+        ui_set_status(app->ui,
+                      "Warning: player '%s' not found in PATH — install mpv or set player_path in tuitube.json",
+                      pname);
+    } else if (!has_ytdlp && (is_plugin || !is_vlc)) {
+        ui_set_status(app->ui,
+                      "Warning: yt-dlp not found — install yt-dlp or set ytdlp_path in tuitube.json");
+    }
+
     return true;
 }
 
@@ -924,6 +1000,11 @@ void app_destroy(AppState *app) {
 int app_notify_fd(const AppState *app) {
     if (!app || !app->pool) return -1;
     return http_pool_notify_fd(app->pool);
+}
+
+void *app_notify_handle(const AppState *app) {
+    if (!app || !app->pool) return NULL;
+    return http_pool_notify_handle(app->pool);
 }
 
 void app_process_async_results(AppState *app) {

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'feat/**']
   pull_request:
 
 jobs:
@@ -46,3 +46,52 @@ jobs:
           make clean && make release
           h2=$(sha256sum ./tuitube | awk '{print $1}')
           test "$h1" = "$h2"
+
+  build-and-test-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-cairo
+            mingw-w64-ucrt-x86_64-pango
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-yyjson
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libpng
+
+      - name: Lint
+        run: make lint
+
+      - name: Build release & debug
+        run: make release && make debug
+
+      - name: Run unit tests & PE verification
+        run: make test
+
+      - name: Smoke test CLI
+        run: ./tuitube.exe --help
+
+      - name: Stage Windows portable bundle
+        run: |
+          mkdir -p dist/tuitube-windows-x64/examples
+          cp tuitube.exe tuitube.dll README.md LICENSE dist/tuitube-windows-x64/
+          cp examples/tuitube.json examples/sample_theme.json dist/tuitube-windows-x64/examples/
+          ldd ./tuitube.exe ./tuitube.dll | awk '/\/ucrt64\/bin\// {print $3}' | sort -u | xargs -r cp -t dist/tuitube-windows-x64/
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuitube-windows-x64
+          path: dist/tuitube-windows-x64

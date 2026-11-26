@@ -52,6 +52,12 @@ typedef struct {
     bool prefer_live_tab;
 } ParsedUrl;
 
+void innertube_set_locale(const char *hl, const char *gl);
+void innertube_get_locale(char *out_hl, size_t hl_cap, char *out_gl, size_t gl_cap);
+bool innertube_format_accept_language(const char *hl, char *out, size_t out_cap);
+void innertube_set_ytdlp_path(const char *path);
+void innertube_get_ytdlp_path(char *out, size_t out_cap);
+
 bool innertube_encode_search_params(SearchFilter filter, char *out, size_t out_cap);
 bool innertube_parse_input_url(const char *input, ParsedUrl *out);
 

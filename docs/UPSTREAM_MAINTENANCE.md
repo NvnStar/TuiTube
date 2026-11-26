@@ -54,9 +54,10 @@ Because TuiTube communicates directly with YouTube's undocumented InnerTube API 
 - Video playback fails to start or picks an unexpected resolution/codec.
 
 ### Where to Fix
+- `player_resolve_ytdlp_path()` and `player_build_mpv_ytdl_script_opt()` in `src/player.c` implement unified `yt-dlp` discovery (`"ytdlp_path"` override -> `<config_dir>` -> `<exe_dir>` -> `PATH` / Windows Registry / WinGet / Scoop / Chocolatey -> `<player_dir>`) and `ytdl_hook-ytdl_path` injection for both standalone `mpv` and `src/mpv_plugin.c`.
 - `player_map_video_format()` in `src/player.c` translates `video_format` (e.g. `1080p60`), `allow_hdr`, and `all_codecs` into `--ytdl-format=...` strings.
 - `player_launch()` in `src/player.c` builds `argv` for `mpv` and `vlc`.
-- Note: Most YouTube playback failures ("Sign in to confirm", HTTP 403 on video streams, SABR/n-sig errors) are resolved by upgrading `yt-dlp` rather than changing TuiTube.
+- Note: Most YouTube playback failures ("Sign in to confirm", HTTP 403 on video streams, SABR/n-sig errors) are resolved by upgrading `yt-dlp` rather than changing TuiTube. Users can bypass outdated system packages without modifying `PATH` by dropping a fresh `yt-dlp` binary into `<config_dir>` (`~/.config/tuitube/yt-dlp` or `%APPDATA%\tuitube\yt-dlp.exe`) or setting `"ytdlp_path"` in `tuitube.json`.
 
 ---
 

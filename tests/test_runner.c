@@ -8,13 +8,123 @@
 
 #include <assert.h>
 #include <math.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <poll.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 static int g_tests_run = 0;
+
+static void test_temp_base(char *out, size_t cap) {
+#ifdef _WIN32
+    wchar_t wtmp[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, wtmp);
+    if (n > 0 && n < MAX_PATH) {
+        char *utf8 = tt_wide_to_utf8(wtmp);
+        if (utf8) {
+            size_t len = strlen(utf8);
+            while (len > 1 && (utf8[len - 1] == '\\' || utf8[len - 1] == '/')) {
+                if (len == 3 && utf8[1] == ':') break;
+                utf8[--len] = '\0';
+            }
+            snprintf(out, cap, "%s", utf8);
+            free(utf8);
+            return;
+        }
+    }
+    snprintf(out, cap, ".");
+#else
+    snprintf(out, cap, "/tmp");
+#endif
+}
+
+static void test_make_temp_dir(const char *prefix, char *out, size_t cap) {
+#ifdef _WIN32
+    static unsigned long seq = 0;
+    char base[PATH_MAX];
+    test_temp_base(base, sizeof(base));
+    snprintf(out, cap, "%s/%s_%lu_%lu", base, prefix,
+             (unsigned long)GetCurrentProcessId(), ++seq);
+    assert(tt_mkdir_p(out, 0755));
+#else
+    snprintf(out, cap, "/tmp/%s_XXXXXX", prefix);
+    assert(mkdtemp(out) != NULL);
+#endif
+}
+
+static void test_make_temp_file(const char *name, char *out, size_t cap) {
+    char base[PATH_MAX];
+    test_temp_base(base, sizeof(base));
+    snprintf(out, cap, "%s/%s", base, name);
+}
+
+static void test_unlink_file(const char *path) {
+#ifdef _WIN32
+    wchar_t *w = tt_utf8_to_wide(path);
+    if (w) {
+        DeleteFileW(w);
+        free(w);
+    }
+#else
+    unlink(path);
+#endif
+}
+
+static void test_rmdir(const char *path) {
+#ifdef _WIN32
+    wchar_t *w = tt_utf8_to_wide(path);
+    if (w) {
+        RemoveDirectoryW(w);
+        free(w);
+    }
+#else
+    rmdir(path);
+#endif
+}
+
+static bool test_same_file_path(const char *a, const char *b) {
+    if (!a || !b) return false;
+#ifdef _WIN32
+    wchar_t *wa = tt_utf8_to_wide(a);
+    wchar_t *wb = tt_utf8_to_wide(b);
+    if (!wa || !wb) {
+        free(wa);
+        free(wb);
+        return false;
+    }
+    HANDLE ha = CreateFileW(wa, 0,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hb = CreateFileW(wb, 0,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wa);
+    free(wb);
+    if (ha == INVALID_HANDLE_VALUE || hb == INVALID_HANDLE_VALUE) {
+        if (ha != INVALID_HANDLE_VALUE) CloseHandle(ha);
+        if (hb != INVALID_HANDLE_VALUE) CloseHandle(hb);
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION ia, ib;
+    bool ok = GetFileInformationByHandle(ha, &ia) &&
+              GetFileInformationByHandle(hb, &ib) &&
+              ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber &&
+              ia.nFileIndexHigh == ib.nFileIndexHigh &&
+              ia.nFileIndexLow == ib.nFileIndexLow;
+    CloseHandle(ha);
+    CloseHandle(hb);
+    return ok;
+#else
+    return strcmp(a, b) == 0;
+#endif
+}
 
 #define RUN_TEST(fn) do { \
     printf("Running %-42s ... ", #fn); \
@@ -341,10 +451,10 @@ static void test_config_theme_and_keybindings(void) {
     assert(theme_contrast_ratio(custom_theme.text_normal.fg, custom_theme.text_normal.bg) >= 4.5);
 
     /* Temporary config directory */
-    char tmpdir[] = "/tmp/tuitube_test_cfg_XXXXXX";
-    assert(mkdtemp(tmpdir) != NULL);
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_cfg", tmpdir, sizeof(tmpdir));
 
-    char cfg_file[256];
+    char cfg_file[PATH_MAX + 32];
     snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
     const char *cfg_json =
         "{\n"
@@ -374,8 +484,8 @@ static void test_config_theme_and_keybindings(void) {
     assert(config_match_keybinding(&cfg, TT_MOD_CTRL, XKB_KEY_q) == ACT_QUIT);
 
     config_free(&cfg);
-    unlink(cfg_file);
-    rmdir(tmpdir);
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
 }
 
 static void test_player_format_mapping(void) {
@@ -403,21 +513,23 @@ static void test_player_format_mapping(void) {
 
 static void test_model_favlist_and_history_persistence(void) {
     /* Load favlist containing [null] entries cleanly */
-    char null_fav_path[] = "/tmp/tuitube_test_fav_null.json";
+    char null_fav_path[PATH_MAX];
+    test_make_temp_file("tuitube_test_fav_null.json", null_fav_path, sizeof(null_fav_path));
     const char *null_json = "[\n  null\n]\n";
     assert(tt_write_file_atomic(null_fav_path, null_json, strlen(null_json)));
     FavoriteList fl;
     favlist_init(&fl);
     assert(favlist_load(&fl, null_fav_path));
     assert(fl.count == 0);
-    unlink(null_fav_path);
+    test_unlink_file(null_fav_path);
 
     FavoriteItem f1 = {.kind = ITEM_CHANNEL, .title = "Ch One", .thumbnail_url = "https://x/1.jpg"};
     snprintf(f1.id, sizeof(f1.id), "UC123");
     assert(favlist_add(&fl, &f1));
     assert(favlist_contains(&fl, "UC123"));
 
-    char fav_path[] = "/tmp/tuitube_test_fav.json";
+    char fav_path[PATH_MAX];
+    test_make_temp_file("tuitube_test_fav.json", fav_path, sizeof(fav_path));
     assert(favlist_save(&fl, fav_path));
     favlist_free(&fl);
 
@@ -427,7 +539,7 @@ static void test_model_favlist_and_history_persistence(void) {
     assert(favlist_remove(&fl, "UC123"));
     assert(!favlist_contains(&fl, "UC123"));
     favlist_free(&fl);
-    unlink(fav_path);
+    test_unlink_file(fav_path);
 
     /* History deduplication & round-trip */
     HistoryList hl;
@@ -445,7 +557,8 @@ static void test_model_favlist_and_history_persistence(void) {
     assert(hl.items[0].watched_at == 300);
     assert(history_contains(&hl, "vidB"));
 
-    char hist_path[] = "/tmp/tuitube_test_hist.json";
+    char hist_path[PATH_MAX];
+    test_make_temp_file("tuitube_test_hist.json", hist_path, sizeof(hist_path));
     assert(history_save(&hl, hist_path));
     history_free(&hl);
 
@@ -453,7 +566,7 @@ static void test_model_favlist_and_history_persistence(void) {
     assert(history_load(&hl, hist_path));
     assert(hl.count == 2 && strcmp(hl.items[0].video_id, "vidA") == 0);
     history_free(&hl);
-    unlink(hist_path);
+    test_unlink_file(hist_path);
 }
 
 static void test_image_decoding_and_mascot(void) {
@@ -466,7 +579,8 @@ static void test_image_decoding_and_mascot(void) {
     assert(!image_decode_bytes(png_bad, sizeof(png_bad), &buf));
 
     /* Generate a valid 2x2 PNG via Cairo and verify round-trip decoding */
-    char png_path[] = "/tmp/tuitube_test_icon.png";
+    char png_path[PATH_MAX];
+    test_make_temp_file("tuitube_test_icon.png", png_path, sizeof(png_path));
     cairo_surface_t *gen = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 2, 2);
     assert(cairo_surface_write_to_png(gen, png_path) == CAIRO_STATUS_SUCCESS);
     cairo_surface_destroy(gen);
@@ -476,7 +590,7 @@ static void test_image_decoding_and_mascot(void) {
     assert(cairo_image_surface_get_width(surf) == 2);
     assert(cairo_image_surface_get_height(surf) == 2);
     cairo_surface_destroy(surf);
-    unlink(png_path);
+    test_unlink_file(png_path);
 }
 
 static void assert_theme_wcag_aa(const char *name) {
@@ -503,8 +617,8 @@ static void test_wcag_themes_and_default_dark(void) {
     assert_theme_wcag_aa("yuuka");
 
     /* Missing config directory defaults to "dark" */
-    char tmpdir[] = "/tmp/tuitube_test_def_XXXXXX";
-    assert(mkdtemp(tmpdir) != NULL);
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_def", tmpdir, sizeof(tmpdir));
     TuiTubeConfig cfg;
     assert(config_load(&cfg, tmpdir));
     assert(strcmp(cfg.theme_name, "dark") == 0);
@@ -518,7 +632,7 @@ static void test_wcag_themes_and_default_dark(void) {
     cfg.scale = 5.0;  assert(config_effective_ui_scale(&cfg) == 3.0);
 
     config_free(&cfg);
-    rmdir(tmpdir);
+    test_rmdir(tmpdir);
 }
 
 static void test_new_keybindings_and_formatting(void) {
@@ -785,12 +899,21 @@ static void test_http_pool_detail_gen_independence(void) {
     assert(http_pool_submit(pool, JOB_DETAIL, 0, a2, pool_test_work, free, free));
     assert(http_pool_submit(pool, JOB_DETAIL, 1, a3, pool_test_work, free, free));
 
+#ifdef _WIN32
+    HANDLE nh = (HANDLE)http_pool_notify_handle(pool);
+    assert(nh != NULL);
+    bool got_valid = false;
+    for (int iter = 0; iter < 50 && !got_valid; iter++) {
+        WaitForSingleObject(nh, 100);
+        http_pool_drain_notify(pool);
+#else
     int nfd = http_pool_notify_fd(pool);
     bool got_valid = false;
     for (int iter = 0; iter < 50 && !got_valid; iter++) {
         struct pollfd pfd = {.fd = nfd, .events = POLLIN};
         poll(&pfd, 1, 100);
         http_pool_drain_notify(pool);
+#endif
         HttpResult res;
         while (http_pool_pop_result(pool, &res)) {
             if (res.kind == RES_JOB_DONE && res.job_type == JOB_DETAIL && res.request_gen == 1) {
@@ -809,10 +932,10 @@ static void test_http_pool_detail_gen_independence(void) {
 }
 
 static void test_config_members_only_and_download(void) {
-    char tmpdir[] = "/tmp/tuitube_test_dl_XXXXXX";
-    assert(mkdtemp(tmpdir) != NULL);
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_dl", tmpdir, sizeof(tmpdir));
 
-    char cfg_file[256];
+    char cfg_file[PATH_MAX + 32];
     snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
     const char *cfg_json =
         "{\n"
@@ -856,8 +979,8 @@ static void test_config_members_only_and_download(void) {
     free(resolved);
     config_free(&cfg);
 
-    unlink(cfg_file);
-    rmdir(tmpdir);
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
 
     /* Download progress template parsing */
     double p = -1.0;
@@ -977,7 +1100,7 @@ static void test_mpv_osd_dims_and_script_opts(void) {
 
     /* Underscore key & ~ expansion */
     assert(tt_mpv_parse_script_opt_config_dir("tuitube_config_dir=~/my_tuitube", dir, sizeof(dir)));
-    assert(strstr(dir, "/my_tuitube") != NULL && dir[0] == '/');
+    assert(strstr(dir, "/my_tuitube") != NULL && tt_is_abs_path(dir));
 
     /* Buffer too small */
     char tiny[8];
@@ -1050,10 +1173,10 @@ static void test_mpv_key_mouse_and_unicode_parsing(void) {
 }
 
 static void test_config_explicit_format_and_slang_flags(void) {
-    char tmpdir[] = "/tmp/tuitube_test_mpvcfg_XXXXXX";
-    assert(mkdtemp(tmpdir) != NULL);
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_mpvcfg", tmpdir, sizeof(tmpdir));
 
-    char cfg_file[256];
+    char cfg_file[PATH_MAX + 32];
     snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
 
     /* Absent -> has_video_format == false, has_sub_language == false */
@@ -1083,13 +1206,13 @@ static void test_config_explicit_format_and_slang_flags(void) {
     assert(strcmp(cfg.sub_language, "ja,en") == 0);
     config_free(&cfg);
 
-    unlink(cfg_file);
-    rmdir(tmpdir);
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
 }
 
 static void test_thumb_cache_flush_ram_and_drop_jobs(void) {
-    char tmpdir[] = "/tmp/tuitube_test_tc_XXXXXX";
-    assert(mkdtemp(tmpdir) != NULL);
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_tc", tmpdir, sizeof(tmpdir));
 
     ThumbCache *tc = thumb_cache_create(tmpdir);
     assert(tc != NULL);
@@ -1113,13 +1236,747 @@ static void test_thumb_cache_flush_ram_and_drop_jobs(void) {
 
     thumb_cache_clear(tc);
     thumb_cache_destroy(tc);
-    rmdir(tmpdir);
+    test_rmdir(tmpdir);
 
     /* Drop queued thumbnail jobs cleanly */
     HttpPool *pool = http_pool_create(1);
     assert(pool != NULL);
     http_pool_drop_thumbnails(pool);
     http_pool_destroy(pool);
+}
+
+static void test_win32_cmdline_quoting(void) {
+    StrBuf sb;
+    sb_init(&sb);
+
+    assert(tt_win32_quote_arg("yt-dlp", &sb));
+    assert(strcmp(sb.data, "yt-dlp") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("", &sb));
+    assert(strcmp(sb.data, "\"\"") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("hello world", &sb));
+    assert(strcmp(sb.data, "\"hello world\"") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("say \"hi\"", &sb));
+    assert(strcmp(sb.data, "\"say \\\"hi\\\"\"") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("C:\\Users\\test\\file.mp4", &sb));
+    assert(strcmp(sb.data, "C:\\Users\\test\\file.mp4") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("C:\\Program Files\\mpv\\mpv.exe", &sb));
+    assert(strcmp(sb.data, "\"C:\\Program Files\\mpv\\mpv.exe\"") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("a\\\"b", &sb));
+    assert(strcmp(sb.data, "\"a\\\\\\\"b\"") == 0);
+
+    sb_clear(&sb);
+    assert(tt_win32_quote_arg("C:\\my dir\\", &sb));
+    assert(strcmp(sb.data, "\"C:\\my dir\\\\\"") == 0);
+    sb_free(&sb);
+
+    const char *argv[] = {
+        "C:\\Program Files\\mpv\\mpv.exe",
+        "--force-media-title=a \"b\"\\",
+        "",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        NULL
+    };
+    char *cmd = tt_win32_build_cmdline(argv);
+    assert(cmd != NULL);
+    assert(strcmp(cmd,
+                  "\"C:\\Program Files\\mpv\\mpv.exe\" "
+                  "\"--force-media-title=a \\\"b\\\"\\\\\" "
+                  "\"\" "
+                  "https://www.youtube.com/watch?v=dQw4w9WgXcQ") == 0);
+    free(cmd);
+}
+
+static void test_windows_paths_and_script_opts(void) {
+    assert(tt_is_abs_path("/usr/local/bin"));
+    assert(tt_is_abs_path("C:/Users/alice"));
+    assert(tt_is_abs_path("D:\\Media\\yt"));
+    assert(tt_is_abs_path("C:"));
+    assert(tt_is_abs_path("\\\\server\\share\\folder"));
+    assert(!tt_is_abs_path(""));
+    assert(!tt_is_abs_path("relative/path"));
+    assert(!tt_is_abs_path("C:relative"));
+
+    char *j1 = tt_path_join("C:\\Users\\alice", "tuitube.json");
+    assert(j1 && strcmp(j1, "C:\\Users\\alice/tuitube.json") == 0);
+    free(j1);
+
+    char *j2 = tt_path_join("C:\\", "tuitube.json");
+    assert(j2 && strcmp(j2, "C:\\tuitube.json") == 0);
+    free(j2);
+
+    char *j3 = tt_path_join("C:\\Users\\alice", "D:\\override\\cfg.json");
+    assert(j3 && strcmp(j3, "D:\\override\\cfg.json") == 0);
+    free(j3);
+
+    char dir[PATH_MAX];
+    assert(tt_mpv_parse_script_opt_config_dir(
+        "foo=1,tuitube-config_dir=C:\\Users\\alice\\tuitube,bar=2", dir, sizeof(dir)));
+    assert(strcmp(dir, "C:\\Users\\alice\\tuitube") == 0);
+
+    assert(tt_mpv_parse_script_opt_config_dir(
+        "tuitube_config_dir=~\\win_cfg", dir, sizeof(dir)));
+    assert(strstr(dir, "\\win_cfg") != NULL && tt_is_abs_path(dir));
+}
+
+static void write_u16be(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)(v & 0xFFu);
+}
+
+static void write_u32be(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)((v >> 16) & 0xFFu);
+    p[2] = (uint8_t)((v >> 8) & 0xFFu);
+    p[3] = (uint8_t)(v & 0xFFu);
+}
+
+static void test_ttf_family_name_parser(void) {
+    char fam[128];
+
+    /* Invalid / corrupt / truncated inputs must fail safely */
+    assert(!tt_ttf_read_family_name(NULL, 100, fam, sizeof(fam)));
+    const uint8_t tiny[8] = {0};
+    assert(!tt_ttf_read_family_name(tiny, sizeof(tiny), fam, sizeof(fam)));
+    const uint8_t bad_magic[16] = {'B', 'A', 'D', '!'};
+    assert(!tt_ttf_read_family_name(bad_magic, sizeof(bad_magic), fam, sizeof(fam)));
+
+    /* Minimal SFNT with nameID=1 (Mac Roman) + nameID=16 (Win UTF-16BE English) */
+    uint8_t sfnt[256];
+    memset(sfnt, 0, sizeof(sfnt));
+    write_u32be(sfnt + 0, 0x00010000u);
+    write_u16be(sfnt + 4, 1); /* numTables */
+    /* Table record at offset 12: 'name' */
+    write_u32be(sfnt + 12, 0x6E616D65u);
+    write_u32be(sfnt + 20, 28);  /* offset */
+    write_u32be(sfnt + 24, 128); /* length */
+
+    /* 'name' header at 28 */
+    uint8_t *nt = sfnt + 28;
+    write_u16be(nt + 0, 0);
+    write_u16be(nt + 2, 2);  /* count */
+    write_u16be(nt + 4, 30); /* stringOffset = 6 + 2*12 */
+
+    /* Record 0: Mac Roman nameID=1 ("OldFam") */
+    write_u16be(nt + 6 + 0, 1);  /* platformID */
+    write_u16be(nt + 6 + 2, 0);  /* encodingID */
+    write_u16be(nt + 6 + 4, 0);  /* languageID */
+    write_u16be(nt + 6 + 6, 1);  /* nameID */
+    write_u16be(nt + 6 + 8, 6);  /* length */
+    write_u16be(nt + 6 + 10, 0); /* offset */
+    memcpy(nt + 30, "OldFam", 6);
+
+    /* Record 1: Windows Unicode BMP English nameID=16 ("JetBrains") */
+    const char *pref = "JetBrains";
+    size_t plen = strlen(pref);
+    write_u16be(nt + 18 + 0, 3);
+    write_u16be(nt + 18 + 2, 1);
+    write_u16be(nt + 18 + 4, 0x0409u);
+    write_u16be(nt + 18 + 6, 16);
+    write_u16be(nt + 18 + 8, (uint16_t)(plen * 2u));
+    write_u16be(nt + 18 + 10, 6);
+    for (size_t i = 0; i < plen; i++) {
+        write_u16be(nt + 30 + 6 + i * 2u, (uint16_t)(unsigned char)pref[i]);
+    }
+
+    assert(tt_ttf_read_family_name(sfnt, 28 + 128, fam, sizeof(fam)));
+    assert(strcmp(fam, "JetBrains") == 0);
+
+    /* Corrupt name table length past buffer -> must fail safely */
+    write_u32be(sfnt + 24, 99999u);
+    assert(!tt_ttf_read_family_name(sfnt, 28 + 128, fam, sizeof(fam)));
+    write_u32be(sfnt + 24, 128);
+
+    /* TTC ('ttcf') container pointing to an OTTO font with surrogate pair + UTF-8 */
+    uint8_t ttc[320];
+    memset(ttc, 0, sizeof(ttc));
+    write_u32be(ttc + 0, 0x74746366u); /* 'ttcf' */
+    write_u32be(ttc + 4, 0x00010000u);
+    write_u32be(ttc + 8, 1);  /* numFonts */
+    write_u32be(ttc + 12, 32); /* offset to font 0 */
+
+    uint8_t *f0 = ttc + 32;
+    write_u32be(f0 + 0, 0x4F54544Fu); /* 'OTTO' */
+    write_u16be(f0 + 4, 1);
+    write_u32be(f0 + 12, 0x6E616D65u);
+    write_u32be(f0 + 20, 32 + 28);
+    write_u32be(f0 + 24, 64);
+
+    uint8_t *nt2 = f0 + 28;
+    write_u16be(nt2 + 2, 1);
+    write_u16be(nt2 + 4, 18);
+    write_u16be(nt2 + 6 + 0, 3);
+    write_u16be(nt2 + 6 + 2, 10);
+    write_u16be(nt2 + 6 + 4, 0x0409u);
+    write_u16be(nt2 + 6 + 6, 1);
+    write_u16be(nt2 + 6 + 8, 6); /* 3 UTF-16 code units: U+1F3B5 + 'A' */
+    write_u16be(nt2 + 6 + 10, 0);
+    write_u16be(nt2 + 18 + 0, 0xD83Cu);
+    write_u16be(nt2 + 18 + 2, 0xDFB5u);
+    write_u16be(nt2 + 18 + 4, 'A');
+
+    assert(tt_ttf_read_family_name(ttc, sizeof(ttc), fam, sizeof(fam)));
+    assert(strcmp(fam, "\xF0\x9F\x8E\xB5" "A") == 0);
+}
+
+static void test_mpv_overlay_section_close_win_and_bindings(void) {
+    TuiTubeConfig cfg;
+    config_init_defaults(&cfg);
+
+    StrBuf sb;
+    sb_init(&sb);
+
+    /* 1. Default config & CLOSE_WIN fallback */
+    assert(config_build_mpv_overlay_section(&cfg, "tuitube", NULL, &sb));
+    assert(sb.data != NULL);
+    assert(strncmp(sb.data, "CLOSE_WIN quit\n", 15) == 0 ||
+           strstr(sb.data, "\nCLOSE_WIN quit\n") != NULL);
+
+    /* Sanitization fallbacks */
+    static const char *const invalid_cmds[] = {
+        "",
+        "   \t  ",
+        "ignore",
+        "IGNORE",
+        "# comment",
+        "quit\nset pause yes",
+        "quit\r\nset pause yes",
+        "noop",
+        "script-binding tuitube/noop"
+    };
+    for (size_t i = 0; i < sizeof(invalid_cmds) / sizeof(invalid_cmds[0]); i++) {
+        assert(config_build_mpv_overlay_section(&cfg, "tuitube", invalid_cmds[i], &sb));
+        assert(strncmp(sb.data, "CLOSE_WIN quit\n", 15) == 0 ||
+               strstr(sb.data, "\nCLOSE_WIN quit\n") != NULL);
+    }
+
+    /* CLOSE_WIN appears before UNMAPPED, and UNMAPPED is the final line */
+    const char *close_pos = strstr(sb.data, "CLOSE_WIN quit\n");
+    const char *unmapped_line = "UNMAPPED repeatable script-binding tuitube/noop\n";
+    const char *unmapped_pos = strstr(sb.data, unmapped_line);
+    assert(close_pos != NULL && unmapped_pos != NULL);
+    assert(close_pos < unmapped_pos);
+    assert(unmapped_pos + strlen(unmapped_line) == sb.data + sb.len);
+
+    /* No WM-specific shortcut hardcoded under default config */
+    assert(strstr(sb.data, "Meta+q") == NULL);
+    assert(strstr(sb.data, "Meta+Q") == NULL);
+    assert(strstr(sb.data, "Super+q") == NULL);
+    assert(strstr(sb.data, "Super+Q") == NULL);
+
+    /* Core overlay bindings remain present */
+    assert(strstr(sb.data, "F12 script-binding tuitube/toggle\n") != NULL);
+    assert(strstr(sb.data, "Ctrl+q script-binding tuitube/input\n") != NULL);
+    assert(strstr(sb.data, "ANY_UNICODE repeatable script-binding tuitube/input\n") != NULL);
+
+    /* 2. Custom host CLOSE_WIN command preservation */
+    assert(config_build_mpv_overlay_section(&cfg, "tuitube", "  quit-watch-later  ", &sb));
+    assert(strstr(sb.data, "CLOSE_WIN quit-watch-later\n") != NULL);
+
+    assert(config_build_mpv_overlay_section(&cfg, "tuitube", "quit 4", &sb));
+    assert(strstr(sb.data, "CLOSE_WIN quit 4\n") != NULL);
+
+    /* 3. config_mpv_key_name() & custom tuitube.json modifier keybindings */
+    char kname[16];
+    assert(config_mpv_key_name(XKB_KEY_Q, kname, sizeof(kname)) && strcmp(kname, "q") == 0);
+    assert(config_mpv_key_name(XKB_KEY_F4, kname, sizeof(kname)) && strcmp(kname, "F4") == 0);
+    assert(config_mpv_key_name(XKB_KEY_Return, kname, sizeof(kname)) && strcmp(kname, "ENTER") == 0);
+    assert(config_mpv_key_name(XKB_KEY_BackSpace, kname, sizeof(kname)) && strcmp(kname, "BS") == 0);
+    assert(config_mpv_key_name(XKB_KEY_bracketright, kname, sizeof(kname)) && strcmp(kname, "]") == 0);
+    assert(!config_mpv_key_name(XKB_KEY_NoSymbol, kname, sizeof(kname)));
+
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_ovsec", tmpdir, sizeof(tmpdir));
+    char cfg_file[PATH_MAX + 32];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+    const char *json_cfg =
+        "{ \"key_bindings\": [ { \"action\": \"show_feed\", \"mod\": \"SUPER\", \"key\": \"R\" } ] }\n";
+    assert(tt_write_file_atomic(cfg_file, json_cfg, strlen(json_cfg)));
+
+    TuiTubeConfig cfg2;
+    assert(config_load(&cfg2, tmpdir));
+    assert(config_build_mpv_overlay_section(&cfg2, "custom_client", NULL, &sb));
+    assert(strstr(sb.data, "Meta+r script-binding custom_client/input\n") != NULL);
+    assert(strstr(sb.data, "CLOSE_WIN quit\n") != NULL);
+
+    config_free(&cfg2);
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
+    sb_free(&sb);
+    config_free(&cfg);
+}
+
+static void test_player_launch_and_exe_resolution(void) {
+    TuiTubeConfig cfg;
+    config_init_defaults(&cfg);
+
+    MediaItem vid = {0};
+    vid.kind = ITEM_VIDEO;
+    snprintf(vid.id, sizeof(vid.id), "dQw4w9WgXcQ");
+    vid.title = tt_strdup("Launch Test");
+
+    char err[256] = {0};
+
+    /* Nonexistent player must fail with a clear diagnostic */
+    free(cfg.player_path);
+    cfg.player_path = tt_strdup("tuitube_definitely_missing_player_99999");
+    assert(!player_launch(&cfg, &vid, err, sizeof(err)));
+    assert(strstr(err, "Failed to launch player:") != NULL);
+
+    /* Real executable must spawn cleanly (catches invalid CreateProcessW flags on Windows) */
+    free(cfg.player_path);
+#ifdef _WIN32
+    char *cmd_exe = tt_win32_resolve_exe("cmd");
+    assert(cmd_exe != NULL && tt_file_exists(cmd_exe));
+    free(cmd_exe);
+    cfg.player_path = tt_strdup("where");
+#else
+    cfg.player_path = tt_strdup("true");
+#endif
+    err[0] = '\0';
+    assert(player_launch(&cfg, &vid, err, sizeof(err)));
+
+    media_item_free_fields(&vid);
+    config_free(&cfg);
+}
+
+static void test_locale_parsing_and_innertube_headers(void) {
+    char hl[16], gl[8];
+
+    assert(tt_parse_locale_tag("vi_VN.UTF-8", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "vi") == 0 && strcmp(gl, "VN") == 0);
+
+    assert(tt_parse_locale_tag("vi-VN", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "vi") == 0 && strcmp(gl, "VN") == 0);
+
+    assert(tt_parse_locale_tag("vi", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "vi") == 0 && gl[0] == '\0');
+
+    assert(tt_parse_locale_tag("en_US.utf8@modern", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "en") == 0 && strcmp(gl, "US") == 0);
+
+    assert(tt_parse_locale_tag("en-GB", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "en-GB") == 0 && strcmp(gl, "GB") == 0);
+
+    assert(tt_parse_locale_tag("zh_TW.UTF-8", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "zh-TW") == 0 && strcmp(gl, "TW") == 0);
+
+    assert(tt_parse_locale_tag("zh-Hant-HK", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "zh-HK") == 0 && strcmp(gl, "HK") == 0);
+
+    assert(tt_parse_locale_tag("zh-Hans-CN", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "zh-CN") == 0 && strcmp(gl, "CN") == 0);
+
+    assert(tt_parse_locale_tag("pt_BR", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "pt-BR") == 0 && strcmp(gl, "BR") == 0);
+
+    assert(tt_parse_locale_tag("es-419", hl, sizeof(hl), gl, sizeof(gl)));
+    assert(strcmp(hl, "es-419") == 0 && gl[0] == '\0');
+
+    static const char *const invalid_locales[] = {
+        "", "C", "C.UTF-8", "POSIX", "auto",
+        "vi\r\nX-Injected: 1", "en;q=0.9", "123", "toolongsubtagvalue"
+    };
+    for (size_t i = 0; i < sizeof(invalid_locales) / sizeof(invalid_locales[0]); i++) {
+        assert(!tt_parse_locale_tag(invalid_locales[i], hl, sizeof(hl), gl, sizeof(gl)));
+    }
+
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_loc", tmpdir, sizeof(tmpdir));
+    char cfg_file[PATH_MAX + 32];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+
+    const char *vi_cfg = "{ \"language\": \"vi\" }\n";
+    assert(tt_write_file_atomic(cfg_file, vi_cfg, strlen(vi_cfg)));
+    TuiTubeConfig cfg;
+    assert(config_load(&cfg, tmpdir));
+    assert(strcmp(cfg.resolved_hl, "vi") == 0);
+    assert(strcmp(cfg.resolved_gl, "VN") == 0);
+    config_free(&cfg);
+
+    const char *vi_us_cfg = "{ \"language\": \"vi\", \"region\": \"us\" }\n";
+    assert(tt_write_file_atomic(cfg_file, vi_us_cfg, strlen(vi_us_cfg)));
+    assert(config_load(&cfg, tmpdir));
+    assert(strcmp(cfg.resolved_hl, "vi") == 0);
+    assert(strcmp(cfg.resolved_gl, "US") == 0);
+    config_free(&cfg);
+
+    /* Load examples/tuitube.json via temp copy */
+    size_t ex_len = 0;
+    char *ex_raw = tt_read_file("examples/tuitube.json", &ex_len);
+    assert(ex_raw != NULL && ex_len > 0);
+    assert(tt_write_file_atomic(cfg_file, ex_raw, ex_len));
+    free(ex_raw);
+    assert(config_load(&cfg, tmpdir));
+    assert(!cfg.has_video_format);
+    assert(!cfg.has_sub_language);
+    assert(!cfg.has_ytdlp_path);
+    assert(cfg.ytdlp_path && cfg.ytdlp_path[0] == '\0');
+    assert(cfg.language && strcmp(cfg.language, "auto") == 0);
+    config_free(&cfg);
+
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
+
+    innertube_set_locale("vi", "VN");
+    innertube_get_locale(hl, sizeof(hl), gl, sizeof(gl));
+    assert(strcmp(hl, "vi") == 0 && strcmp(gl, "VN") == 0);
+
+    char hdr[64];
+    assert(innertube_format_accept_language("vi", hdr, sizeof(hdr)));
+    assert(strcmp(hdr, "Accept-Language: vi,en;q=0.8") == 0);
+    assert(innertube_format_accept_language("en", hdr, sizeof(hdr)));
+    assert(strcmp(hdr, "Accept-Language: en-US,en;q=0.9") == 0);
+
+    innertube_set_locale("en", "US");
+}
+
+static void test_non_english_lockup_and_badges(void) {
+    const char *vi_browse =
+        "{"
+        "  \"header\": {\"pageHeaderRenderer\": {\"content\": {\"pageHeaderViewModel\": {\"title\": {\"dynamicTextViewModel\": {\"text\": {\"content\": \"Kenh Viet\"}}}}}}},"
+        "  \"contents\": {\"twoColumnBrowseResultsRenderer\": {\"tabs\": [{\"tabRenderer\": {\"selected\": true, \"content\": {"
+        "    \"richGridRenderer\": {\"contents\": ["
+        "      {\"richItemRenderer\": {\"content\": {\"lockupViewModel\": {"
+        "        \"contentId\": \"viMem01\","
+        "        \"contentType\": \"LOCKUP_CONTENT_TYPE_VIDEO\","
+        "        \"metadata\": {\"lockupMetadataViewModel\": {"
+        "          \"title\": {\"content\": \"Video Hoi Vien\"},"
+        "          \"badges\": [{\"badgeViewModel\": {\"badgeText\": \"D\\u00e0nh ri\\u00eang cho h\\u1ed9i vi\\u00ean\"}}],"
+        "          \"metadata\": {\"contentMetadataViewModel\": {\"metadataRows\": ["
+        "            {\"metadataParts\": ["
+        "              {\"text\": {\"content\": \"12 N l\\u01b0\\u1ee3t xem\"}},"
+        "              {\"text\": {\"content\": \"3 ng\\u00e0y tr\\u01b0\\u1edbc\"}}"
+        "            ]}"
+        "          ]}}"
+        "        }}"
+        "      }}}},"
+        "      {\"richItemRenderer\": {\"content\": {\"lockupViewModel\": {"
+        "        \"contentId\": \"viLive02\","
+        "        \"contentType\": \"LOCKUP_CONTENT_TYPE_VIDEO\","
+        "        \"metadata\": {\"lockupMetadataViewModel\": {"
+        "          \"title\": {\"content\": \"Phat Truc Tiep\"},"
+        "          \"badges\": [{\"badgeViewModel\": {\"badgeText\": \"TR\\u1ef0C TI\\u1ebeP\"}}],"
+        "          \"metadata\": {\"contentMetadataViewModel\": {\"metadataRows\": ["
+        "            {\"metadataParts\": ["
+        "              {\"text\": {\"content\": \"1,5 N ng\\u01b0\\u1eddi \\u0111ang xem\"}}"
+        "            ]}"
+        "          ]}}"
+        "        }}"
+        "      }}}}"
+        "    ]}"
+        "  }}}]}}"
+        "}";
+
+    MediaList ml;
+    media_list_init(&ml);
+    char err[128] = {0};
+    assert(innertube_parse_browse_json(vi_browse, strlen(vi_browse), &ml, err, sizeof(err)));
+    assert(ml.count == 2);
+
+    assert(strcmp(ml.items[0].id, "viMem01") == 0);
+    assert(ml.items[0].author == NULL);
+    assert(ml.items[0].view_count_text &&
+           strcmp(ml.items[0].view_count_text, "12 N l\xC6\xB0\xE1\xBB\xA3t xem") == 0);
+    assert(ml.items[0].published_text &&
+           strcmp(ml.items[0].published_text, "3 ng\xC3\xA0y tr\xC6\xB0\xE1\xBB\x9B" "c") == 0);
+    assert(ml.items[0].is_members_only == true);
+
+    assert(strcmp(ml.items[1].id, "viLive02") == 0);
+    assert(ml.items[1].author == NULL);
+    assert(ml.items[1].is_live == true);
+
+    media_list_free(&ml);
+}
+
+static void write_u16le(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void write_u32le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static void test_pe_subsystem_and_runtime_dep_checks(void) {
+    uint8_t pe[160];
+    memset(pe, 0, sizeof(pe));
+    pe[0] = 'M';
+    pe[1] = 'Z';
+    write_u32le(pe + 0x3C, 64u);
+    pe[64] = 'P';
+    pe[65] = 'E';
+    pe[66] = 0;
+    pe[67] = 0;
+
+    /* PE32+ GUI (Subsystem = 2) -> true; CUI (Subsystem = 3) -> false */
+    write_u16le(pe + 64u + 24u, 0x020Bu);
+    write_u16le(pe + 64u + 24u + 68u, 2u);
+    assert(tt_pe_is_gui_subsystem(pe, sizeof(pe)));
+
+    write_u16le(pe + 64u + 24u + 68u, 3u);
+    assert(!tt_pe_is_gui_subsystem(pe, sizeof(pe)));
+
+    /* PE32 GUI -> true */
+    write_u16le(pe + 64u + 24u, 0x010Bu);
+    write_u16le(pe + 64u + 24u + 68u, 2u);
+    assert(tt_pe_is_gui_subsystem(pe, sizeof(pe)));
+
+    /* Truncated / corrupt headers -> false */
+    assert(!tt_pe_is_gui_subsystem(pe, 150u));
+    assert(!tt_pe_is_gui_subsystem(NULL, sizeof(pe)));
+    pe[64] = 'X';
+    assert(!tt_pe_is_gui_subsystem(pe, sizeof(pe)));
+    pe[64] = 'P';
+    pe[0] = 'X';
+    assert(!tt_pe_is_gui_subsystem(pe, sizeof(pe)));
+
+    /* Runtime dependency checks */
+    TuiTubeConfig cfg;
+    config_init_defaults(&cfg);
+
+    bool has_player = true;
+    bool has_ytdlp = false;
+    free(cfg.player_path);
+    cfg.player_path = tt_strdup("tuitube_definitely_missing_player_99999");
+    player_check_deps(&cfg, &has_player, &has_ytdlp);
+    assert(!has_player);
+
+    free(cfg.player_path);
+#ifdef _WIN32
+    tt_win32_refresh_path();
+    char *cmd_exe = tt_win32_resolve_exe("cmd");
+    assert(cmd_exe != NULL && tt_file_exists(cmd_exe));
+    free(cmd_exe);
+    cfg.player_path = tt_strdup("where");
+#else
+    cfg.player_path = tt_strdup("true");
+#endif
+    has_player = false;
+    player_check_deps(&cfg, &has_player, NULL);
+    assert(has_player);
+
+    config_free(&cfg);
+}
+
+static void test_ytdlp_path_resolution_and_mpv_opts(void) {
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_ytdlp", tmpdir, sizeof(tmpdir));
+
+    char subdir[PATH_MAX + 32];
+    snprintf(subdir, sizeof(subdir), "%s/sub", tmpdir);
+    assert(tt_mkdir_p(subdir, 0755));
+
+    char missing_path[PATH_MAX + 64];
+    snprintf(missing_path, sizeof(missing_path), "%s/definitely_missing_ytdlp_99999", tmpdir);
+
+    /* 1. tt_dir_exists() checks */
+    assert(tt_dir_exists(tmpdir));
+    assert(tt_dir_exists(subdir));
+    assert(!tt_dir_exists(missing_path));
+
+    char dummy_file[PATH_MAX + 64];
+    snprintf(dummy_file, sizeof(dummy_file), "%s/regular.txt", tmpdir);
+    assert(tt_write_file_atomic(dummy_file, "hello", 5));
+    assert(tt_file_exists(dummy_file));
+    assert(!tt_dir_exists(dummy_file));
+    test_unlink_file(dummy_file);
+
+    /* 2. Config JSON parsing & trimming of ytdlp_path */
+    char cfg_file[PATH_MAX + 32];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+    const char *json_cfg = "{ \"ytdlp_path\": \"  \\\"/tmp/custom-ytdlp\\\"  \" }\n";
+    assert(tt_write_file_atomic(cfg_file, json_cfg, strlen(json_cfg)));
+    TuiTubeConfig loaded;
+    assert(config_load(&loaded, tmpdir));
+    assert(loaded.has_ytdlp_path);
+    assert(loaded.ytdlp_path && strcmp(loaded.ytdlp_path, "/tmp/custom-ytdlp") == 0);
+    config_free(&loaded);
+
+    /* 2b. Override config file (e.g., mpv/script-opts/tuitube.json) & relative asset resolution */
+    char override_cfg[PATH_MAX + 64];
+    snprintf(override_cfg, sizeof(override_cfg), "%s/tuitube.json", subdir);
+    char override_theme[PATH_MAX + 64];
+    snprintf(override_theme, sizeof(override_theme), "%s/mpv_theme.json", subdir);
+    const char *ov_json = "{ \"language\": \"ja\", \"theme_path\": \"mpv_theme.json\" }\n";
+    assert(tt_write_file_atomic(override_cfg, ov_json, strlen(ov_json)));
+    assert(tt_write_file_atomic(override_theme, "{}\n", 3));
+    assert(config_load_from(&loaded, tmpdir, override_cfg));
+    assert(strcmp(loaded.config_dir, tmpdir) == 0);
+    assert(strcmp(loaded.config_file_dir, subdir) == 0);
+    assert(strcmp(loaded.resolved_hl, "ja") == 0);
+    char *resolved_asset = config_resolve_asset_path(&loaded, "mpv_theme.json");
+    assert(resolved_asset != NULL && test_same_file_path(resolved_asset, override_theme));
+    free(resolved_asset);
+    config_free(&loaded);
+    test_unlink_file(override_theme);
+    test_unlink_file(override_cfg);
+    test_unlink_file(cfg_file);
+
+    TuiTubeConfig cfg;
+    config_init_defaults(&cfg);
+    snprintf(cfg.config_dir, sizeof(cfg.config_dir), "%s", tmpdir);
+
+    /* 3. Auto <config_dir> discovery (ytdlp_path: "") */
+    char cfg_bin[PATH_MAX + 64];
+#ifdef _WIN32
+    snprintf(cfg_bin, sizeof(cfg_bin), "%s/yt-dlp.exe", tmpdir);
+    assert(tt_write_file_atomic(cfg_bin, "MZ", 2));
+#else
+    snprintf(cfg_bin, sizeof(cfg_bin), "%s/yt-dlp", tmpdir);
+    assert(tt_write_file_atomic(cfg_bin, "#!/bin/sh\nexit 0\n", 17));
+    assert(chmod(cfg_bin, 0755) == 0);
+#endif
+
+    bool needs_opt = false;
+    char *resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
+    assert(resolved != NULL);
+    assert(needs_opt);
+    assert(test_same_file_path(resolved, cfg_bin));
+
+    bool has_ytdlp = false;
+    player_check_deps(&cfg, NULL, &has_ytdlp);
+    assert(has_ytdlp);
+
+    char opt[PATH_MAX + 64];
+    assert(player_build_mpv_ytdl_script_opt(&cfg, opt, sizeof(opt)));
+    char expected_opt[PATH_MAX + 128];
+    snprintf(expected_opt, sizeof(expected_opt), "ytdl_hook-ytdl_path=%s", resolved);
+    assert(strcmp(opt, expected_opt) == 0);
+    free(resolved);
+    test_unlink_file(cfg_bin);
+
+    /* 4. Explicit ytdlp_path file (with whitespace) & directory expansion */
+    char sub_custom[PATH_MAX + 64];
+#ifdef _WIN32
+    snprintf(sub_custom, sizeof(sub_custom), "%s/my-ytdlp.exe", subdir);
+    assert(tt_write_file_atomic(sub_custom, "MZ", 2));
+#else
+    snprintf(sub_custom, sizeof(sub_custom), "%s/my-ytdlp", subdir);
+    assert(tt_write_file_atomic(sub_custom, "#!/bin/sh\nexit 0\n", 17));
+    assert(chmod(sub_custom, 0755) == 0);
+#endif
+    free(cfg.ytdlp_path);
+    cfg.ytdlp_path = tt_asprintf("  %s  ", sub_custom);
+    needs_opt = false;
+    resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
+    assert(resolved != NULL && needs_opt);
+    assert(test_same_file_path(resolved, sub_custom));
+    assert(player_build_mpv_ytdl_script_opt(&cfg, opt, sizeof(opt)));
+    snprintf(expected_opt, sizeof(expected_opt), "ytdl_hook-ytdl_path=%s", resolved);
+    assert(strcmp(opt, expected_opt) == 0);
+    free(resolved);
+
+    char sub_std[PATH_MAX + 64];
+#ifdef _WIN32
+    snprintf(sub_std, sizeof(sub_std), "%s/yt-dlp.exe", subdir);
+    assert(tt_write_file_atomic(sub_std, "MZ", 2));
+#else
+    snprintf(sub_std, sizeof(sub_std), "%s/yt-dlp", subdir);
+    assert(tt_write_file_atomic(sub_std, "#!/bin/sh\nexit 0\n", 17));
+    assert(chmod(sub_std, 0755) == 0);
+#endif
+    free(cfg.ytdlp_path);
+    cfg.ytdlp_path = tt_strdup(subdir);
+    needs_opt = false;
+    resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
+    assert(resolved != NULL && needs_opt);
+    assert(test_same_file_path(resolved, sub_std));
+    free(resolved);
+
+    /* 5. Relative ytdlp_path under <config_dir> */
+    free(cfg.ytdlp_path);
+#ifdef _WIN32
+    cfg.ytdlp_path = tt_strdup("sub/my-ytdlp.exe");
+#else
+    cfg.ytdlp_path = tt_strdup("sub/my-ytdlp");
+#endif
+    needs_opt = false;
+    resolved = player_resolve_ytdlp_path(&cfg, &needs_opt);
+    assert(resolved != NULL && needs_opt);
+    assert(test_same_file_path(resolved, sub_custom));
+    free(resolved);
+
+    test_unlink_file(sub_custom);
+    test_unlink_file(sub_std);
+
+    /* 6. Missing explicit ytdlp_path (strict no-fallback) */
+    MediaItem vid = {0};
+    vid.kind = ITEM_VIDEO;
+    snprintf(vid.id, sizeof(vid.id), "dQw4w9WgXcQ");
+    vid.title = tt_strdup("Test Video");
+
+    free(cfg.ytdlp_path);
+    cfg.ytdlp_path = tt_strdup(missing_path);
+    assert(player_resolve_ytdlp_path(&cfg, NULL) == NULL);
+    has_ytdlp = true;
+    player_check_deps(&cfg, NULL, &has_ytdlp);
+    assert(!has_ytdlp);
+
+    char err[256] = {0};
+    assert(!player_download_start(&cfg, &vid, NULL, 0, err, sizeof(err)));
+    assert(strstr(err, "ytdlp_path") != NULL);
+
+#ifndef _WIN32
+    /* 7. POSIX non-executable ytdlp_path */
+    char nonexec[PATH_MAX + 64];
+    snprintf(nonexec, sizeof(nonexec), "%s/nonexec_ytdlp", tmpdir);
+    assert(tt_write_file_atomic(nonexec, "#!/bin/sh\nexit 0\n", 17));
+    assert(chmod(nonexec, 0644) == 0);
+    free(cfg.ytdlp_path);
+    cfg.ytdlp_path = tt_strdup(nonexec);
+    assert(player_resolve_ytdlp_path(&cfg, NULL) == NULL);
+    memset(err, 0, sizeof(err));
+    assert(!player_download_start(&cfg, &vid, NULL, 0, err, sizeof(err)));
+    assert(strstr(err, "not executable") != NULL);
+    test_unlink_file(nonexec);
+#endif
+
+    /* 8. Delimiter / newline sanitization in player_build_mpv_ytdl_script_opt() */
+    free(cfg.ytdlp_path);
+    cfg.ytdlp_path = tt_strdup("bad\npath");
+    assert(!player_build_mpv_ytdl_script_opt(&cfg, opt, sizeof(opt)));
+
+    free(cfg.ytdlp_path);
+#ifdef _WIN32
+    cfg.ytdlp_path = tt_strdup("C:\\Tools\\a;b\\yt-dlp.exe");
+#else
+    cfg.ytdlp_path = tt_strdup("/tmp/a:b/yt-dlp");
+#endif
+    assert(!player_build_mpv_ytdl_script_opt(&cfg, opt, sizeof(opt)));
+
+    /* 9. InnerTube ytdlp_path setter / getter */
+    char it_buf[PATH_MAX];
+    innertube_set_ytdlp_path("/custom/yt-dlp");
+    innertube_get_ytdlp_path(it_buf, sizeof(it_buf));
+    assert(strcmp(it_buf, "/custom/yt-dlp") == 0);
+
+    innertube_set_ytdlp_path("bad\npath");
+    innertube_get_ytdlp_path(it_buf, sizeof(it_buf));
+    assert(strcmp(it_buf, "yt-dlp") == 0);
+
+    innertube_set_ytdlp_path(NULL);
+    innertube_get_ytdlp_path(it_buf, sizeof(it_buf));
+    assert(strcmp(it_buf, "yt-dlp") == 0);
+
+    media_item_free_fields(&vid);
+    config_free(&cfg);
+    test_rmdir(subdir);
+    test_rmdir(tmpdir);
 }
 
 int main(void) {
@@ -1143,6 +2000,15 @@ int main(void) {
     RUN_TEST(test_mpv_key_mouse_and_unicode_parsing);
     RUN_TEST(test_config_explicit_format_and_slang_flags);
     RUN_TEST(test_thumb_cache_flush_ram_and_drop_jobs);
+    RUN_TEST(test_win32_cmdline_quoting);
+    RUN_TEST(test_windows_paths_and_script_opts);
+    RUN_TEST(test_ttf_family_name_parser);
+    RUN_TEST(test_mpv_overlay_section_close_win_and_bindings);
+    RUN_TEST(test_player_launch_and_exe_resolution);
+    RUN_TEST(test_locale_parsing_and_innertube_headers);
+    RUN_TEST(test_non_english_lockup_and_badges);
+    RUN_TEST(test_pe_subsystem_and_runtime_dep_checks);
+    RUN_TEST(test_ytdlp_path_resolution_and_mpv_opts);
 
     printf("\nAll %d tests passed!\n", g_tests_run);
     return 0;

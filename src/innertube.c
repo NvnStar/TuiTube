@@ -5,18 +5,82 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <yyjson.h>
 
 #define INNERTUBE_CLIENT_VER "2.20260708.00.00"
 #define INNERTUBE_MAX_JSON (16u * 1024u * 1024u)
 
-static const char *const INNERTUBE_HEADERS[] = {
-    "Content-Type: application/json",
-    "Origin: https://www.youtube.com",
-    "Referer: https://www.youtube.com/"
-};
+static char g_innertube_hl[16] = "en";
+static char g_innertube_gl[8] = "US";
+static char g_innertube_ytdlp_path[PATH_MAX] = "yt-dlp";
+
+void innertube_set_ytdlp_path(const char *path) {
+    if (!path || !path[0]) {
+        snprintf(g_innertube_ytdlp_path, sizeof(g_innertube_ytdlp_path), "yt-dlp");
+        return;
+    }
+    size_t len = strlen(path);
+    if (len >= sizeof(g_innertube_ytdlp_path)) {
+        snprintf(g_innertube_ytdlp_path, sizeof(g_innertube_ytdlp_path), "yt-dlp");
+        return;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (path[i] == '\r' || path[i] == '\n') {
+            snprintf(g_innertube_ytdlp_path, sizeof(g_innertube_ytdlp_path), "yt-dlp");
+            return;
+        }
+    }
+    snprintf(g_innertube_ytdlp_path, sizeof(g_innertube_ytdlp_path), "%s", path);
+}
+
+void innertube_get_ytdlp_path(char *out, size_t out_cap) {
+    if (out && out_cap > 0) {
+        snprintf(out, out_cap, "%s", g_innertube_ytdlp_path);
+    }
+}
+
+void innertube_set_locale(const char *hl, const char *gl) {
+    char parsed_hl[16] = {0};
+    char parsed_gl[8] = {0};
+    if (hl && tt_parse_locale_tag(hl, parsed_hl, sizeof(parsed_hl), parsed_gl, sizeof(parsed_gl))) {
+        snprintf(g_innertube_hl, sizeof(g_innertube_hl), "%s", parsed_hl);
+    } else {
+        snprintf(g_innertube_hl, sizeof(g_innertube_hl), "en");
+    }
+
+    if (gl && isalpha((unsigned char)gl[0]) && isalpha((unsigned char)gl[1]) && gl[2] == '\0') {
+        g_innertube_gl[0] = (char)toupper((unsigned char)gl[0]);
+        g_innertube_gl[1] = (char)toupper((unsigned char)gl[1]);
+        g_innertube_gl[2] = '\0';
+    } else {
+        snprintf(g_innertube_gl, sizeof(g_innertube_gl), "US");
+    }
+}
+
+void innertube_get_locale(char *out_hl, size_t hl_cap, char *out_gl, size_t gl_cap) {
+    if (out_hl && hl_cap > 0) snprintf(out_hl, hl_cap, "%s", g_innertube_hl);
+    if (out_gl && gl_cap > 0) snprintf(out_gl, gl_cap, "%s", g_innertube_gl);
+}
+
+bool innertube_format_accept_language(const char *hl, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return false;
+    char norm_hl[16] = {0};
+    if (!hl || !tt_parse_locale_tag(hl, norm_hl, sizeof(norm_hl), NULL, 0)) {
+        snprintf(norm_hl, sizeof(norm_hl), "en");
+    }
+
+    int n = -1;
+    if (tt_strncasecmp(norm_hl, "en", 2) == 0 && (norm_hl[2] == '\0' || norm_hl[2] == '-')) {
+        if (norm_hl[2] == '\0') {
+            n = snprintf(out, out_cap, "Accept-Language: en-US,en;q=0.9");
+        } else {
+            n = snprintf(out, out_cap, "Accept-Language: %s,en;q=0.9", norm_hl);
+        }
+    } else {
+        n = snprintf(out, out_cap, "Accept-Language: %s,en;q=0.8", norm_hl);
+    }
+    return n >= 0 && (size_t)n < out_cap;
+}
 
 bool innertube_encode_search_params(SearchFilter filter, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return false;
@@ -267,7 +331,9 @@ static bool check_live_badge_obj(yyjson_val *obj) {
         yyjson_val *tv = yyjson_obj_get(obj, txt_keys[i]);
         if (tv) {
             char *s = extract_text(tv);
-            bool match = (s && tt_strcasecmp(s, "LIVE") == 0);
+            bool match = (s && (tt_strcasecmp(s, "LIVE") == 0 ||
+                                tt_strcasecmp(s, "TRỰC TIẾP") == 0 ||
+                                strcmp(s, "trực tiếp") == 0));
             free(s);
             if (match) return true;
         }
@@ -309,7 +375,8 @@ static bool check_members_only_badge_obj(yyjson_val *obj) {
         yyjson_val *tv = yyjson_obj_get(obj, txt_keys[i]);
         if (tv) {
             char *s = extract_text(tv);
-            bool match = (s && tt_strcasestr(s, "members only") != NULL);
+            bool match = (s && (tt_strcasestr(s, "members only") != NULL ||
+                                tt_strcasestr(s, "hội viên") != NULL));
             free(s);
             if (match) return true;
         }
@@ -321,7 +388,8 @@ static bool check_members_only_badge_obj(yyjson_val *obj) {
     }
     yyjson_val *albl = acc ? yyjson_obj_get(acc, "label") : NULL;
     if (albl && yyjson_is_str(albl) &&
-        tt_strcasestr(yyjson_get_str(albl), "members only") != NULL) {
+        (tt_strcasestr(yyjson_get_str(albl), "members only") != NULL ||
+         tt_strcasestr(yyjson_get_str(albl), "hội viên") != NULL)) {
         return true;
     }
     return false;
@@ -668,12 +736,22 @@ static void parse_lockup_view_model(yyjson_val *lvm, MediaList *out_list) {
                             tt_strcasestr(txt, "ago") != NULL ||
                             tt_strcasestr(txt, "streamed") != NULL ||
                             tt_strcasestr(txt, "scheduled") != NULL ||
-                            tt_strcasestr(txt, "premiere") != NULL;
-                        if (!it.author && !looks_metric) {
+                            tt_strcasestr(txt, "premiere") != NULL ||
+                            tt_strcasestr(txt, "lượt xem") != NULL ||
+                            tt_strcasestr(txt, "đang xem") != NULL ||
+                            tt_strcasestr(txt, "trước") != NULL ||
+                            tt_strcasestr(txt, "công chiếu") != NULL;
+                        bool treat_as_metric =
+                            looks_metric ||
+                            (it.kind == ITEM_VIDEO &&
+                             (ridx > 0 || pmax > 1 || (rmax == 1 && !it.author_id)));
+                        if (!it.author && !treat_as_metric) {
                             it.author = txt;
                         } else if (!it.view_count_text) {
                             it.view_count_text = txt;
-                            if (tt_strcasestr(txt, "watching") != NULL && !it.duration_text) {
+                            if ((tt_strcasestr(txt, "watching") != NULL ||
+                                 tt_strcasestr(txt, "đang xem") != NULL) &&
+                                !it.duration_text) {
                                 it.is_live = true;
                             }
                         } else if (!it.published_text) {
@@ -1438,8 +1516,8 @@ void innertube_filter_and_sort_feed(MediaList *list, int64_t now_epoch, int64_t 
 static void add_innertube_context(yyjson_mut_doc *doc, yyjson_mut_val *root) {
     yyjson_mut_val *ctx = yyjson_mut_obj(doc);
     yyjson_mut_val *cli = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_str(doc, cli, "hl", "en");
-    yyjson_mut_obj_add_str(doc, cli, "gl", "US");
+    yyjson_mut_obj_add_str(doc, cli, "hl", g_innertube_hl);
+    yyjson_mut_obj_add_str(doc, cli, "gl", g_innertube_gl);
     yyjson_mut_obj_add_str(doc, cli, "clientName", "WEB");
     yyjson_mut_obj_add_str(doc, cli, "clientVersion", INNERTUBE_CLIENT_VER);
     yyjson_mut_obj_add_val(doc, ctx, "client", cli);
@@ -1456,7 +1534,18 @@ static bool innertube_post(CURL *curl, const char *endpoint, yyjson_mut_doc *doc
     char url[256];
     snprintf(url, sizeof(url), "https://www.youtube.com/youtubei/v1/%s?prettyPrint=false", endpoint);
 
-    bool ok = http_post_json(curl, url, body, INNERTUBE_HEADERS, 3, INNERTUBE_MAX_JSON, resp);
+    char accept_hdr[64];
+    if (!innertube_format_accept_language(g_innertube_hl, accept_hdr, sizeof(accept_hdr))) {
+        snprintf(accept_hdr, sizeof(accept_hdr), "Accept-Language: en-US,en;q=0.9");
+    }
+    const char *headers[] = {
+        "Content-Type: application/json",
+        "Origin: https://www.youtube.com",
+        "Referer: https://www.youtube.com/",
+        accept_hdr
+    };
+
+    bool ok = http_post_json(curl, url, body, headers, 4, INNERTUBE_MAX_JSON, resp);
     free(body);
     if (!ok) {
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Network error: %s", resp->error);
@@ -1475,49 +1564,19 @@ static bool innertube_post(CURL *curl, const char *endpoint, yyjson_mut_doc *doc
 
 static bool search_ytdlp_fallback(const char *query, MediaList *out_list) {
     if (!query || !query[0]) return false;
-    int pfd[2];
-    if (pipe(pfd) != 0) return false;
-
     char *search_arg = tt_asprintf("ytsearch20:%s", query);
-    if (!search_arg) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return false;
-    }
+    if (!search_arg) return false;
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        free(search_arg);
-        close(pfd[0]);
-        close(pfd[1]);
-        return false;
-    }
-    if (pid == 0) {
-        close(pfd[0]);
-        dup2(pfd[1], STDOUT_FILENO);
-        close(pfd[1]);
-        char *argv[] = {"yt-dlp", "--flat-playlist", "--dump-single-json", search_arg, NULL};
-        execvp("yt-dlp", argv);
-        _exit(127);
-    }
-
-    close(pfd[1]);
-    free(search_arg);
-
+    const char *argv[] = {
+        g_innertube_ytdlp_path, "--flat-playlist", "--dump-single-json", search_arg, NULL
+    };
     StrBuf sb;
     sb_init(&sb);
-    char buf[8192];
-    ssize_t n;
-    while ((n = read(pfd[0], buf, sizeof(buf))) > 0) {
-        if (sb.len + (size_t)n > INNERTUBE_MAX_JSON) break;
-        sb_append_n(&sb, buf, (size_t)n);
-    }
-    close(pfd[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
+    bool spawn_ok = tt_spawn_capture_stdout(argv, INNERTUBE_MAX_JSON, &sb);
+    free(search_arg);
 
     bool ok = false;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && sb.len > 0) {
+    if (spawn_ok && sb.len > 0) {
         ok = innertube_parse_ytdlp_json(sb.data, sb.len, out_list);
     }
     sb_free(&sb);

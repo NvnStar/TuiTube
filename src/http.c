@@ -2,12 +2,18 @@
 #include "util.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <process.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <pthread.h>
 #include <unistd.h>
+#endif
 
 #define HTTP_USER_AGENT "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 #define HTTP_JOB_QUEUE_CAP 256
@@ -35,11 +41,19 @@ typedef struct ResultNode {
 } ResultNode;
 
 struct HttpPool {
+#ifdef _WIN32
+    HANDLE *threads;
+    CRITICAL_SECTION mu;
+    CONDITION_VARIABLE cond;
+    HANDLE notify_event;
+#else
     pthread_t *threads;
-    int num_threads;
-
     pthread_mutex_t mu;
     pthread_cond_t cond;
+    int notify_fds[2];
+#endif
+    int num_threads;
+
     bool stop;
     uint64_t active_gen;
     uint64_t active_detail_gen;
@@ -49,11 +63,53 @@ struct HttpPool {
 
     ResultNode *res_head;
     ResultNode *res_tail;
-
-    int notify_fds[2];
 };
 
+static void pool_lock(HttpPool *pool) {
+#ifdef _WIN32
+    EnterCriticalSection(&pool->mu);
+#else
+    pthread_mutex_lock(&pool->mu);
+#endif
+}
+
+static void pool_unlock(HttpPool *pool) {
+#ifdef _WIN32
+    LeaveCriticalSection(&pool->mu);
+#else
+    pthread_mutex_unlock(&pool->mu);
+#endif
+}
+
+static void pool_cond_wait(HttpPool *pool) {
+#ifdef _WIN32
+    SleepConditionVariableCS(&pool->cond, &pool->mu, INFINITE);
+#else
+    pthread_cond_wait(&pool->cond, &pool->mu);
+#endif
+}
+
+static void pool_cond_signal(HttpPool *pool) {
+#ifdef _WIN32
+    WakeConditionVariable(&pool->cond);
+#else
+    pthread_cond_signal(&pool->cond);
+#endif
+}
+
+static void pool_cond_broadcast(HttpPool *pool) {
+#ifdef _WIN32
+    WakeAllConditionVariable(&pool->cond);
+#else
+    pthread_cond_broadcast(&pool->cond);
+#endif
+}
+
 bool http_global_init(void) {
+#ifdef _WIN32
+    /* Prefer Windows Schannel when multi-SSL libcurl is available; falls back cleanly otherwise */
+    (void)curl_global_sslset(CURLSSLBACKEND_SCHANNEL, NULL, NULL);
+#endif
     return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
 }
 
@@ -129,6 +185,21 @@ static bool perform_curl(CURL *reuse_handle, const char *url,
     curl_easy_setopt(curl, CURLOPT_USERAGENT, HTTP_USER_AGENT);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+#ifdef _WIN32
+    /* Use Windows System Certificate Store instead of MSYS2's compile-time ca-bundle path */
+    long ssl_opts = 0;
+#ifdef CURLSSLOPT_NATIVE_CA
+    ssl_opts |= CURLSSLOPT_NATIVE_CA;
+#endif
+#ifdef CURLSSLOPT_REVOKE_BEST_EFFORT
+    ssl_opts |= CURLSSLOPT_REVOKE_BEST_EFFORT;
+#endif
+    if (ssl_opts != 0) {
+        curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, ssl_opts);
+    }
+    curl_easy_setopt(curl, CURLOPT_CAINFO, NULL);
+    curl_easy_setopt(curl, CURLOPT_CAPATH, NULL);
+#endif
 
     if (slist) {
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
@@ -185,6 +256,7 @@ void http_response_free(HttpResponse *res) {
     memset(res, 0, sizeof(*res));
 }
 
+#ifndef _WIN32
 static bool set_nonblock_cloexec(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
@@ -192,6 +264,7 @@ static bool set_nonblock_cloexec(int fd) {
     if (fdfl >= 0) fcntl(fd, F_SETFD, fdfl | FD_CLOEXEC);
     return true;
 }
+#endif
 
 static void push_result_locked(HttpPool *pool, HttpResult res) {
     ResultNode *node = malloc(sizeof(ResultNode));
@@ -208,22 +281,27 @@ static void push_result_locked(HttpPool *pool, HttpResult res) {
     }
     pool->res_tail = node;
 
+#ifdef _WIN32
+    if (pool->notify_event) {
+        SetEvent(pool->notify_event);
+    }
+#else
     char byte = 1;
     ssize_t wr = write(pool->notify_fds[1], &byte, 1);
     (void)wr;
+#endif
 }
 
-static void *worker_main(void *arg) {
-    HttpPool *pool = arg;
+static void worker_main_impl(HttpPool *pool) {
     CURL *curl = curl_easy_init();
 
     for (;;) {
-        pthread_mutex_lock(&pool->mu);
+        pool_lock(pool);
         while (!pool->stop && pool->job_count == 0) {
-            pthread_cond_wait(&pool->cond, &pool->mu);
+            pool_cond_wait(pool);
         }
         if (pool->stop) {
-            pthread_mutex_unlock(&pool->mu);
+            pool_unlock(pool);
             break;
         }
 
@@ -247,7 +325,7 @@ static void *worker_main(void *arg) {
         pool->job_count--;
         uint64_t active_gen = pool->active_gen;
         uint64_t active_detail_gen = pool->active_detail_gen;
-        pthread_mutex_unlock(&pool->mu);
+        pool_unlock(pool);
 
         /* Skip already-superseded jobs */
         bool stale = false;
@@ -267,7 +345,7 @@ static void *worker_main(void *arg) {
         }
         if (job.free_arg) job.free_arg(job.arg);
 
-        pthread_mutex_lock(&pool->mu);
+        pool_lock(pool);
         if (!pool->stop) {
             HttpResult res = {0};
             res.kind = RES_JOB_DONE;
@@ -279,18 +357,54 @@ static void *worker_main(void *arg) {
         } else if (out_data && job.free_res) {
             job.free_res(out_data);
         }
-        pthread_mutex_unlock(&pool->mu);
+        pool_unlock(pool);
     }
 
     if (curl) curl_easy_cleanup(curl);
+}
+
+#ifdef _WIN32
+static unsigned __stdcall win32_worker_tramp(void *arg) {
+    worker_main_impl((HttpPool *)arg);
+    return 0;
+}
+#else
+static void *posix_worker_tramp(void *arg) {
+    worker_main_impl((HttpPool *)arg);
     return NULL;
 }
+#endif
 
 HttpPool *http_pool_create(int num_threads) {
     if (num_threads <= 0) num_threads = 4;
     HttpPool *pool = calloc(1, sizeof(HttpPool));
     if (!pool) return NULL;
 
+#ifdef _WIN32
+    pool->notify_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!pool->notify_event) {
+        free(pool);
+        return NULL;
+    }
+    InitializeCriticalSection(&pool->mu);
+    InitializeConditionVariable(&pool->cond);
+
+    pool->threads = calloc((size_t)num_threads, sizeof(HANDLE));
+    if (!pool->threads) {
+        CloseHandle(pool->notify_event);
+        DeleteCriticalSection(&pool->mu);
+        free(pool);
+        return NULL;
+    }
+
+    pool->num_threads = 0;
+    for (int i = 0; i < num_threads; i++) {
+        uintptr_t h = _beginthreadex(NULL, 0, win32_worker_tramp, pool, 0, NULL);
+        if (h != 0) {
+            pool->threads[pool->num_threads++] = (HANDLE)h;
+        }
+    }
+#else
     if (pipe(pool->notify_fds) != 0) {
         free(pool);
         return NULL;
@@ -313,23 +427,29 @@ HttpPool *http_pool_create(int num_threads) {
 
     pool->num_threads = 0;
     for (int i = 0; i < num_threads; i++) {
-        if (pthread_create(&pool->threads[i], NULL, worker_main, pool) == 0) {
+        if (pthread_create(&pool->threads[i], NULL, posix_worker_tramp, pool) == 0) {
             pool->num_threads++;
         }
     }
+#endif
     return pool;
 }
 
 void http_pool_destroy(HttpPool *pool) {
     if (!pool) return;
 
-    pthread_mutex_lock(&pool->mu);
+    pool_lock(pool);
     pool->stop = true;
-    pthread_cond_broadcast(&pool->cond);
-    pthread_mutex_unlock(&pool->mu);
+    pool_cond_broadcast(pool);
+    pool_unlock(pool);
 
     for (int i = 0; i < pool->num_threads; i++) {
+#ifdef _WIN32
+        WaitForSingleObject(pool->threads[i], INFINITE);
+        CloseHandle(pool->threads[i]);
+#else
         pthread_join(pool->threads[i], NULL);
+#endif
     }
 
     for (size_t i = 0; i < pool->job_count; i++) {
@@ -343,23 +463,48 @@ void http_pool_destroy(HttpPool *pool) {
         n = next;
     }
 
+#ifdef _WIN32
+    if (pool->notify_event) CloseHandle(pool->notify_event);
+    DeleteCriticalSection(&pool->mu);
+#else
     close(pool->notify_fds[0]);
     close(pool->notify_fds[1]);
     pthread_mutex_destroy(&pool->mu);
     pthread_cond_destroy(&pool->cond);
+#endif
     free(pool->threads);
     free(pool);
 }
 
 int http_pool_notify_fd(const HttpPool *pool) {
+#ifdef _WIN32
+    (void)pool;
+    return -1;
+#else
     return pool ? pool->notify_fds[0] : -1;
+#endif
+}
+
+void *http_pool_notify_handle(const HttpPool *pool) {
+#ifdef _WIN32
+    return pool ? (void *)pool->notify_event : NULL;
+#else
+    (void)pool;
+    return NULL;
+#endif
 }
 
 void http_pool_drain_notify(HttpPool *pool) {
     if (!pool) return;
+#ifdef _WIN32
+    if (pool->notify_event) {
+        ResetEvent(pool->notify_event);
+    }
+#else
     char buf[128];
     while (read(pool->notify_fds[0], buf, sizeof(buf)) > 0) {
     }
+#endif
 }
 
 bool http_pool_submit(HttpPool *pool, HttpJobType type, uint64_t request_gen,
@@ -370,9 +515,9 @@ bool http_pool_submit(HttpPool *pool, HttpJobType type, uint64_t request_gen,
         return false;
     }
 
-    pthread_mutex_lock(&pool->mu);
+    pool_lock(pool);
     if (pool->stop) {
-        pthread_mutex_unlock(&pool->mu);
+        pool_unlock(pool);
         if (free_arg && arg) free_arg(arg);
         return false;
     }
@@ -408,7 +553,7 @@ bool http_pool_submit(HttpPool *pool, HttpJobType type, uint64_t request_gen,
             }
         }
         if (!evicted) {
-            pthread_mutex_unlock(&pool->mu);
+            pool_unlock(pool);
             if (free_arg && arg) free_arg(arg);
             return false;
         }
@@ -422,21 +567,21 @@ bool http_pool_submit(HttpPool *pool, HttpJobType type, uint64_t request_gen,
         .free_arg = free_arg,
         .free_res = free_res,
     };
-    pthread_cond_signal(&pool->cond);
-    pthread_mutex_unlock(&pool->mu);
+    pool_cond_signal(pool);
+    pool_unlock(pool);
     return true;
 }
 
 void http_pool_set_active_gen(HttpPool *pool, uint64_t gen) {
     if (!pool) return;
-    pthread_mutex_lock(&pool->mu);
+    pool_lock(pool);
     pool->active_gen = gen;
-    pthread_mutex_unlock(&pool->mu);
+    pool_unlock(pool);
 }
 
 void http_pool_drop_thumbnails(HttpPool *pool) {
     if (!pool) return;
-    pthread_mutex_lock(&pool->mu);
+    pool_lock(pool);
     size_t w = 0;
     for (size_t i = 0; i < pool->job_count; i++) {
         if (pool->jobs[i].type == JOB_THUMBNAIL) {
@@ -447,27 +592,27 @@ void http_pool_drop_thumbnails(HttpPool *pool) {
         }
     }
     pool->job_count = w;
-    pthread_mutex_unlock(&pool->mu);
+    pool_unlock(pool);
 }
 
 void http_pool_set_active_detail_gen(HttpPool *pool, uint64_t gen) {
     if (!pool) return;
-    pthread_mutex_lock(&pool->mu);
+    pool_lock(pool);
     pool->active_detail_gen = gen;
-    pthread_mutex_unlock(&pool->mu);
+    pool_unlock(pool);
 }
 
 bool http_pool_should_cancel(HttpPool *pool, uint64_t request_gen) {
     if (!pool) return false;
-    pthread_mutex_lock(&pool->mu);
+    pool_lock(pool);
     bool cancel = pool->stop || (request_gen < pool->active_gen);
-    pthread_mutex_unlock(&pool->mu);
+    pool_unlock(pool);
     return cancel;
 }
 
 void http_pool_post_progress(HttpPool *pool, HttpJobType type, uint64_t gen, const char *msg) {
     if (!pool || !msg) return;
-    pthread_mutex_lock(&pool->mu);
+    pool_lock(pool);
     if (!pool->stop) {
         HttpResult res = {0};
         res.kind = RES_PROGRESS;
@@ -476,20 +621,20 @@ void http_pool_post_progress(HttpPool *pool, HttpJobType type, uint64_t gen, con
         res.progress_text = tt_strdup(msg);
         push_result_locked(pool, res);
     }
-    pthread_mutex_unlock(&pool->mu);
+    pool_unlock(pool);
 }
 
 bool http_pool_pop_result(HttpPool *pool, HttpResult *out) {
     if (!pool || !out) return false;
-    pthread_mutex_lock(&pool->mu);
+    pool_lock(pool);
     ResultNode *node = pool->res_head;
     if (!node) {
-        pthread_mutex_unlock(&pool->mu);
+        pool_unlock(pool);
         return false;
     }
     pool->res_head = node->next;
     if (!pool->res_head) pool->res_tail = NULL;
-    pthread_mutex_unlock(&pool->mu);
+    pool_unlock(pool);
 
     *out = node->res;
     free(node);

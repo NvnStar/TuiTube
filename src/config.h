@@ -1,11 +1,17 @@
 #ifndef TUITUBE_CONFIG_H
 #define TUITUBE_CONFIG_H
 
+#include "tt_keysyms.h"
+#include "util.h"
+
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <xkbcommon/xkbcommon.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 typedef struct {
     uint8_t r;
@@ -77,12 +83,18 @@ typedef struct {
 } KeyBinding;
 
 typedef struct {
+    char *language;
+    char *region;
+    char resolved_hl[16];
+    char resolved_gl[8];
     double scale;
     char *font;
     int font_size;
     int thumb_size;
     int playlist_width;
     char *player_path;
+    char *ytdlp_path;
+    bool has_ytdlp_path;
     char *video_format;
     bool has_video_format;
     char *sub_language;
@@ -108,6 +120,7 @@ typedef struct {
     size_t key_binding_count;
 
     char config_dir[PATH_MAX];
+    char config_file_dir[PATH_MAX];
     char cache_dir[PATH_MAX];
     bool portable_mode;
     Theme theme;
@@ -122,9 +135,17 @@ bool config_mods_from_string(const char *s, uint32_t *out_mods);
 bool config_key_from_string(const char *s, xkb_keysym_t *out_sym);
 KeyAction config_match_keybinding(const TuiTubeConfig *cfg, uint32_t mods, xkb_keysym_t sym);
 bool config_format_action_shortcut(const TuiTubeConfig *cfg, KeyAction act, char *out, size_t out_cap);
+bool config_mpv_key_name(xkb_keysym_t sym, char *out, size_t out_cap);
+bool config_build_mpv_overlay_section(const TuiTubeConfig *cfg,
+                                      const char *client_name,
+                                      const char *close_win_cmd,
+                                      StrBuf *out);
 
 void config_init_defaults(TuiTubeConfig *cfg);
+void config_resolve_locale(TuiTubeConfig *cfg);
 bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir);
+bool config_load_from(TuiTubeConfig *cfg, const char *cli_config_dir,
+                      const char *override_config_file);
 bool config_apply_theme(TuiTubeConfig *cfg, const char *theme_name);
 double config_effective_ui_scale(const TuiTubeConfig *cfg);
 char *config_resolve_asset_path(const TuiTubeConfig *cfg, const char *rel_or_abs);

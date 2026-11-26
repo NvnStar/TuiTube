@@ -1,11 +1,15 @@
 #include "image.h"
 #include "util.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dirent.h>
+#include <unistd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <jpeglib.h>
 #include <png.h>
 #include <setjmp.h>
@@ -395,6 +399,38 @@ void thumb_cache_clear(ThumbCache *tc) {
     if (!tc) return;
     thumb_cache_flush_mem(tc);
     if (!tc->cache_dir || !tc->cache_dir[0]) return;
+#ifdef _WIN32
+    char *pattern = tt_path_join(tc->cache_dir, "*.img");
+    if (!pattern) return;
+    wchar_t *wpat = tt_utf8_to_wide(pattern);
+    free(pattern);
+    if (!wpat) return;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    free(wpat);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char *name = tt_wide_to_utf8(fd.cFileName);
+        if (name) {
+            size_t nlen = strlen(name);
+            if (nlen > 4 && strcmp(name + nlen - 4, ".img") == 0) {
+                char *p = tt_path_join(tc->cache_dir, name);
+                if (p) {
+                    wchar_t *wp = tt_utf8_to_wide(p);
+                    if (wp) {
+                        DeleteFileW(wp);
+                        free(wp);
+                    }
+                    free(p);
+                }
+            }
+            free(name);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+#else
     DIR *d = opendir(tc->cache_dir);
     if (!d) return;
     struct dirent *ent;
@@ -409,6 +445,7 @@ void thumb_cache_clear(ThumbCache *tc) {
         }
     }
     closedir(d);
+#endif
 }
 
 static char *disk_cache_path(const char *cache_dir, const char *key) {
