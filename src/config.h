@@ -2,6 +2,7 @@
 #define TUITUBE_CONFIG_H
 
 #include "tt_keysyms.h"
+#include "util.h"
 
 #include <limits.h>
 #include <stdbool.h>
@@ -127,6 +128,11 @@ bool config_mods_from_string(const char *s, uint32_t *out_mods);
 bool config_key_from_string(const char *s, xkb_keysym_t *out_sym);
 KeyAction config_match_keybinding(const TuiTubeConfig *cfg, uint32_t mods, xkb_keysym_t sym);
 bool config_format_action_shortcut(const TuiTubeConfig *cfg, KeyAction act, char *out, size_t out_cap);
+bool config_mpv_key_name(xkb_keysym_t sym, char *out, size_t out_cap);
+bool config_build_mpv_overlay_section(const TuiTubeConfig *cfg,
+                                      const char *client_name,
+                                      const char *close_win_cmd,
+                                      StrBuf *out);
 
 void config_init_defaults(TuiTubeConfig *cfg);
 bool config_load(TuiTubeConfig *cfg, const char *cli_config_dir);

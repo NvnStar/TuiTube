@@ -1392,6 +1392,93 @@ static void test_ttf_family_name_parser(void) {
     assert(strcmp(fam, "\xF0\x9F\x8E\xB5" "A") == 0);
 }
 
+static void test_mpv_overlay_section_close_win_and_bindings(void) {
+    TuiTubeConfig cfg;
+    config_init_defaults(&cfg);
+
+    StrBuf sb;
+    sb_init(&sb);
+
+    /* 1. Default config & CLOSE_WIN fallback */
+    assert(config_build_mpv_overlay_section(&cfg, "tuitube", NULL, &sb));
+    assert(sb.data != NULL);
+    assert(strncmp(sb.data, "CLOSE_WIN quit\n", 15) == 0 ||
+           strstr(sb.data, "\nCLOSE_WIN quit\n") != NULL);
+
+    /* Sanitization fallbacks */
+    static const char *const invalid_cmds[] = {
+        "",
+        "   \t  ",
+        "ignore",
+        "IGNORE",
+        "# comment",
+        "quit\nset pause yes",
+        "quit\r\nset pause yes",
+        "noop",
+        "script-binding tuitube/noop"
+    };
+    for (size_t i = 0; i < sizeof(invalid_cmds) / sizeof(invalid_cmds[0]); i++) {
+        assert(config_build_mpv_overlay_section(&cfg, "tuitube", invalid_cmds[i], &sb));
+        assert(strncmp(sb.data, "CLOSE_WIN quit\n", 15) == 0 ||
+               strstr(sb.data, "\nCLOSE_WIN quit\n") != NULL);
+    }
+
+    /* CLOSE_WIN appears before UNMAPPED, and UNMAPPED is the final line */
+    const char *close_pos = strstr(sb.data, "CLOSE_WIN quit\n");
+    const char *unmapped_line = "UNMAPPED repeatable script-binding tuitube/noop\n";
+    const char *unmapped_pos = strstr(sb.data, unmapped_line);
+    assert(close_pos != NULL && unmapped_pos != NULL);
+    assert(close_pos < unmapped_pos);
+    assert(unmapped_pos + strlen(unmapped_line) == sb.data + sb.len);
+
+    /* No WM-specific shortcut hardcoded under default config */
+    assert(strstr(sb.data, "Meta+q") == NULL);
+    assert(strstr(sb.data, "Meta+Q") == NULL);
+    assert(strstr(sb.data, "Super+q") == NULL);
+    assert(strstr(sb.data, "Super+Q") == NULL);
+
+    /* Core overlay bindings remain present */
+    assert(strstr(sb.data, "F12 script-binding tuitube/toggle\n") != NULL);
+    assert(strstr(sb.data, "Ctrl+q script-binding tuitube/input\n") != NULL);
+    assert(strstr(sb.data, "ANY_UNICODE repeatable script-binding tuitube/input\n") != NULL);
+
+    /* 2. Custom host CLOSE_WIN command preservation */
+    assert(config_build_mpv_overlay_section(&cfg, "tuitube", "  quit-watch-later  ", &sb));
+    assert(strstr(sb.data, "CLOSE_WIN quit-watch-later\n") != NULL);
+
+    assert(config_build_mpv_overlay_section(&cfg, "tuitube", "quit 4", &sb));
+    assert(strstr(sb.data, "CLOSE_WIN quit 4\n") != NULL);
+
+    /* 3. config_mpv_key_name() & custom tuitube.json modifier keybindings */
+    char kname[16];
+    assert(config_mpv_key_name(XKB_KEY_Q, kname, sizeof(kname)) && strcmp(kname, "q") == 0);
+    assert(config_mpv_key_name(XKB_KEY_F4, kname, sizeof(kname)) && strcmp(kname, "F4") == 0);
+    assert(config_mpv_key_name(XKB_KEY_Return, kname, sizeof(kname)) && strcmp(kname, "ENTER") == 0);
+    assert(config_mpv_key_name(XKB_KEY_BackSpace, kname, sizeof(kname)) && strcmp(kname, "BS") == 0);
+    assert(config_mpv_key_name(XKB_KEY_bracketright, kname, sizeof(kname)) && strcmp(kname, "]") == 0);
+    assert(!config_mpv_key_name(XKB_KEY_NoSymbol, kname, sizeof(kname)));
+
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_ovsec", tmpdir, sizeof(tmpdir));
+    char cfg_file[PATH_MAX + 32];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+    const char *json_cfg =
+        "{ \"key_bindings\": [ { \"action\": \"show_feed\", \"mod\": \"SUPER\", \"key\": \"R\" } ] }\n";
+    assert(tt_write_file_atomic(cfg_file, json_cfg, strlen(json_cfg)));
+
+    TuiTubeConfig cfg2;
+    assert(config_load(&cfg2, tmpdir));
+    assert(config_build_mpv_overlay_section(&cfg2, "custom_client", NULL, &sb));
+    assert(strstr(sb.data, "Meta+r script-binding custom_client/input\n") != NULL);
+    assert(strstr(sb.data, "CLOSE_WIN quit\n") != NULL);
+
+    config_free(&cfg2);
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
+    sb_free(&sb);
+    config_free(&cfg);
+}
+
 int main(void) {
     RUN_TEST(test_util_utf8_and_entities);
     RUN_TEST(test_search_params_encoding);
@@ -1416,6 +1503,7 @@ int main(void) {
     RUN_TEST(test_win32_cmdline_quoting);
     RUN_TEST(test_windows_paths_and_script_opts);
     RUN_TEST(test_ttf_family_name_parser);
+    RUN_TEST(test_mpv_overlay_section_close_win_and_bindings);
 
     printf("\nAll %d tests passed!\n", g_tests_run);
     return 0;

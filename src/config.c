@@ -639,3 +639,193 @@ void config_free(TuiTubeConfig *cfg) {
     free(cfg->key_bindings);
     memset(cfg, 0, sizeof(*cfg));
 }
+
+bool config_mpv_key_name(xkb_keysym_t sym, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return false;
+    out[0] = '\0';
+
+    int n = -1;
+    if (sym >= XKB_KEY_A && sym <= XKB_KEY_Z) {
+        n = snprintf(out, out_cap, "%c", (char)(sym - XKB_KEY_A + 'a'));
+    } else if (sym >= XKB_KEY_a && sym <= XKB_KEY_z) {
+        n = snprintf(out, out_cap, "%c", (char)sym);
+    } else if (sym >= XKB_KEY_0 && sym <= XKB_KEY_9) {
+        n = snprintf(out, out_cap, "%c", (char)sym);
+    } else if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F12) {
+        n = snprintf(out, out_cap, "F%u", (unsigned)(sym - XKB_KEY_F1 + 1));
+    } else {
+        const char *named = NULL;
+        switch (sym) {
+            case XKB_KEY_Escape:       named = "ESC"; break;
+            case XKB_KEY_Return:
+            case XKB_KEY_KP_Enter:     named = "ENTER"; break;
+            case XKB_KEY_Tab:          named = "TAB"; break;
+            case XKB_KEY_BackSpace:    named = "BS"; break;
+            case XKB_KEY_Delete:       named = "DEL"; break;
+            case XKB_KEY_Insert:       named = "INS"; break;
+            case XKB_KEY_Left:         named = "LEFT"; break;
+            case XKB_KEY_Right:        named = "RIGHT"; break;
+            case XKB_KEY_Up:           named = "UP"; break;
+            case XKB_KEY_Down:         named = "DOWN"; break;
+            case XKB_KEY_Page_Up:      named = "PGUP"; break;
+            case XKB_KEY_Page_Down:    named = "PGDWN"; break;
+            case XKB_KEY_Home:         named = "HOME"; break;
+            case XKB_KEY_End:          named = "END"; break;
+            case XKB_KEY_space:        named = "SPACE"; break;
+            case XKB_KEY_apostrophe:   named = "'"; break;
+            case XKB_KEY_comma:        named = ","; break;
+            case XKB_KEY_minus:        named = "-"; break;
+            case XKB_KEY_period:       named = "."; break;
+            case XKB_KEY_slash:        named = "/"; break;
+            case XKB_KEY_question:     named = "?"; break;
+            case XKB_KEY_semicolon:    named = ";"; break;
+            case XKB_KEY_equal:        named = "="; break;
+            case XKB_KEY_bracketleft:  named = "["; break;
+            case XKB_KEY_bracketright: named = "]"; break;
+            case XKB_KEY_backslash:    named = "\\"; break;
+            case XKB_KEY_grave:        named = "`"; break;
+            default:                   return false;
+        }
+        n = snprintf(out, out_cap, "%s", named);
+    }
+
+    if (n < 0 || (size_t)n >= out_cap) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static void sanitize_close_win_cmd(const char *close_win_cmd,
+                                   const char **out_start,
+                                   size_t *out_len) {
+    static const char fallback[] = "quit";
+    *out_start = fallback;
+    *out_len = sizeof(fallback) - 1u;
+
+    if (!close_win_cmd) return;
+
+    for (const char *p = close_win_cmd; *p != '\0'; p++) {
+        if (*p == '\n' || *p == '\r') return;
+    }
+
+    const char *start = close_win_cmd;
+    while (*start == ' ' || *start == '\t') start++;
+
+    size_t len = strlen(start);
+    while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t')) {
+        len--;
+    }
+
+    if (len == 0 || start[0] == '#') return;
+    if (len == 6 && tt_strncasecmp(start, "ignore", 6) == 0) return;
+    if (len == 4 && tt_strncasecmp(start, "noop", 4) == 0) return;
+    if (len >= 5 && tt_strncasecmp(start + (len - 5), "/noop", 5) == 0) return;
+
+    *out_start = start;
+    *out_len = len;
+}
+
+bool config_build_mpv_overlay_section(const TuiTubeConfig *cfg,
+                                      const char *client_name,
+                                      const char *close_win_cmd,
+                                      StrBuf *out) {
+    if (!out) return false;
+    sb_clear(out);
+
+    const char *cname = (client_name && client_name[0]) ? client_name : "tuitube";
+
+    const char *close_slice = NULL;
+    size_t close_len = 0;
+    sanitize_close_win_cmd(close_win_cmd, &close_slice, &close_len);
+
+    bool ok = sb_append(out, "CLOSE_WIN ") &&
+              sb_append_n(out, close_slice, close_len) &&
+              sb_append_char(out, '\n');
+
+    /* Mouse bindings */
+    ok = ok && sb_appendf(out, "MOUSE_MOVE script-binding %s/mouse_move\n", cname);
+    ok = ok && sb_appendf(out, "MOUSE_LEAVE script-binding %s/mouse_leave\n", cname);
+
+    static const char *const mouse_btns[] = {
+        "MBTN_LEFT", "MBTN_LEFT_DBL", "MBTN_RIGHT",
+        "MBTN_MID", "MBTN_BACK", "MBTN_FORWARD"
+    };
+    for (size_t i = 0; ok && i < sizeof(mouse_btns) / sizeof(mouse_btns[0]); i++) {
+        ok = sb_appendf(out, "%s script-binding %s/input\n", mouse_btns[i], cname);
+    }
+
+    static const char *const wheel_btns[] = {
+        "WHEEL_UP", "WHEEL_DOWN", "WHEEL_LEFT", "WHEEL_RIGHT"
+    };
+    for (size_t i = 0; ok && i < sizeof(wheel_btns) / sizeof(wheel_btns[0]); i++) {
+        ok = sb_appendf(out, "%s repeatable script-binding %s/input\n", wheel_btns[i], cname);
+    }
+
+    /* Toggle shortcut inside overlay */
+    ok = ok && sb_appendf(out, "F12 script-binding %s/toggle\n", cname);
+
+    /* Printable / Unicode / IME */
+    ok = ok && sb_appendf(out, "ANY_UNICODE repeatable script-binding %s/input\n", cname);
+    ok = ok && sb_appendf(out, "SPACE repeatable script-binding %s/input\n", cname);
+    ok = ok && sb_appendf(out, "SHARP repeatable script-binding %s/input\n", cname);
+    ok = ok && sb_appendf(out, "KP_DIVIDE repeatable script-binding %s/input\n", cname);
+
+    /* Navigation & editing keys across modifier prefixes */
+    static const char *const mod_prefixes[] = {
+        "", "Shift+", "Ctrl+", "Alt+", "Ctrl+Shift+", "Ctrl+Alt+"
+    };
+    static const struct { const char *key; bool rep; } nav_keys[] = {
+        {"ESC", false}, {"ENTER", false}, {"KP_ENTER", false}, {"TAB", false},
+        {"BS", true}, {"DEL", true}, {"INS", false},
+        {"UP", true}, {"DOWN", true}, {"LEFT", true}, {"RIGHT", true},
+        {"PGUP", true}, {"PGDWN", true}, {"HOME", false}, {"END", false},
+        {"F1", false}, {"F2", false}, {"F3", false}, {"F4", false},
+        {"F5", false}, {"F6", false}, {"F7", false}, {"F8", false},
+        {"F9", false}, {"F10", false}, {"F11", false}
+    };
+    for (size_t m = 0; ok && m < sizeof(mod_prefixes) / sizeof(mod_prefixes[0]); m++) {
+        for (size_t k = 0; ok && k < sizeof(nav_keys) / sizeof(nav_keys[0]); k++) {
+            ok = sb_appendf(out, "%s%s%s script-binding %s/input\n",
+                            mod_prefixes[m], nav_keys[k].key,
+                            nav_keys[k].rep ? " repeatable" : "", cname);
+        }
+    }
+
+    /* Modified printable shortcuts */
+    for (char c = 'a'; ok && c <= 'z'; c++) {
+        ok = sb_appendf(out, "Ctrl+%c script-binding %s/input\n", c, cname) &&
+             sb_appendf(out, "Ctrl+Shift+%c script-binding %s/input\n", c, cname);
+    }
+    static const char *const ctrl_punct[] = {
+        "[", "]", "/", "-", "=", "\\", ";", "'", ",", "."
+    };
+    for (size_t i = 0; ok && i < sizeof(ctrl_punct) / sizeof(ctrl_punct[0]); i++) {
+        ok = sb_appendf(out, "Ctrl+%s script-binding %s/input\n", ctrl_punct[i], cname);
+    }
+
+    /* Additional configured modifier+key combinations (no WM shortcuts hardcoded) */
+    if (cfg) {
+        for (size_t i = 0; ok && i < cfg->key_binding_count; i++) {
+            const KeyBinding *kb = &cfg->key_bindings[i];
+            if (kb->mods == 0) continue;
+            char kname[16];
+            if (!config_mpv_key_name(kb->keysym, kname, sizeof(kname))) continue;
+            ok = sb_appendf(out, "%s%s%s%s%s script-binding %s/input\n",
+                            (kb->mods & TT_MOD_CTRL) ? "Ctrl+" : "",
+                            (kb->mods & TT_MOD_ALT) ? "Alt+" : "",
+                            (kb->mods & TT_MOD_SHIFT) ? "Shift+" : "",
+                            (kb->mods & TT_MOD_SUPER) ? "Meta+" : "",
+                            kname, cname);
+        }
+    }
+
+    /* Catch-all so unmapped keys never leak to mpv while exclusive */
+    ok = ok && sb_appendf(out, "UNMAPPED repeatable script-binding %s/noop\n", cname);
+
+    if (!ok || !out->data) {
+        sb_free(out);
+        return false;
+    }
+    return true;
+}

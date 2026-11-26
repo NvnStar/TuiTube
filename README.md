@@ -112,8 +112,13 @@ mpv.exe --idle --script=.\tuitube.dll
   Tab script-message tuitube-toggle
   ```
   (`script-binding tuitube/toggle`, `script-message tuitube-open`, and `script-message tuitube-close` are also supported.)
+- **Closing `mpv`:** Triggering an OS/window-manager close-window action (titlebar `[X]`, `Alt+F4`, or your compositor's window-close shortcut) quits `mpv` directly even while the TuiTube overlay is open (`Ctrl+Q` and `Esc` hide only the overlay).
 - **Playback Behavior:** Videos play directly in the host `mpv` window via `loadfile`, respecting your `mpv.conf` unless `"video_format"` or `"sub_language"` are explicitly set in `tuitube.json`.
 - **Override Config Dir:** Pass `--script-opts=tuitube-config_dir=/path/to/dir` (or `C:\path\to\dir` on Windows).
+
+> **Windows Security Note (Unsigned Binaries):** Windows release binaries (`tuitube.exe`, `tuitube.dll`, and bundled MSYS2 UCRT64 runtime DLLs) are **unsigned** open-source builds.
+> - **Microsoft Defender SmartScreen:** Click *More info -> Run anyway*, or run `Unblock-File .\tuitube-windows-x64.zip` in PowerShell before extracting.
+> - **Windows 11 Smart App Control (SAC):** When SAC is **On**, kernel Code Integrity blocks all unsigned `.exe`/`.dll` files without a *Run anyway* prompt; set Smart App Control to **Off** under *Windows Security -> App & browser control -> Smart App Control settings* to run unsigned builds.
 
 ### Shared State & Portable Mode
 
@@ -130,7 +135,7 @@ Starter files: [examples/tuitube.json](examples/tuitube.json) · [examples/sampl
 | Key / Input | Action |
 | :--- | :--- |
 | `F12` *(plugin)* | Toggle TuiTube overlay inside `mpv` |
-| `Ctrl+Q` | Quit (`./tuitube`) / Hide overlay (`tuitube.so`) |
+| `Ctrl+Q` | Quit (`./tuitube` / `tuitube.exe`) / Hide overlay (`tuitube.so` / `tuitube.dll`; OS/WM window close quits `mpv`) |
 | `Ctrl+L` or `/` | Focus search box (`Esc` returns to list, `Ctrl+U`/`Ctrl+BackSpace` edit) |
 | `Tab` / `Shift+Tab` | Cycle focus across Search, List, and Detail panes |
 | `Enter` / Double-Click | Play selected video or open channel/playlist |
