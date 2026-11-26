@@ -1479,6 +1479,40 @@ static void test_mpv_overlay_section_close_win_and_bindings(void) {
     config_free(&cfg);
 }
 
+static void test_player_launch_and_exe_resolution(void) {
+    TuiTubeConfig cfg;
+    config_init_defaults(&cfg);
+
+    MediaItem vid = {0};
+    vid.kind = ITEM_VIDEO;
+    snprintf(vid.id, sizeof(vid.id), "dQw4w9WgXcQ");
+    vid.title = tt_strdup("Launch Test");
+
+    char err[256] = {0};
+
+    /* Nonexistent player must fail with a clear diagnostic */
+    free(cfg.player_path);
+    cfg.player_path = tt_strdup("tuitube_definitely_missing_player_99999");
+    assert(!player_launch(&cfg, &vid, err, sizeof(err)));
+    assert(strstr(err, "Failed to launch player:") != NULL);
+
+    /* Real executable must spawn cleanly (catches invalid CreateProcessW flags on Windows) */
+    free(cfg.player_path);
+#ifdef _WIN32
+    char *cmd_exe = tt_win32_resolve_exe("cmd");
+    assert(cmd_exe != NULL && tt_file_exists(cmd_exe));
+    free(cmd_exe);
+    cfg.player_path = tt_strdup("where");
+#else
+    cfg.player_path = tt_strdup("true");
+#endif
+    err[0] = '\0';
+    assert(player_launch(&cfg, &vid, err, sizeof(err)));
+
+    media_item_free_fields(&vid);
+    config_free(&cfg);
+}
+
 int main(void) {
     RUN_TEST(test_util_utf8_and_entities);
     RUN_TEST(test_search_params_encoding);
@@ -1504,6 +1538,7 @@ int main(void) {
     RUN_TEST(test_windows_paths_and_script_opts);
     RUN_TEST(test_ttf_family_name_parser);
     RUN_TEST(test_mpv_overlay_section_close_win_and_bindings);
+    RUN_TEST(test_player_launch_and_exe_resolution);
 
     printf("\nAll %d tests passed!\n", g_tests_run);
     return 0;

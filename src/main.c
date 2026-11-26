@@ -2,6 +2,7 @@
 #include "http.h"
 #include "player.h"
 #include "ui.h"
+#include "util.h"
 #include "wayland.h"
 
 #include <stdio.h>
@@ -109,7 +110,9 @@ int main(int argc, char **argv) {
         }
     }
 
-#ifndef _WIN32
+#ifdef _WIN32
+    tt_win32_refresh_path();
+#else
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_stop_sig);
     signal(SIGTERM, handle_stop_sig);

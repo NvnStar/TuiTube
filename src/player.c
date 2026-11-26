@@ -182,14 +182,16 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
                           : NULL;
 
 #ifdef _WIN32
+    char *resolved_player = tt_win32_resolve_exe(player);
+    const char *launch_exe = (resolved_player && resolved_player[0]) ? resolved_player : player;
     char *cmdline = NULL;
-    if (is_vlc_path(player)) {
-        const char *argv_vlc[] = {player, arg_title_vlc, url, NULL};
+    if (is_vlc_path(launch_exe)) {
+        const char *argv_vlc[] = {launch_exe, arg_title_vlc, url, NULL};
         cmdline = tt_win32_build_cmdline(argv_vlc);
     } else {
         const char *argv_mpv[8];
         int idx = 0;
-        argv_mpv[idx++] = player;
+        argv_mpv[idx++] = launch_exe;
         argv_mpv[idx++] = "--ytdl=yes";
         argv_mpv[idx++] = arg_fmt;
         argv_mpv[idx++] = arg_title_mpv;
@@ -205,15 +207,38 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
     free(arg_slang);
 
     if (!cmdline) {
+        free(resolved_player);
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Out of memory");
         return false;
     }
 
+    wchar_t *wapp = (resolved_player && tt_file_exists(resolved_player))
+                        ? tt_utf8_to_wide(resolved_player)
+                        : NULL;
     wchar_t *wcmd = tt_utf8_to_wide(cmdline);
     free(cmdline);
+    free(resolved_player);
     if (!wcmd) {
+        free(wapp);
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Out of memory");
         return false;
+    }
+
+    wchar_t *wcwd = NULL;
+    if (wapp) {
+        const wchar_t *last_sep = NULL;
+        for (const wchar_t *p = wapp; *p; p++) {
+            if (*p == L'\\' || *p == L'/') last_sep = p;
+        }
+        if (last_sep && last_sep > wapp) {
+            size_t dlen = (size_t)(last_sep - wapp);
+            if (dlen == 2 && wapp[1] == L':') dlen = 3;
+            wcwd = malloc((dlen + 1u) * sizeof(wchar_t));
+            if (wcwd) {
+                memcpy(wcwd, wapp, dlen * sizeof(wchar_t));
+                wcwd[dlen] = L'\0';
+            }
+        }
     }
 
     STARTUPINFOW si;
@@ -222,13 +247,24 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
     memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
 
-    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE,
-                             CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT,
-                             NULL, NULL, &si, &pi);
+    /* CREATE_NO_WINDOW suppresses console flashes for shims/mpv.com while
+       GUI apps like mpv.exe ignore it; never combine with DETACHED_PROCESS
+       (mutually exclusive -> ERROR_INVALID_PARAMETER). */
+    BOOL ok = CreateProcessW(wapp, wcmd, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                             NULL, wcwd, &si, &pi);
+    DWORD last_err = ok ? 0 : GetLastError();
+    free(wcwd);
+    free(wapp);
     free(wcmd);
     if (!ok) {
         if (err_buf && err_cap) {
-            snprintf(err_buf, err_cap, "Failed to launch player: %s", player);
+            if (last_err == ERROR_FILE_NOT_FOUND || last_err == ERROR_PATH_NOT_FOUND) {
+                snprintf(err_buf, err_cap, "Failed to launch player: %s (not found in PATH)", player);
+            } else {
+                snprintf(err_buf, err_cap, "Failed to launch player: %s (error %lu)",
+                         player, (unsigned long)last_err);
+            }
         }
         return false;
     }
@@ -595,8 +631,10 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
     snprintf(url, sizeof(url), "https://www.youtube.com/watch?v=%s", video->id);
 
 #ifdef _WIN32
+    char *resolved_ytdlp = tt_win32_resolve_exe("yt-dlp");
+    const char *ytdlp_exe = (resolved_ytdlp && resolved_ytdlp[0]) ? resolved_ytdlp : "yt-dlp";
     const char *argv[] = {
-        "yt-dlp",
+        ytdlp_exe,
         "--no-playlist",
         "--no-simulate",
         "--progress",
@@ -614,13 +652,19 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
     };
     char *cmdline = tt_win32_build_cmdline(argv);
     if (!cmdline) {
+        free(resolved_ytdlp);
         free(dir);
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Out of memory");
         return false;
     }
+    wchar_t *wapp = (resolved_ytdlp && tt_file_exists(resolved_ytdlp))
+                        ? tt_utf8_to_wide(resolved_ytdlp)
+                        : NULL;
     wchar_t *wcmd = tt_utf8_to_wide(cmdline);
     free(cmdline);
+    free(resolved_ytdlp);
     if (!wcmd) {
+        free(wapp);
         free(dir);
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Out of memory");
         return false;
@@ -629,6 +673,7 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
     SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
     HANDLE out_read = NULL, out_write = NULL;
     if (!CreatePipe(&out_read, &out_write, &sa, 0)) {
+        free(wapp);
         free(wcmd);
         free(dir);
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to create output pipe");
@@ -652,16 +697,25 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
     si.hStdError = out_write;
     si.hStdInput = (h_nul != INVALID_HANDLE_VALUE) ? h_nul : NULL;
 
-    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
+    BOOL ok = CreateProcessW(wapp, wcmd, NULL, NULL, TRUE,
                              CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
                              NULL, NULL, &si, &pi);
+    DWORD last_err = ok ? 0 : GetLastError();
+    free(wapp);
     free(wcmd);
     CloseHandle(out_write);
     if (h_nul != INVALID_HANDLE_VALUE) CloseHandle(h_nul);
     if (!ok) {
         CloseHandle(out_read);
         free(dir);
-        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Failed to launch yt-dlp");
+        if (err_buf && err_cap) {
+            if (last_err == ERROR_FILE_NOT_FOUND || last_err == ERROR_PATH_NOT_FOUND) {
+                snprintf(err_buf, err_cap, "Failed to launch yt-dlp (not found in PATH)");
+            } else {
+                snprintf(err_buf, err_cap, "Failed to launch yt-dlp (error %lu)",
+                         (unsigned long)last_err);
+            }
+        }
         return false;
     }
     CloseHandle(pi.hThread);

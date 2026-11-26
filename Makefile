@@ -26,7 +26,7 @@ ifeq ($(TARGET_OS),windows)
 WIN_PKG_DEPS := cairo pangocairo libcurl yyjson libjpeg libpng
 WIN_PKG_CFLAGS := $(shell pkg-config --cflags $(WIN_PKG_DEPS))
 WIN_PKG_LIBS := $(shell pkg-config --libs $(WIN_PKG_DEPS))
-WIN_SYS_LIBS := -lgdi32 -luser32 -limm32 -ldwmapi -lshell32 -lole32 -luuid -lm
+WIN_SYS_LIBS := -lgdi32 -luser32 -ladvapi32 -limm32 -ldwmapi -lshell32 -lole32 -luuid -lm
 
 WIN_CFLAGS_BASE := -std=c17 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 -D_CRT_SECURE_NO_WARNINGS -Isrc $(WIN_PKG_CFLAGS) -Wall -Wextra -Wpedantic
 WIN_CFLAGS_RELEASE := $(WIN_CFLAGS_BASE) -O2

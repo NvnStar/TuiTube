@@ -14,6 +14,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <wchar.h>
+#include <wctype.h>
 #else
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -979,20 +980,451 @@ bool tt_ttf_read_family_name(const uint8_t *data, size_t len, char *out, size_t 
     return out[0] != '\0';
 }
 
+#ifdef _WIN32
+static bool win32_has_path_sep(const char *s) {
+    if (!s) return false;
+    for (const char *p = s; *p; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':') return true;
+    }
+    return false;
+}
+
+static bool win32_has_ext(const char *s) {
+    if (!s) return false;
+    const char *base = s;
+    for (const char *p = s; *p; p++) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
+    const char *dot = strrchr(base, '.');
+    return dot != NULL && dot[1] != '\0';
+}
+
+static bool win32_dir_exists_w(const wchar_t *wdir) {
+    if (!wdir || !wdir[0]) return false;
+    DWORD attr = GetFileAttributesW(wdir);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static wchar_t *win32_read_reg_path(HKEY root, const wchar_t *subkey) {
+    DWORD cb = 0;
+    LSTATUS st = RegGetValueW(root, subkey, L"Path",
+                              RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+                              NULL, NULL, &cb);
+    if (st != ERROR_SUCCESS || cb < sizeof(wchar_t)) return NULL;
+    wchar_t *buf = malloc((size_t)cb + sizeof(wchar_t));
+    if (!buf) return NULL;
+    st = RegGetValueW(root, subkey, L"Path",
+                      RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+                      NULL, buf, &cb);
+    if (st != ERROR_SUCCESS) {
+        free(buf);
+        return NULL;
+    }
+    buf[cb / sizeof(wchar_t)] = L'\0';
+    return buf;
+}
+
+static size_t win32_trim_path_seg(const wchar_t *s, size_t len) {
+    while (len > 1u && (s[len - 1u] == L'\\' || s[len - 1u] == L'/')) {
+        if (len == 3u && s[1] == L':') break;
+        len--;
+    }
+    return len;
+}
+
+static bool win32_wcsieq_n(const wchar_t *a, size_t alen, const wchar_t *b, size_t blen) {
+    if (alen != blen) return false;
+    for (size_t i = 0; i < alen; i++) {
+        wint_t ca = (a[i] == L'/') ? (wint_t)L'\\' : towlower((wint_t)a[i]);
+        wint_t cb = (b[i] == L'/') ? (wint_t)L'\\' : towlower((wint_t)b[i]);
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+static char *win32_path_join_bs(const char *base, const char *rel) {
+    if (!rel || !rel[0]) return NULL;
+    if (!base || !base[0]) return tt_strdup(rel);
+    size_t blen = strlen(base);
+    while (blen > 1 && is_path_sep(base[blen - 1])) {
+        if (blen == 3 && isalpha((unsigned char)base[0]) && base[1] == ':') break;
+        blen--;
+    }
+    if (is_path_sep(base[blen - 1])) {
+        return tt_asprintf("%.*s%s", (int)blen, base, rel);
+    }
+    return tt_asprintf("%.*s\\%s", (int)blen, base, rel);
+}
+
+static bool win32_path_contains_seg(const wchar_t *path_str, const wchar_t *seg, size_t seg_len) {
+    if (!path_str || !seg || seg_len == 0) return false;
+    size_t want_len = win32_trim_path_seg(seg, seg_len);
+    const wchar_t *p = path_str;
+    while (*p) {
+        const wchar_t *semi = wcschr(p, L';');
+        size_t slen = semi ? (size_t)(semi - p) : wcslen(p);
+        while (slen > 0 && (*p == L' ' || *p == L'\t')) { p++; slen--; }
+        while (slen > 0 && (p[slen - 1u] == L' ' || p[slen - 1u] == L'\t')) slen--;
+        if (slen > 0) {
+            size_t tlen = win32_trim_path_seg(p, slen);
+            if (win32_wcsieq_n(p, tlen, seg, want_len)) return true;
+        }
+        if (!semi) break;
+        p = semi + 1;
+    }
+    return false;
+}
+
+static bool win32_append_path_entries(wchar_t **cur_path, const wchar_t *extra, bool *changed) {
+    if (!cur_path || !extra || !extra[0]) return true;
+    const wchar_t *p = extra;
+    while (*p) {
+        const wchar_t *semi = wcschr(p, L';');
+        size_t slen = semi ? (size_t)(semi - p) : wcslen(p);
+        while (slen > 0 && (*p == L' ' || *p == L'\t')) { p++; slen--; }
+        while (slen > 0 && (p[slen - 1u] == L' ' || p[slen - 1u] == L'\t')) slen--;
+        if (slen > 0 && !win32_path_contains_seg(*cur_path, p, slen)) {
+            size_t cur_len = *cur_path ? wcslen(*cur_path) : 0;
+            bool need_semi = (cur_len > 0 && (*cur_path)[cur_len - 1u] != L';');
+            size_t new_len = cur_len + (need_semi ? 1u : 0u) + slen;
+            wchar_t *grown = realloc(*cur_path, (new_len + 1u) * sizeof(wchar_t));
+            if (!grown) return false;
+            if (need_semi) grown[cur_len++] = L';';
+            memcpy(grown + cur_len, p, slen * sizeof(wchar_t));
+            grown[cur_len + slen] = L'\0';
+            *cur_path = grown;
+            if (changed) *changed = true;
+        }
+        if (!semi) break;
+        p = semi + 1;
+    }
+    return true;
+}
+
+void tt_win32_refresh_path(void) {
+    DWORD need = GetEnvironmentVariableW(L"PATH", NULL, 0);
+    wchar_t *merged = NULL;
+    if (need > 0) {
+        merged = malloc(((size_t)need + 1u) * sizeof(wchar_t));
+        if (!merged) return;
+        DWORD got = GetEnvironmentVariableW(L"PATH", merged, need + 1u);
+        merged[got <= need ? got : need] = L'\0';
+    } else {
+        merged = calloc(1, sizeof(wchar_t));
+        if (!merged) return;
+    }
+
+    bool changed = false;
+    wchar_t *user_path = win32_read_reg_path(HKEY_CURRENT_USER, L"Environment");
+    if (user_path) {
+        win32_append_path_entries(&merged, user_path, &changed);
+        free(user_path);
+    }
+    wchar_t *sys_path = win32_read_reg_path(
+        HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment");
+    if (sys_path) {
+        win32_append_path_entries(&merged, sys_path, &changed);
+        free(sys_path);
+    }
+
+    const char *localappdata = getenv("LOCALAPPDATA");
+    if (localappdata && localappdata[0]) {
+        char *wg_links = win32_path_join_bs(localappdata, "Microsoft\\WinGet\\Links");
+        if (wg_links) {
+            wchar_t *wdir = tt_utf8_to_wide(wg_links);
+            free(wg_links);
+            if (wdir) {
+                if (win32_dir_exists_w(wdir)) {
+                    win32_append_path_entries(&merged, wdir, &changed);
+                }
+                free(wdir);
+            }
+        }
+    }
+
+    const char *progfiles = getenv("ProgramFiles");
+    if (progfiles && progfiles[0]) {
+        char *wg_sys_links = win32_path_join_bs(progfiles, "WinGet\\Links");
+        if (wg_sys_links) {
+            wchar_t *wdir = tt_utf8_to_wide(wg_sys_links);
+            free(wg_sys_links);
+            if (wdir) {
+                if (win32_dir_exists_w(wdir)) {
+                    win32_append_path_entries(&merged, wdir, &changed);
+                }
+                free(wdir);
+            }
+        }
+    }
+
+    if (changed && merged && merged[0]) {
+        SetEnvironmentVariableW(L"PATH", merged);
+    }
+    free(merged);
+}
+
+static char *win32_search_path_ext(const wchar_t *search_path, const wchar_t *wname, const wchar_t *wext) {
+    DWORD need = SearchPathW(search_path, wname, wext, 0, NULL, NULL);
+    if (need == 0) return NULL;
+    wchar_t *buf = malloc(((size_t)need + 1u) * sizeof(wchar_t));
+    if (!buf) return NULL;
+    DWORD got = SearchPathW(search_path, wname, wext, need + 1u, buf, NULL);
+    if (got == 0 || got > need) {
+        free(buf);
+        return NULL;
+    }
+    DWORD attr = GetFileAttributesW(buf);
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        free(buf);
+        return NULL;
+    }
+    char *utf8 = tt_wide_to_utf8(buf);
+    free(buf);
+    return utf8;
+}
+
+static char *win32_search_path(const wchar_t *search_path, const char *name) {
+    if (!name || !name[0]) return NULL;
+    wchar_t *wname = tt_utf8_to_wide(name);
+    if (!wname) return NULL;
+    char *res = NULL;
+    if (win32_has_ext(name)) {
+        res = win32_search_path_ext(search_path, wname, NULL);
+    } else {
+        res = win32_search_path_ext(search_path, wname, L".exe");
+        if (!res) res = win32_search_path_ext(search_path, wname, L".com");
+    }
+    free(wname);
+    return res;
+}
+
+static char *win32_try_in_dir(const char *dir, const char *name) {
+    if (!dir || !dir[0] || !name || !name[0]) return NULL;
+    if (win32_has_ext(name)) {
+        char *cand = win32_path_join_bs(dir, name);
+        if (cand && tt_file_exists(cand)) return cand;
+        free(cand);
+        return NULL;
+    }
+    static const char *const exts[] = {".exe", ".com"};
+    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
+        char *fname = tt_asprintf("%s%s", name, exts[i]);
+        if (!fname) continue;
+        char *cand = win32_path_join_bs(dir, fname);
+        free(fname);
+        if (cand && tt_file_exists(cand)) return cand;
+        free(cand);
+    }
+    return NULL;
+}
+
+static char *win32_scan_winget_packages(const char *localappdata, const char *pkg_hint,
+                                        const char *exe_name) {
+    if (!localappdata || !localappdata[0] || !pkg_hint || !exe_name) return NULL;
+    char *pkgs_dir = win32_path_join_bs(localappdata, "Microsoft\\WinGet\\Packages");
+    if (!pkgs_dir) return NULL;
+    char *pat = tt_asprintf("%s\\*", pkgs_dir);
+    wchar_t *wpat = pat ? tt_utf8_to_wide(pat) : NULL;
+    free(pat);
+    if (!wpat) {
+        free(pkgs_dir);
+        return NULL;
+    }
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    free(wpat);
+    if (h == INVALID_HANDLE_VALUE) {
+        free(pkgs_dir);
+        return NULL;
+    }
+
+    char *found = NULL;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        char *dname = tt_wide_to_utf8(fd.cFileName);
+        if (!dname) continue;
+        if (tt_strcasestr(dname, pkg_hint) == NULL) {
+            free(dname);
+            continue;
+        }
+        char *pkg_path = win32_path_join_bs(pkgs_dir, dname);
+        free(dname);
+        if (!pkg_path) continue;
+
+        found = win32_try_in_dir(pkg_path, exe_name);
+        if (!found) {
+            /* Check one nested subdirectory (e.g. extracted archive folder) */
+            char *sub_pat = tt_asprintf("%s\\*", pkg_path);
+            wchar_t *wsub = sub_pat ? tt_utf8_to_wide(sub_pat) : NULL;
+            free(sub_pat);
+            if (wsub) {
+                WIN32_FIND_DATAW sfd;
+                HANDLE sh = FindFirstFileW(wsub, &sfd);
+                free(wsub);
+                if (sh != INVALID_HANDLE_VALUE) {
+                    do {
+                        if ((sfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+                        if (wcscmp(sfd.cFileName, L".") == 0 || wcscmp(sfd.cFileName, L"..") == 0) continue;
+                        char *sname = tt_wide_to_utf8(sfd.cFileName);
+                        if (!sname) continue;
+                        char *sub_path = win32_path_join_bs(pkg_path, sname);
+                        free(sname);
+                        if (sub_path) {
+                            found = win32_try_in_dir(sub_path, exe_name);
+                            free(sub_path);
+                        }
+                    } while (!found && FindNextFileW(sh, &sfd));
+                    FindClose(sh);
+                }
+            }
+        }
+        free(pkg_path);
+    } while (!found && FindNextFileW(h, &fd));
+
+    FindClose(h);
+    free(pkgs_dir);
+    return found;
+}
+
+char *tt_win32_resolve_exe(const char *exe) {
+    if (!exe || !exe[0]) return NULL;
+
+    if (win32_has_path_sep(exe)) {
+        if (tt_file_exists(exe)) return tt_strdup(exe);
+        if (!win32_has_ext(exe)) {
+            char *c1 = tt_asprintf("%s.exe", exe);
+            if (c1 && tt_file_exists(c1)) return c1;
+            free(c1);
+            char *c2 = tt_asprintf("%s.com", exe);
+            if (c2 && tt_file_exists(c2)) return c2;
+            free(c2);
+        }
+        return NULL;
+    }
+
+    /* 1. Current process PATH (and application directory) */
+    char *found = win32_search_path(NULL, exe);
+    if (found) return found;
+
+    /* 2. Fresh registry PATH (covers winget/scoop/choco installs before shell restart) */
+    wchar_t *user_path = win32_read_reg_path(HKEY_CURRENT_USER, L"Environment");
+    if (user_path) {
+        found = win32_search_path(user_path, exe);
+        free(user_path);
+        if (found) return found;
+    }
+    wchar_t *sys_path = win32_read_reg_path(
+        HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment");
+    if (sys_path) {
+        found = win32_search_path(sys_path, exe);
+        free(sys_path);
+        if (found) return found;
+    }
+
+    /* 3. Well-known Windows package manager link/shim directories */
+    const char *localappdata = getenv("LOCALAPPDATA");
+    const char *progfiles = getenv("ProgramFiles");
+    const char *progfiles_x86 = getenv("ProgramFiles(x86)");
+    const char *userprofile = getenv("USERPROFILE");
+    const char *progdata = getenv("ProgramData");
+
+    const struct { const char *base; const char *sub; } shim_dirs[] = {
+        {localappdata, "Microsoft\\WinGet\\Links"},
+        {progfiles,    "WinGet\\Links"},
+        {userprofile,  "scoop\\shims"},
+        {progdata,     "chocolatey\\bin"},
+        {localappdata, "Microsoft\\WindowsApps"},
+    };
+    for (size_t i = 0; i < sizeof(shim_dirs) / sizeof(shim_dirs[0]); i++) {
+        if (!shim_dirs[i].base || !shim_dirs[i].base[0]) continue;
+        char *dir = win32_path_join_bs(shim_dirs[i].base, shim_dirs[i].sub);
+        if (!dir) continue;
+        found = win32_try_in_dir(dir, exe);
+        free(dir);
+        if (found) return found;
+    }
+
+    /* 4. Tool-specific fallback locations */
+    if (tt_strcasecmp(exe, "mpv") == 0 || tt_strcasecmp(exe, "mpv.exe") == 0) {
+        found = win32_scan_winget_packages(localappdata, "mpv", "mpv");
+        if (found) return found;
+
+        const struct { const char *base; const char *sub; const char *bin; } mpv_dirs[] = {
+            {progfiles,    "mpv",             "mpv"},
+            {progfiles,    "MPV Player",      "mpv"},
+            {localappdata, "Programs\\mpv",   "mpv"},
+            {localappdata, "Programs\\mpv.net", "mpvnet.exe"},
+            {progfiles,    "mpv.net",         "mpvnet.exe"},
+        };
+        for (size_t i = 0; i < sizeof(mpv_dirs) / sizeof(mpv_dirs[0]); i++) {
+            if (!mpv_dirs[i].base || !mpv_dirs[i].base[0]) continue;
+            char *dir = win32_path_join_bs(mpv_dirs[i].base, mpv_dirs[i].sub);
+            if (!dir) continue;
+            found = win32_try_in_dir(dir, mpv_dirs[i].bin);
+            free(dir);
+            if (found) return found;
+        }
+        /* mpv.net installed via winget / scoop / PATH */
+        found = win32_search_path(NULL, "mpvnet");
+        if (found) return found;
+        found = win32_scan_winget_packages(localappdata, "mpv", "mpvnet");
+        if (found) return found;
+    } else if (tt_strcasecmp(exe, "yt-dlp") == 0 || tt_strcasecmp(exe, "yt-dlp.exe") == 0) {
+        found = win32_scan_winget_packages(localappdata, "yt-dlp", "yt-dlp");
+        if (found) return found;
+    } else if (tt_strcasecmp(exe, "vlc") == 0 || tt_strcasecmp(exe, "vlc.exe") == 0) {
+        if (progfiles && progfiles[0]) {
+            char *dir = win32_path_join_bs(progfiles, "VideoLAN\\VLC");
+            if (dir) {
+                found = win32_try_in_dir(dir, "vlc.exe");
+                free(dir);
+                if (found) return found;
+            }
+        }
+        if (progfiles_x86 && progfiles_x86[0]) {
+            char *dir = win32_path_join_bs(progfiles_x86, "VideoLAN\\VLC");
+            if (dir) {
+                found = win32_try_in_dir(dir, "vlc.exe");
+                free(dir);
+                if (found) return found;
+            }
+        }
+    }
+
+    return NULL;
+}
+#endif
+
 bool tt_spawn_capture_stdout(const char *const *argv, size_t max_bytes, StrBuf *out_stdout) {
     if (!argv || !argv[0] || !out_stdout) return false;
     sb_clear(out_stdout);
 
 #ifdef _WIN32
+    char *resolved_exe = tt_win32_resolve_exe(argv[0]);
     char *cmdline = tt_win32_build_cmdline(argv);
-    if (!cmdline) return false;
+    if (!cmdline) {
+        free(resolved_exe);
+        return false;
+    }
+    wchar_t *wapp = (resolved_exe && tt_file_exists(resolved_exe))
+                        ? tt_utf8_to_wide(resolved_exe)
+                        : NULL;
     wchar_t *wcmd = tt_utf8_to_wide(cmdline);
     free(cmdline);
-    if (!wcmd) return false;
+    free(resolved_exe);
+    if (!wcmd) {
+        free(wapp);
+        return false;
+    }
 
     SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
     HANDLE h_read = NULL, h_write = NULL;
     if (!CreatePipe(&h_read, &h_write, &sa, 0)) {
+        free(wapp);
         free(wcmd);
         return false;
     }
@@ -1012,9 +1444,10 @@ bool tt_spawn_capture_stdout(const char *const *argv, size_t max_bytes, StrBuf *
 
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof(pi));
-    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
+    BOOL ok = CreateProcessW(wapp, wcmd, NULL, NULL, TRUE,
                              CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
                              NULL, NULL, &si, &pi);
+    free(wapp);
     free(wcmd);
     CloseHandle(h_write);
     if (h_nul != INVALID_HANDLE_VALUE) CloseHandle(h_nul);

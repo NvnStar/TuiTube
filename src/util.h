@@ -66,6 +66,8 @@ void tt_sanitize_filename(const char *key, char *out, size_t out_cap);
 #ifdef _WIN32
 wchar_t *tt_utf8_to_wide(const char *utf8);
 char *tt_wide_to_utf8(const wchar_t *wide);
+void tt_win32_refresh_path(void);
+char *tt_win32_resolve_exe(const char *exe);
 #endif
 
 bool tt_win32_quote_arg(const char *arg, StrBuf *out);
