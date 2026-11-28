@@ -23,6 +23,22 @@
 
 static int g_tests_run = 0;
 
+/*
+ * The wrapped-link geometry test needs a real Pango layout, which on Linux
+ * makes libpangoft2 call FcInit(). fontconfig 2.15 on Ubuntu parses its XML
+ * config through libexpat on an internal thread and intentionally retains those
+ * allocations for the process lifetime; LeakSanitizer reports them as direct
+ * leaks even though none of the bytes belong to TuiTube. Suppress only those
+ * two third-party modules so leaks in our own code are still fatal.
+ */
+#if defined(__SANITIZE_ADDRESS__)
+const char *__lsan_default_suppressions(void);
+const char *__lsan_default_suppressions(void) {
+    return "leak:libfontconfig\n"
+           "leak:libexpat\n";
+}
+#endif
+
 static void test_temp_base(char *out, size_t cap) {
 #ifdef _WIN32
     wchar_t wtmp[MAX_PATH];
@@ -1683,7 +1699,7 @@ static void test_original_titles(void) {
     test_unlink_file(cfg_file);
     test_rmdir(tmpdir);
 
-    /* (b) Config-aware display helpers default to originals and honour opt-out */
+    /* (b) display helper prefers original_title, copies/frees it */
     MediaItem src = {0};
     src.kind = ITEM_VIDEO;
     snprintf(src.id, sizeof(src.id), "abc123XYZ");
@@ -1691,8 +1707,6 @@ static void test_original_titles(void) {
     src.original_title = tt_strdup("Original English Title");
 
     assert(strcmp(media_item_display_title(&src), "Original English Title") == 0);
-    assert(strcmp(media_item_display_title_for(&src, true), "Original English Title") == 0);
-    assert(strcmp(media_item_display_title_for(&src, false), "Vietnamese title") == 0);
 
     MediaItem copy;
     assert(media_item_copy(&copy, &src));
@@ -1715,6 +1729,92 @@ static void test_original_titles(void) {
     media_item_free_fields(&no_orig);
     assert(media_item_display_title(NULL) == NULL);
     media_item_free_fields(&src);
+
+    /* (c) oEmbed JSON title extraction */
+    char out[128];
+    const char *valid =
+        "{\"title\":\"I Survived 100 Days in a Cave\","
+        "\"author_name\":\"MrBeast\",\"type\":\"video\"}";
+    assert(innertube_parse_oembed_json(valid, strlen(valid), out, sizeof(out)));
+    assert(strcmp(out, "I Survived 100 Days in a Cave") == 0);
+
+    const char *empty_obj = "{}";
+    out[0] = 'x';
+    assert(!innertube_parse_oembed_json(empty_obj, strlen(empty_obj), out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *empty_title = "{\"title\":\"\"}";
+    assert(!innertube_parse_oembed_json(empty_title, strlen(empty_title), out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *malformed = "{\"title\": ";
+    assert(!innertube_parse_oembed_json(malformed, strlen(malformed), out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *non_string_title = "{\"title\": 42}";
+    assert(!innertube_parse_oembed_json(non_string_title, strlen(non_string_title), out, sizeof(out)));
+
+    /* (d) player-endpoint fallback JSON title extraction */
+    const char *player_valid =
+        "{\"videoDetails\":{\"videoId\":\"abc123XYZ\","
+        "\"title\":\"Uploader Original Title\"},\"playabilityStatus\":{\"status\":\"OK\"}}";
+    assert(innertube_parse_player_title_json(player_valid, strlen(player_valid), out, sizeof(out)));
+    assert(strcmp(out, "Uploader Original Title") == 0);
+
+    const char *player_no_details = "{\"playabilityStatus\":{\"status\":\"OK\"}}";
+    out[0] = 'x';
+    assert(!innertube_parse_player_title_json(player_no_details, strlen(player_no_details),
+                                              out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *player_no_title = "{\"videoDetails\":{\"videoId\":\"abc123XYZ\"}}";
+    assert(!innertube_parse_player_title_json(player_no_title, strlen(player_no_title),
+                                              out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *player_empty_title = "{\"videoDetails\":{\"title\":\"\"}}";
+    assert(!innertube_parse_player_title_json(player_empty_title, strlen(player_empty_title),
+                                              out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *player_non_string = "{\"videoDetails\":{\"title\":42}}";
+    assert(!innertube_parse_player_title_json(player_non_string, strlen(player_non_string),
+                                              out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *player_malformed = "{\"videoDetails\":{\"title\": ";
+    assert(!innertube_parse_player_title_json(player_malformed, strlen(player_malformed),
+                                              out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *oembed_missing_title = "{\"author_name\":\"Nobody\"}";
+    assert(!innertube_parse_oembed_json(oembed_missing_title, strlen(oembed_missing_title),
+                                        out, sizeof(out)));
+
+    /* oEmbed failure triggers the player fallback; oEmbed success wins. */
+    assert(innertube_parse_original_title_fallback(NULL, 0, false,
+                                                   player_valid, strlen(player_valid), true,
+                                                   out, sizeof(out)));
+    assert(strcmp(out, "Uploader Original Title") == 0);
+    assert(innertube_parse_original_title_fallback(valid, strlen(valid), true,
+                                                   player_valid, strlen(player_valid), true,
+                                                   out, sizeof(out)));
+    assert(strcmp(out, "I Survived 100 Days in a Cave") == 0);
+    out[0] = 'x';
+    assert(!innertube_parse_original_title_fallback(NULL, 0, false,
+                                                    player_malformed, strlen(player_malformed), true,
+                                                    out, sizeof(out)));
+    assert(out[0] == '\0');
+    assert(innertube_parse_original_title_fallback(oembed_missing_title,
+                                                   strlen(oembed_missing_title), true,
+                                                   player_valid, strlen(player_valid), true,
+                                                   out, sizeof(out)));
+    assert(strcmp(out, "Uploader Original Title") == 0);
+
+    /* (e) Cache reset is callable and idempotent */
+    innertube_original_title_cache_reset();
+    innertube_original_title_cache_reset();
+    innertube_original_title_cache_reset();
 }
 
 static void test_original_title_detail_merge(void) {
@@ -1742,22 +1842,109 @@ static void test_original_title_detail_merge(void) {
            strcmp(detail_item.original_title, "Resolved original title") == 0);
     assert(strcmp(media_item_display_title(&detail_item), "Resolved original title") == 0);
 
-    /* With originals disabled the resolved original is ignored, not shown. */
-    assert(strcmp(media_item_display_title_for(&detail_item, false),
-                  "Localized detail title") == 0);
+    MediaItem fresh_original = {0};
+    fresh_original.kind = ITEM_VIDEO;
+    snprintf(fresh_original.id, sizeof(fresh_original.id), "mergeVid1");
+    fresh_original.title = tt_strdup("Localized detail title");
+    fresh_original.original_title = tt_strdup("New original from detail");
+    assert(media_item_apply_detail_merge(&selected, &detail_item, true, &fresh_original));
+    assert(strcmp(media_item_display_title(&selected), "New original from detail") == 0);
+    assert(strcmp(media_item_display_title(&detail_item), "New original from detail") == 0);
 
+    /* Detail refresh without an original must not discard the resolved one. */
     MediaItem localized_refresh = {0};
     localized_refresh.kind = ITEM_VIDEO;
     snprintf(localized_refresh.id, sizeof(localized_refresh.id), "mergeVid1");
     localized_refresh.title = tt_strdup("Localized again");
     assert(media_item_apply_detail_merge(&selected, &detail_item, true, &localized_refresh));
-    assert(strcmp(media_item_display_title_for(&selected, true), "Resolved original title") == 0);
-    assert(strcmp(media_item_display_title_for(&selected, false), "Localized again") == 0);
-    assert(strcmp(media_item_display_title_for(&detail_item, false), "Localized again") == 0);
+    assert(strcmp(media_item_display_title(&selected), "New original from detail") == 0);
+    assert(strcmp(media_item_display_title(&detail_item), "New original from detail") == 0);
+
+    /* A resolved original already in the detail pane must reach the row. */
+    MediaItem pane_only = {0};
+    pane_only.kind = ITEM_VIDEO;
+    snprintf(pane_only.id, sizeof(pane_only.id), "mergeVid2");
+    pane_only.title = tt_strdup("Pane localized");
+    pane_only.original_title = tt_strdup("Pane resolved original");
+
+    MediaItem row_without_original = {0};
+    row_without_original.kind = ITEM_VIDEO;
+    snprintf(row_without_original.id, sizeof(row_without_original.id), "mergeVid2");
+    row_without_original.title = tt_strdup("Row localized");
+
+    MediaItem detail_without_original = {0};
+    detail_without_original.kind = ITEM_VIDEO;
+    snprintf(detail_without_original.id, sizeof(detail_without_original.id), "mergeVid2");
+    detail_without_original.title = tt_strdup("Detail localized");
+    assert(media_item_apply_detail_merge(&row_without_original, &pane_only, true,
+                                         &detail_without_original));
+    assert(strcmp(media_item_display_title(&row_without_original),
+                  "Pane resolved original") == 0);
+    assert(strcmp(media_item_display_title(&pane_only), "Pane resolved original") == 0);
 
     media_item_free_fields(&selected);
     media_item_free_fields(&detail_item);
     media_item_free_fields(&localized_detail);
+    media_item_free_fields(&fresh_original);
+    media_item_free_fields(&localized_refresh);
+    media_item_free_fields(&pane_only);
+    media_item_free_fields(&row_without_original);
+    media_item_free_fields(&detail_without_original);
+}
+
+static void test_original_opt_out_display_and_merge(void) {
+    MediaItem row = {0};
+    row.kind = ITEM_VIDEO;
+    snprintf(row.id, sizeof(row.id), "optOut01");
+    row.title = tt_strdup("Localized row title");
+    row.original_title = tt_strdup("Original row title");
+    row.description = tt_strdup("Localized row description");
+    row.original_description = tt_strdup("Original row description");
+
+    /* Display selection only honours originals when explicitly enabled. */
+    assert(strcmp(media_item_display_title_for(&row, true), "Original row title") == 0);
+    assert(strcmp(media_item_display_title_for(&row, false), "Localized row title") == 0);
+    assert(strcmp(media_item_display_description_for(&row, true),
+                  "Original row description") == 0);
+    assert(strcmp(media_item_display_description_for(&row, false),
+                  "Localized row description") == 0);
+    assert(media_item_has_description_for(&row, true));
+    assert(media_item_has_description_for(&row, false));
+    assert(media_item_display_title(NULL) == NULL);
+    assert(media_item_display_title_for(NULL, false) == NULL);
+    assert(media_item_display_description_for(NULL, true) == NULL);
+
+    /* A localized detail refresh after an original response keeps both the
+       localized metadata and the resolved original; only display selection
+       decides which one is shown. */
+    MediaItem pane;
+    assert(media_item_copy(&pane, &row));
+    MediaItem localized_refresh = {0};
+    localized_refresh.kind = ITEM_VIDEO;
+    snprintf(localized_refresh.id, sizeof(localized_refresh.id), "optOut01");
+    localized_refresh.title = tt_strdup("Newer localized detail title");
+    localized_refresh.description = tt_strdup("Newer localized detail description");
+    assert(media_item_apply_detail_merge(&row, &pane, true, &localized_refresh));
+    assert(strcmp(row.title, "Newer localized detail title") == 0);
+    assert(strcmp(row.description, "Newer localized detail description") == 0);
+    assert(strcmp(media_item_display_title_for(&row, true), "Original row title") == 0);
+    assert(strcmp(media_item_display_title_for(&row, false),
+                  "Newer localized detail title") == 0);
+    assert(strcmp(media_item_display_description_for(&row, false),
+                  "Newer localized detail description") == 0);
+
+    /* Empty originals never leak through the opt-out path. */
+    free(row.original_title);
+    row.original_title = tt_strdup("");
+    free(row.original_description);
+    row.original_description = tt_strdup("");
+    assert(strcmp(media_item_display_title_for(&row, false),
+                  "Newer localized detail title") == 0);
+    assert(strcmp(media_item_display_title_for(&row, true),
+                  "Newer localized detail title") == 0);
+
+    media_item_free_fields(&row);
+    media_item_free_fields(&pane);
     media_item_free_fields(&localized_refresh);
 }
 
@@ -1781,7 +1968,18 @@ static void test_background_title_patch_is_field_only(void) {
     assert(!media_item_set_original_title(&detail, ""));
     assert(!media_item_set_original_title(NULL, "x"));
 
+    /* A stale detail response merged after the patch must not clobber the
+       newer title/description that were already shown. */
+    MediaItem stale = {0};
+    stale.kind = ITEM_VIDEO;
+    snprintf(stale.id, sizeof(stale.id), "patchVid1");
+    stale.title = tt_strdup("Stale title");
+    stale.description = tt_strdup("Stale description");
+    media_item_merge_details(&detail, &stale);
+    assert(strcmp(detail.title, "Stale title") == 0);
+
     media_item_free_fields(&detail);
+    media_item_free_fields(&stale);
 }
 
 static void test_copy_description_gating_and_player_opt_out(void) {
@@ -1790,8 +1988,29 @@ static void test_copy_description_gating_and_player_opt_out(void) {
     snprintf(item.id, sizeof(item.id), "copyVid01");
     item.title = tt_strdup("Localized copy title");
     item.original_title = tt_strdup("Original copy title");
+    item.original_description = tt_strdup("Only original description");
 
-    /* Player titles and title args follow the config flag. */
+    /* "Copy Description" is offered when only original_description exists and
+       copies exactly the displayed text. */
+    assert(media_item_has_description_for(&item, true));
+    assert(strcmp(media_item_display_description_for(&item, true),
+                  "Only original description") == 0);
+    /* With originals opted out the localized path is empty, so the menu entry
+       must not appear. */
+    assert(!media_item_has_description_for(&item, false));
+    assert(media_item_display_description_for(&item, false) == NULL);
+
+    item.description = tt_strdup("Localized description only");
+    free(item.original_description);
+    item.original_description = NULL;
+    assert(media_item_has_description_for(&item, true));
+    assert(strcmp(media_item_display_description_for(&item, true),
+                  "Localized description only") == 0);
+    assert(media_item_has_description_for(&item, false));
+    assert(strcmp(media_item_display_description_for(&item, false),
+                  "Localized description only") == 0);
+
+    /* Player titles follow the same config flag. */
     assert(strcmp(player_video_title_for(&item, true), "Original copy title") == 0);
     assert(strcmp(player_video_title_for(&item, false), "Localized copy title") == 0);
     assert(player_video_title_for(NULL, true) == NULL);
@@ -1810,6 +2029,70 @@ static void test_copy_description_gating_and_player_opt_out(void) {
     free(vlc_arg);
 
     media_item_free_fields(&item);
+}
+
+static void test_player_view_hides_resolved_original(void) {
+    MediaItem row = {0};
+    row.kind = ITEM_VIDEO;
+    snprintf(row.id, sizeof(row.id), "viewVid01");
+    row.title = tt_strdup("Localized view title");
+    row.original_title = tt_strdup("Original view title");
+
+    /* The app hands play hooks a shallow view whose `title` is the displayed
+       title and whose original field is cleared, so an untouched consumer that
+       reads `video->title` still honours the opt-out. */
+    MediaItem view = row;
+    view.title = (char *)media_item_display_title_for(&row, false);
+    view.original_title = NULL;
+    assert(strcmp(view.title, "Localized view title") == 0);
+    assert(strcmp(player_video_title(&view), "Localized view title") == 0);
+
+    view.title = (char *)media_item_display_title_for(&row, true);
+    assert(strcmp(view.title, "Original view title") == 0);
+    assert(strcmp(player_video_title(&view), "Original view title") == 0);
+
+    media_item_free_fields(&row);
+}
+
+static void test_desc_link_hit_translation_and_clipping(void) {
+    TtLinkRect rects[4] = {0};
+    rects[0].rect = (TtRectF){10.0, 30.0, 40.0, 15.0};
+    rects[0].link = 0;
+    rects[1].rect = (TtRectF){100.0, 10.0, 50.0, 15.0};
+    rects[1].link = 1;
+    TtRectF area = {50.0, 100.0, 200.0, 50.0};
+
+    assert(tt_desc_link_hit(NULL, 0, area, 0.0, 60.0, 140.0) == -1);
+
+    /* Outside the description viewport horizontally/vertically. */
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 49.0, 110.0) == -1);
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 50.0, 99.0) == -1);
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 250.0, 110.0) == -1);
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 100.0, 150.0) == -1);
+
+    /* Link 0 is at layout y=30, so unscrolled it maps to viewport y=130. */
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 65.0, 140.0) == 0);
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 49.0, 140.0) == -1);
+
+    /* Scrolling by 20 moves the rect above the viewport: no stale hit. */
+    assert(tt_desc_link_hit(rects, 2, area, 20.0, 65.0, 110.0) == 0);
+    assert(tt_desc_link_hit(rects, 2, area, 20.0, 65.0, 140.0) == -1);
+    assert(tt_desc_link_hit(rects, 2, area, 40.0, 65.0, 90.0) == -1);
+
+    /* Link 1 is partly above the viewport; only its clipped part is hittable. */
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 160.0, 112.0) == 1);
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 160.0, 150.0) == -1);
+    assert(tt_desc_link_hit(rects, 2, area, 5.0, 160.0, 108.0) == 1);
+    assert(tt_desc_link_hit(rects, 2, area, 5.0, 160.0, 103.0) == -1);
+
+    /* Overlapping rectangles resolve topmost-first. */
+    TtLinkRect overlap[2] = {0};
+    overlap[0].rect = (TtRectF){20.0, 20.0, 60.0, 20.0};
+    overlap[0].link = 0;
+    overlap[1].rect = (TtRectF){30.0, 22.0, 60.0, 20.0};
+    overlap[1].link = 1;
+    assert(tt_desc_link_hit(overlap, 2, area, 0.0, 85.0, 130.0) == 1);
+    assert(tt_desc_link_hit(overlap, 2, area, 0.0, 75.0, 132.0) == 0);
 }
 
 static void test_original_description_and_url_links(void) {
@@ -1845,6 +2128,166 @@ static void test_original_description_and_url_links(void) {
     assert(!innertube_parse_player_metadata_json(malformed, strlen(malformed), title,
                                                  sizeof(title), &desc));
     assert(desc == NULL);
+
+    MediaItem item = {0};
+    item.kind = ITEM_VIDEO;
+    snprintf(item.id, sizeof(item.id), "descVid01");
+    item.title = tt_strdup("Localized title");
+    item.description = tt_strdup("Localized description");
+    item.original_description = tt_strdup("Original description");
+    assert(strcmp(media_item_display_description(&item), "Original description") == 0);
+
+    MediaItem copy;
+    assert(media_item_copy(&copy, &item));
+    assert(copy.original_description &&
+           strcmp(copy.original_description, "Original description") == 0);
+    assert(strcmp(media_item_display_description(&copy), "Original description") == 0);
+    media_item_free_fields(&copy);
+    assert(copy.original_description == NULL);
+
+    MediaItem localized = {0};
+    localized.kind = ITEM_VIDEO;
+    snprintf(localized.id, sizeof(localized.id), "descVid01");
+    localized.description = tt_strdup("Localized refresh");
+    MediaItem pane;
+    assert(media_item_copy(&pane, &item));
+    assert(media_item_apply_detail_merge(&item, &pane, true, &localized));
+    assert(strcmp(media_item_display_description(&item), "Original description") == 0);
+    assert(strcmp(media_item_display_description(&pane), "Original description") == 0);
+
+    item.original_description[0] = '\0';
+    assert(strcmp(media_item_display_description(&item), "Localized refresh") == 0);
+    media_item_free_fields(&item);
+    media_item_free_fields(&pane);
+    media_item_free_fields(&localized);
+
+    const char *text =
+        "Read https://Example.com/a_(b), www.youtube.com/@chan and youtu.be/x. "
+        "Wiki en.wikipedia.org/wiki/Test. Not ftp://example.com or a@b.com or https://x.com/...";
+    TtTextSpan spans[8];
+    size_t n = tt_find_url_spans(text, spans, 8);
+    assert(n == 4);
+    char url[256];
+    assert(tt_url_from_span(text, spans[0], url, sizeof(url)));
+    assert(strcmp(url, "https://Example.com/a_(b)") == 0);
+    assert(tt_url_from_span(text, spans[1], url, sizeof(url)));
+    assert(strcmp(url, "https://www.youtube.com/@chan") == 0);
+    assert(tt_url_from_span(text, spans[2], url, sizeof(url)));
+    assert(strcmp(url, "https://youtu.be/x") == 0);
+    assert(tt_url_from_span(text, spans[3], url, sizeof(url)));
+    assert(strcmp(url, "https://en.wikipedia.org/wiki/Test") == 0);
+
+    const char *shortener = "Mirror: bit.ly/abc123 and t.co/x";
+    n = tt_find_url_spans(shortener, spans, 8);
+    assert(n == 2);
+    assert(tt_url_from_span(shortener, spans[0], url, sizeof(url)));
+    assert(strcmp(url, "https://bit.ly/abc123") == 0);
+    assert(tt_url_from_span(shortener, spans[1], url, sizeof(url)));
+    assert(strcmp(url, "https://t.co/x") == 0);
+
+    TtTextSpan none[4];
+    assert(tt_find_url_spans("mail me at a@b.com or ftp://x", none, 4) == 0);
+    const char *caps = "HTTP://Example.COM/path";
+    assert(tt_find_url_spans(caps, spans, 8) == 1);
+    assert(tt_url_from_span(caps, spans[0], url, sizeof(url)));
+    assert(strcmp(url, "HTTP://Example.COM/path") == 0);
+
+    char err[64] = {0};
+    assert(!tt_open_url("ftp://example.com", err, sizeof(err)));
+    assert(err[0] != '\0');
+    assert(!tt_open_url("javascript:alert(1)", err, sizeof(err)));
+    assert(!tt_open_url("https://exa mple.com", err, sizeof(err)));
+    assert(!tt_open_url("", err, sizeof(err)));
+}
+
+static void test_url_link_rect_geometry(void) {
+    /*
+     * Two long URLs separated by prose. At this narrow width every URL must
+     * wrap across multiple visual lines regardless of font metrics, so the
+     * assertions below do not depend on which font "Sans" resolves to.
+     */
+    const char *text =
+        "See https://example.com/a/very/long/path/that/must/wrap/across/lines/for/testing "
+        "and https://www.youtube.com/@channel/with/a/long/vanity/name too.";
+    TtTextSpan spans[8];
+    size_t span_count = tt_find_url_spans(text, spans, 8);
+    assert(span_count == 2);
+
+    /* Use a private font map/context so Pango's global default map (and its
+       fontconfig caches) is never created inside the sanitizer run. */
+    PangoFontMap *fm = pango_cairo_font_map_new();
+    assert(fm != NULL);
+    PangoContext *ctx = pango_font_map_create_context(fm);
+    assert(ctx != NULL);
+    PangoLayout *layout = pango_layout_new(ctx);
+    assert(layout != NULL);
+
+    PangoFontDescription *fd = pango_font_description_new();
+    pango_font_description_set_family(fd, "Sans");
+    pango_font_description_set_absolute_size(fd, 13.0 * PANGO_SCALE);
+    pango_layout_set_font_description(layout, fd);
+    pango_font_description_free(fd);
+    pango_layout_set_text(layout, text, -1);
+    pango_layout_set_width(layout, (int)(120 * PANGO_SCALE));
+    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+
+    TtLinkRect rects[32];
+    size_t rect_count = tt_layout_link_rects(layout, spans, span_count, rects, 32);
+    assert(rect_count > 0);
+
+    /* Every rectangle must be a plausible, positive-size hit target. */
+    for (size_t i = 0; i < rect_count; i++) {
+        assert(rects[i].link < span_count);
+        assert(rects[i].rect.w > 0.5);
+        assert(rects[i].rect.h > 0.5);
+    }
+
+    /* Both links must produce at least one rectangle. */
+    bool seen[2] = {false, false};
+    for (size_t i = 0; i < rect_count; i++) seen[rects[i].link] = true;
+    assert(seen[0] && seen[1]);
+
+    /* The URLs are longer than the width, so each spans several visual lines. */
+    size_t per_link[2] = {0, 0};
+    for (size_t i = 0; i < rect_count; i++) per_link[rects[i].link]++;
+    assert(per_link[0] >= 2 && per_link[1] >= 2);
+
+    /*
+     * Cross-check every rectangle against Pango's own index-to-position
+     * oracle for the first byte of its link. This catches passing
+     * line-relative byte indexes to Pango, which shifts later-line links.
+     */
+    for (size_t i = 0; i < rect_count; i++) {
+        const TtTextSpan *span = &spans[rects[i].link];
+        PangoRectangle pos;
+        pango_layout_index_to_pos(layout, (int)span->start, &pos);
+        double want_x = (double)pos.x / PANGO_SCALE;
+        double want_y = (double)pos.y / PANGO_SCALE;
+        /* Only the first rectangle of each link starts at the link's first byte. */
+        bool first_of_link = true;
+        for (size_t j = 0; j < i; j++) {
+            if (rects[j].link == rects[i].link) first_of_link = false;
+        }
+        if (first_of_link) {
+            assert(fabs(rects[i].rect.x - want_x) < 2.0);
+            assert(fabs(rects[i].rect.y - want_y) < 2.0);
+        }
+    }
+
+    /*
+     * Rect heights must describe one line, not the line's absolute bottom
+     * offset. With the yrange API misread as a height, rectangles further down
+     * the layout grow progressively taller; every rect height here is one
+     * line pitch, so all heights must be equal within a tolerance.
+     */
+    double h0 = rects[0].rect.h;
+    for (size_t i = 1; i < rect_count; i++) {
+        assert(fabs(rects[i].rect.h - h0) < 0.5);
+    }
+
+    g_object_unref(layout);
+    g_object_unref(ctx);
+    g_object_unref(fm);
 }
 
 static void test_history_original_title_roundtrip(void) {
@@ -1914,78 +2357,37 @@ static void test_history_original_title_roundtrip(void) {
     media_item_free_fields(&localized_only);
 }
 
-static void test_original_opt_out_display_and_merge(void) {
-    MediaItem row = {0};
-    row.kind = ITEM_VIDEO;
-    snprintf(row.id, sizeof(row.id), "optOut01");
-    row.title = tt_strdup("Localized row title");
-    row.original_title = tt_strdup("Original row title");
-    row.description = tt_strdup("Localized row description");
-    row.original_description = tt_strdup("Original row description");
+static void test_player_original_title_selection(void) {
+    MediaItem video = {0};
+    video.kind = ITEM_VIDEO;
+    snprintf(video.id, sizeof(video.id), "titleVid01");
+    video.title = tt_strdup("Localized player title");
 
-    assert(strcmp(media_item_display_title_for(&row, false), "Localized row title") == 0);
-    assert(strcmp(media_item_display_description_for(&row, false),
-                  "Localized row description") == 0);
-    assert(media_item_has_description_for(&row, false));
+    assert(strcmp(player_video_title(&video), "Localized player title") == 0);
 
-    /* A localized refresh after an original detail response keeps both kinds of
-       metadata; display selection decides what is shown. */
-    MediaItem pane;
-    assert(media_item_copy(&pane, &row));
-    MediaItem localized_refresh = {0};
-    localized_refresh.kind = ITEM_VIDEO;
-    snprintf(localized_refresh.id, sizeof(localized_refresh.id), "optOut01");
-    localized_refresh.title = tt_strdup("Newer localized detail title");
-    localized_refresh.description = tt_strdup("Newer localized detail description");
-    assert(media_item_apply_detail_merge(&row, &pane, true, &localized_refresh));
-    assert(strcmp(media_item_display_title_for(&row, false),
-                  "Newer localized detail title") == 0);
-    assert(strcmp(media_item_display_description_for(&row, false),
-                  "Newer localized detail description") == 0);
+    video.original_title = tt_strdup("Original player title");
+    assert(strcmp(player_video_title(&video), "Original player title") == 0);
 
-    media_item_free_fields(&row);
-    media_item_free_fields(&pane);
-    media_item_free_fields(&localized_refresh);
-}
+    char *mpv_arg = NULL;
+    char *vlc_arg = NULL;
+    assert(player_build_title_args(&video, &mpv_arg, &vlc_arg));
+    assert(strcmp(mpv_arg, "--force-media-title=Original player title") == 0);
+    assert(strcmp(vlc_arg, "--meta-title=Original player title") == 0);
+    free(mpv_arg);
+    free(vlc_arg);
 
-static void test_url_span_detection_and_open_rules(void) {
-    const char *text =
-        "Read https://Example.com/a_(b), www.youtube.com/@chan and youtu.be/x. "
-        "Wiki en.wikipedia.org/wiki/Test. Not ftp://example.com or a@b.com or https://x.com/...";
-    TtTextSpan spans[8];
-    size_t n = tt_find_url_spans(text, spans, 8);
-    assert(n == 4);
-    char url[256];
-    assert(tt_url_from_span(text, spans[0], url, sizeof(url)));
-    assert(strcmp(url, "https://Example.com/a_(b)") == 0);
-    assert(tt_url_from_span(text, spans[1], url, sizeof(url)));
-    assert(strcmp(url, "https://www.youtube.com/@chan") == 0);
-    assert(tt_url_from_span(text, spans[2], url, sizeof(url)));
-    assert(strcmp(url, "https://youtu.be/x") == 0);
-    assert(tt_url_from_span(text, spans[3], url, sizeof(url)));
-    assert(strcmp(url, "https://en.wikipedia.org/wiki/Test") == 0);
-
-    char err[64] = {0};
-    assert(!tt_open_url("ftp://example.com", err, sizeof(err)));
-    assert(err[0] != '\0');
-    assert(!tt_open_url("javascript:alert(1)", err, sizeof(err)));
-    assert(!tt_open_url("https://exa mple.com", err, sizeof(err)));
-    assert(!tt_open_url("", err, sizeof(err)));
-}
-
-static void test_desc_link_hit_translation_and_clipping(void) {
-    TtLinkRect rects[2] = {0};
-    rects[0].rect = (TtRectF){10.0, 30.0, 40.0, 15.0};
-    rects[0].link = 0;
-    rects[1].rect = (TtRectF){100.0, 10.0, 50.0, 15.0};
-    rects[1].link = 1;
-    TtRectF area = {50.0, 100.0, 200.0, 50.0};
-
-    assert(tt_desc_link_hit(NULL, 0, area, 0.0, 60.0, 140.0) == -1);
-    assert(tt_desc_link_hit(rects, 2, area, 0.0, 65.0, 140.0) == 0);
-    assert(tt_desc_link_hit(rects, 2, area, 20.0, 65.0, 140.0) == -1);
-    assert(tt_desc_link_hit(rects, 2, area, 0.0, 160.0, 112.0) == 1);
-    assert(tt_desc_link_hit(rects, 2, area, 0.0, 100.0, 150.0) == -1);
+    /* Missing titles fall back to the video id. */
+    media_item_free_fields(&video);
+    video.kind = ITEM_VIDEO;
+    snprintf(video.id, sizeof(video.id), "titleVid01");
+    assert(strcmp(player_video_title(&video), "titleVid01") == 0);
+    assert(player_build_title_args(&video, &mpv_arg, &vlc_arg));
+    assert(strcmp(mpv_arg, "--force-media-title=titleVid01") == 0);
+    assert(strcmp(vlc_arg, "--meta-title=titleVid01") == 0);
+    free(mpv_arg);
+    free(vlc_arg);
+    assert(player_video_title(NULL) == NULL);
+    media_item_free_fields(&video);
 }
 
 static void test_non_english_lockup_and_badges(void) {
@@ -2354,13 +2756,15 @@ int main(void) {
     RUN_TEST(test_locale_parsing_and_innertube_headers);
     RUN_TEST(test_original_titles);
     RUN_TEST(test_original_title_detail_merge);
+    RUN_TEST(test_original_description_and_url_links);
+    RUN_TEST(test_original_opt_out_display_and_merge);
     RUN_TEST(test_background_title_patch_is_field_only);
     RUN_TEST(test_copy_description_gating_and_player_opt_out);
-    RUN_TEST(test_original_description_and_url_links);
-    RUN_TEST(test_history_original_title_roundtrip);
-    RUN_TEST(test_original_opt_out_display_and_merge);
-    RUN_TEST(test_url_span_detection_and_open_rules);
+    RUN_TEST(test_player_view_hides_resolved_original);
     RUN_TEST(test_desc_link_hit_translation_and_clipping);
+    RUN_TEST(test_url_link_rect_geometry);
+    RUN_TEST(test_history_original_title_roundtrip);
+    RUN_TEST(test_player_original_title_selection);
     RUN_TEST(test_non_english_lockup_and_badges);
     RUN_TEST(test_pe_subsystem_and_runtime_dep_checks);
     RUN_TEST(test_ytdlp_path_resolution_and_mpv_opts);

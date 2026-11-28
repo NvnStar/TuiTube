@@ -193,7 +193,7 @@ Portable Mode (any directory containing tuitube_portable_mode.txt)
 
 ## Configuration & Keybindings
 
-Release archives include a starter `tuitube.json` beside the executable. See **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** for the full 27-key reference, `yt-dlp` placement & lookup order, locale/region behavior, portable mode, custom themes, and `key_bindings` documentation.
+Release archives include a starter `tuitube.json` beside the executable. See **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** for the full 28-key reference, `yt-dlp` placement & lookup order, locale/region behavior, original-title defaults and opt-out, portable mode, custom themes, and `key_bindings` documentation.
 
 Starter files: [examples/tuitube.json](examples/tuitube.json) · [examples/sample_theme.json](examples/sample_theme.json)
 
@@ -201,6 +201,7 @@ Starter files: [examples/tuitube.json](examples/tuitube.json) · [examples/sampl
 | :--- | :--- | :--- |
 | `language` | UI/YouTube metadata language (`"auto"` detects OS locale, or `"vi"`, `"en"`, `"ja"`, `"zh-TW"`, etc.) | `"auto"` |
 | `region` | Optional 2-letter country override (`"US"`, `"VN"`, `"JP"`, etc.) | `""` |
+| `original_titles` | Show uploader-original video titles and the selected video's description (UI stays localized; links in the description are clickable). Set `false` to opt back into localized text | `true` |
 | `player_path` | Standalone external player (`"mpv"`, `"vlc"`, or full path) | `"mpv"` |
 | `ytdlp_path` | Custom `yt-dlp` binary or directory (`""` auto-detects config dir, app dir, and `PATH`) | `""` |
 | `video_format` | Quality/codec format (empty = `"1080p60"` standalone / `mpv.conf` in plugin) | `""` |
@@ -252,7 +253,7 @@ TuiTube/
 ├── tests/
 │   └── test_runner.c               # Offline unit test suite (ASan + UBSan)
 ├── docs/
-│   ├── CONFIGURATION.md            # Binary placement matrix, 27 config keys, themes & keys
+│   ├── CONFIGURATION.md            # Binary placement matrix, 28 config keys, themes & keys
 │   ├── ARCHITECTURE.md             # Module map and concurrency model
 │   └── UPSTREAM_MAINTENANCE.md     # Guide for fixing YouTube / yt-dlp / mpv changes
 ├── examples/

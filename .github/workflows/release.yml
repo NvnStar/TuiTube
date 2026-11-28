@@ -256,6 +256,11 @@ jobs:
           cat > release-notes.md << 'EOF'
           Lightweight, pure-C17 YouTube client for **Linux (Wayland)** and **Windows (Win32)** — available as both a standalone desktop application and a native `mpv` C plugin.
 
+          ### What's New
+          - **Original titles and descriptions:** `original_titles` (default `true`) restores the uploader's original title **and** the selected video's description from neutral `youtubei/v1/player` metadata, with locale-translated text kept as a silent fallback. Setting it to `false` suppresses originals everywhere, including after detail refresh and in History/Favorites.
+          - **Clickable description links:** plain HTTP(S), `www.`, and conservative bare-domain URLs in the detail description are underlined; clicking one opens the default browser. Unsupported schemes and truncated `...` links are ignored.
+          - **Copy Description** copies the description exactly as displayed (original when available, otherwise localized), and description scrolling/link hit-testing stays aligned.
+
           > [!NOTE]
           > **Which Windows Archive Should You Download?**
           > - **`tuitube-windows-x64-bundled.zip` (Recommended for quick start):** Includes `mpv.exe` and `yt-dlp.exe` ready to run out of the box (extract and double-click `tuitube.exe`; run `.\yt-dlp.exe -U` later if YouTube changes break playback; optional [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) is only needed for merging high-resolution `Ctrl+S` downloads).

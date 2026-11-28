@@ -30,6 +30,7 @@
   "allow_hdr": false,
   "all_codecs": false,
   "hide_members_only": false,
+  "original_titles": true,
   "download_dir": "",
   "key_bindings": [
     {"action": "set_light_theme", "mod": "", "key": "F2"},
