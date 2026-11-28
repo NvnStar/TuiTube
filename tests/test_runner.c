@@ -1642,6 +1642,102 @@ static void test_locale_parsing_and_innertube_headers(void) {
     innertube_set_locale("en", "US");
 }
 
+static void test_original_titles(void) {
+    /* (a) Config parsing: true / false / omitted / non-bool */
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_orig_cfg", tmpdir, sizeof(tmpdir));
+    char cfg_file[PATH_MAX + 32];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+
+    const char *cfg_true = "{ \"original_titles\": true }\n";
+    assert(tt_write_file_atomic(cfg_file, cfg_true, strlen(cfg_true)));
+    TuiTubeConfig cfg;
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.original_titles == true);
+    config_free(&cfg);
+
+    const char *cfg_false = "{ \"original_titles\": false }\n";
+    assert(tt_write_file_atomic(cfg_file, cfg_false, strlen(cfg_false)));
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.original_titles == false);
+    config_free(&cfg);
+
+    const char *cfg_omitted = "{ \"language\": \"vi\" }\n";
+    assert(tt_write_file_atomic(cfg_file, cfg_omitted, strlen(cfg_omitted)));
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.original_titles == false);
+    config_free(&cfg);
+
+    const char *cfg_nonbool = "{ \"original_titles\": \"yes\" }\n";
+    assert(tt_write_file_atomic(cfg_file, cfg_nonbool, strlen(cfg_nonbool)));
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.original_titles == false);
+    config_free(&cfg);
+
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
+
+    /* (b) display helper prefers original_title, copies/frees it */
+    MediaItem src = {0};
+    src.kind = ITEM_VIDEO;
+    snprintf(src.id, sizeof(src.id), "abc123XYZ");
+    src.title = tt_strdup("Vietnamese title");
+    src.original_title = tt_strdup("Original English Title");
+
+    assert(strcmp(media_item_display_title(&src), "Original English Title") == 0);
+
+    MediaItem copy;
+    assert(media_item_copy(&copy, &src));
+    assert(copy.original_title && strcmp(copy.original_title, "Original English Title") == 0);
+    assert(strcmp(media_item_display_title(&copy), "Original English Title") == 0);
+    media_item_free_fields(&copy);
+    assert(copy.title == NULL && copy.original_title == NULL);
+
+    /* Empty original_title falls back to the localized title */
+    MediaItem empty_orig = {0};
+    empty_orig.title = tt_strdup("Localized");
+    empty_orig.original_title = tt_strdup("");
+    assert(strcmp(media_item_display_title(&empty_orig), "Localized") == 0);
+    media_item_free_fields(&empty_orig);
+
+    /* NULL original_title falls back too, and NULL item is safe */
+    MediaItem no_orig = {0};
+    no_orig.title = tt_strdup("Only Title");
+    assert(strcmp(media_item_display_title(&no_orig), "Only Title") == 0);
+    media_item_free_fields(&no_orig);
+    assert(media_item_display_title(NULL) == NULL);
+    media_item_free_fields(&src);
+
+    /* (c) oEmbed JSON title extraction */
+    char out[128];
+    const char *valid =
+        "{\"title\":\"I Survived 100 Days in a Cave\","
+        "\"author_name\":\"MrBeast\",\"type\":\"video\"}";
+    assert(innertube_parse_oembed_json(valid, strlen(valid), out, sizeof(out)));
+    assert(strcmp(out, "I Survived 100 Days in a Cave") == 0);
+
+    const char *empty_obj = "{}";
+    out[0] = 'x';
+    assert(!innertube_parse_oembed_json(empty_obj, strlen(empty_obj), out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *empty_title = "{\"title\":\"\"}";
+    assert(!innertube_parse_oembed_json(empty_title, strlen(empty_title), out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *malformed = "{\"title\": ";
+    assert(!innertube_parse_oembed_json(malformed, strlen(malformed), out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *non_string_title = "{\"title\": 42}";
+    assert(!innertube_parse_oembed_json(non_string_title, strlen(non_string_title), out, sizeof(out)));
+
+    /* (d) Cache reset is callable and idempotent */
+    innertube_original_title_cache_reset();
+    innertube_original_title_cache_reset();
+    innertube_original_title_cache_reset();
+}
+
 static void test_non_english_lockup_and_badges(void) {
     const char *vi_browse =
         "{"
@@ -2006,6 +2102,7 @@ int main(void) {
     RUN_TEST(test_mpv_overlay_section_close_win_and_bindings);
     RUN_TEST(test_player_launch_and_exe_resolution);
     RUN_TEST(test_locale_parsing_and_innertube_headers);
+    RUN_TEST(test_original_titles);
     RUN_TEST(test_non_english_lockup_and_badges);
     RUN_TEST(test_pe_subsystem_and_runtime_dep_checks);
     RUN_TEST(test_ytdlp_path_resolution_and_mpv_opts);

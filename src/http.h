@@ -20,7 +20,8 @@ typedef enum {
     JOB_DETAIL,
     JOB_FEED,
     JOB_RESOLVE_URL,
-    JOB_THUMBNAIL
+    JOB_THUMBNAIL,
+    JOB_ORIGINAL_TITLE
 } HttpJobType;
 
 typedef enum {

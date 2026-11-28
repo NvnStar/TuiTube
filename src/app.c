@@ -156,6 +156,7 @@ typedef struct {
     bool load_list;
     bool append;
     bool hide_members_only;
+    bool original_titles;
 } NextJobReq;
 
 typedef struct {
@@ -196,9 +197,46 @@ static void *run_next_job(CURL *curl, void *arg, uint64_t gen, HttpPool *pool) {
                              req->continuation ? NULL : &res->details,
                              req->load_list ? &res->recommended : NULL,
                              res->error, sizeof(res->error));
+    if (res->ok && req->original_titles && res->details.id[0] && !res->details.original_title) {
+        char orig[512];
+        if (innertube_resolve_original_title(curl, res->details.id, orig, sizeof(orig))) {
+            res->details.original_title = tt_strdup(orig);
+        }
+    }
     if (res->ok && req->load_list && req->hide_members_only) {
         media_list_filter_members_only(&res->recommended);
     }
+    return res;
+}
+
+typedef struct {
+    char *video_id;
+} OriginalTitleJobReq;
+
+typedef struct {
+    bool ok;
+    char video_id[32];
+    char title[512];
+} OriginalTitleJobRes;
+
+static void free_original_title_req(void *p) {
+    OriginalTitleJobReq *r = p;
+    if (!r) return;
+    free(r->video_id);
+    free(r);
+}
+
+static void free_original_title_res(void *p) {
+    free(p);
+}
+
+static void *run_original_title_job(CURL *curl, void *arg, uint64_t gen, HttpPool *pool) {
+    OriginalTitleJobReq *req = arg;
+    if (pool && http_pool_should_cancel(pool, gen)) return NULL;
+    OriginalTitleJobRes *res = calloc(1, sizeof(OriginalTitleJobRes));
+    if (!res) return NULL;
+    snprintf(res->video_id, sizeof(res->video_id), "%s", req->video_id);
+    res->ok = innertube_resolve_original_title(curl, req->video_id, res->title, sizeof(res->title));
     return res;
 }
 
@@ -346,6 +384,39 @@ static uint64_t bump_list_gen(AppState *app) {
     return app->list_gen;
 }
 
+#define ORIGINAL_TITLE_LIST_CAP 30
+
+static void submit_original_title_job(AppState *app, const char *video_id, uint64_t gen) {
+    if (!app || !app->pool || !video_id || !video_id[0]) return;
+    OriginalTitleJobReq *req = calloc(1, sizeof(OriginalTitleJobReq));
+    if (!req) return;
+    req->video_id = tt_strdup(video_id);
+    if (!req->video_id) {
+        free_original_title_req(req);
+        return;
+    }
+    /* http_pool_submit frees `req` itself on failure; a rejected submit is a
+       silent no-op and the row keeps its localized title. */
+    (void)http_pool_submit(app->pool, JOB_ORIGINAL_TITLE, gen, req,
+                           run_original_title_job,
+                           free_original_title_req,
+                           free_original_title_res);
+}
+
+static void enqueue_original_title_jobs(AppState *app) {
+    if (!app || !app->cfg.original_titles || !app->ui) return;
+    MediaList *list = ui_get_list(app->ui);
+    if (!list) return;
+    size_t queued = 0;
+    for (size_t i = 0; i < list->count && queued < ORIGINAL_TITLE_LIST_CAP; i++) {
+        MediaItem *it = &list->items[i];
+        if (it->kind == ITEM_VIDEO && it->id[0] && !it->original_title) {
+            submit_original_title_job(app, it->id, app->list_gen);
+            queued++;
+        }
+    }
+}
+
 static void submit_browse(AppState *app, const char *browse_id, const char *params,
                           const char *continuation, const char *heading,
                           bool append, bool push_nav) {
@@ -383,6 +454,7 @@ static void submit_next(AppState *app, const char *video_id, const char *continu
     req->load_list = load_list;
     req->append = append;
     req->hide_members_only = app->cfg.hide_members_only;
+    req->original_titles = app->cfg.original_titles;
 
     if (load_list && !append && push_nav) push_current_nav(app);
     uint64_t gen = load_list ? bump_list_gen(app) : ++app->detail_gen;
@@ -878,6 +950,7 @@ bool app_init_ex(AppState *app, const char *cli_config_dir, const char *override
         fprintf(stderr, "Warning: failed to parse config file, using defaults\n");
     }
     innertube_set_locale(app->cfg.resolved_hl, app->cfg.resolved_gl);
+    innertube_original_title_cache_reset();
     char *resolved_ytdlp = player_resolve_ytdlp_path(&app->cfg, NULL);
     if (resolved_ytdlp) {
         innertube_set_ytdlp_path(resolved_ytdlp);
@@ -1037,6 +1110,7 @@ void app_process_async_results(AppState *app) {
                     if (!lr->append) {
                         sync_selected_item_details(app);
                     }
+                    enqueue_original_title_jobs(app);
                     ui_set_status(app->ui, "Loaded %zu items", ui_get_list(app->ui)->count);
                 } else {
                     const char *emsg = lr->error[0] ? lr->error : "Request failed";
@@ -1057,6 +1131,38 @@ void app_process_async_results(AppState *app) {
             if (nr && res.request_gen == app->detail_gen && nr->ok && nr->details.id[0]) {
                 ui_set_detail_item(app->ui, &nr->details);
             }
+        } else if (res.job_type == JOB_ORIGINAL_TITLE) {
+            OriginalTitleJobRes *ot = res.data;
+            if (ot && ot->ok && res.request_gen == app->list_gen && ot->video_id[0] && ot->title[0]) {
+                bool applied = false;
+                MediaList *list = ui_get_list(app->ui);
+                if (list) {
+                    for (size_t i = 0; i < list->count; i++) {
+                        MediaItem *it = &list->items[i];
+                        if (it->kind == ITEM_VIDEO && strcmp(it->id, ot->video_id) == 0) {
+                            if (!it->original_title || !it->original_title[0]) {
+                                free(it->original_title);
+                                it->original_title = tt_strdup(ot->title);
+                                applied = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+                const MediaItem *det = ui_get_detail_item(app->ui);
+                if (det && strcmp(det->id, ot->video_id) == 0 &&
+                    (!det->original_title || !det->original_title[0])) {
+                    MediaItem tmp;
+                    if (media_item_copy(&tmp, det)) {
+                        free(tmp.original_title);
+                        tmp.original_title = tt_strdup(ot->title);
+                        ui_set_detail_item(app->ui, &tmp);
+                        media_item_free_fields(&tmp);
+                        applied = true;
+                    }
+                }
+                if (applied) wayland_request_redraw(app->wl);
+            }
         } else if (res.job_type == JOB_NEXT) {
             NextJobRes *nr = res.data;
             if (nr) {
@@ -1068,6 +1174,7 @@ void app_process_async_results(AppState *app) {
                         if (!nr->append && nr->details.id[0]) {
                             ui_set_detail_item(app->ui, &nr->details);
                         }
+                        enqueue_original_title_jobs(app);
                         ui_set_status(app->ui, "Loaded %zu recommended videos",
                                       ui_get_list(app->ui)->count);
                     } else {
@@ -1111,6 +1218,7 @@ void app_process_async_results(AppState *app) {
                         ui_set_list(app->ui, &rr->list, false);
                         sync_ui_nav(app);
                         sync_selected_item_details(app);
+                        enqueue_original_title_jobs(app);
                         ui_set_status(app->ui, "Loaded %zu items", ui_get_list(app->ui)->count);
                     }
                 } else {

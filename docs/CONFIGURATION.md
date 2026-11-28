@@ -96,7 +96,7 @@ Alternatively, save the binary anywhere and point `"ytdlp_path"` in `tuitube.jso
 
 ## 4. Complete `tuitube.json` Option Reference
 
-All 27 configuration keys are optional; omitted keys keep their built-in defaults.
+All 28 configuration keys are optional; omitted keys keep their built-in defaults.
 
 | Key | Type | Default | Valid Values / Clamping | Notes |
 | :--- | :--- | :--- | :--- | :--- |
@@ -125,6 +125,7 @@ All 27 configuration keys are optional; omitted keys keep their built-in default
 | `max_feed_videos_per_channel` | `integer` | `15` | Clamped `[1, 100]` | Maximum items fetched per favorite channel/playlist for Subscription Feed. |
 | `max_feed_age` | `string` | `"1 month"` | `"<N> hour(s)\|day(s)\|week(s)\|month(s)\|year(s)"` | Filter out feed videos older than this age. |
 | `hide_members_only` | `boolean` | `false` | `true` / `false` | Also accepts alias `"hide_member_videos"`. Hides channel-members-only videos in search/browse/recommended (and Feed when `feed_use_rss: false`). |
+| `original_titles` | `boolean` | `false` | `true` / `false` | When `true`, list rows and the detail pane show the uploader's **original** title instead of the locale-translated one, resolved lazily via YouTube's public oEmbed endpoint (bounded, best-effort). UI language is still controlled by `language`. |
 | `download_dir` | `string` | `""` | Directory path (`~`, `~/...`, absolute, or relative to `config_dir`) | Target folder for `yt-dlp` downloads (`Ctrl+S`). |
 | `key_bindings` | `array` | `[]` *(appends over defaults)* | Array of `{"action", "mod", "key"}` objects | Custom bindings override earlier/default bindings on matching `mod` + `key`. |
 
@@ -133,6 +134,11 @@ All 27 configuration keys are optional; omitted keys keep their built-in default
 YouTube's InnerTube API returns localized video titles and descriptions according to the request's `context.client.hl` and `Accept-Language` header. Because YouTube does not provide an unauthenticated *"original uploader language only"* parameter, videos that have creator-provided or auto-translated metadata will match your configured `"language"`:
 - `"language": "auto"` (default) aligns YouTube results with your OS language (e.g., Vietnamese `"vi"` / `"VN"`, Japanese `"ja"` / `"JP"`, English `"en"` / `"US"`).
 - To force a consistent language regardless of OS settings, set `"language": "en"` or `"language": "vi"`, etc.
+
+By default `"language"` localizes **both** the UI chrome **and** the content titles. Set `"original_titles": true` to keep the UI localized while showing each video's **uploader-original** title instead of the translated one:
+- Originals come from YouTube's public **oEmbed** endpoint (`https://www.youtube.com/oembed?url=...&format=json`), which returns the creator's original title regardless of `hl`/`Accept-Language`.
+- Resolution is **lazy, non-blocking, and best-effort**: lists render immediately with localized titles, then originals are filled in on background workers (first ~30 unresolved video rows per list, with a bounded success-only cache). Failed/private/deleted lookups silently keep the localized title — no error is surfaced.
+- Channel and playlist names are uploader-authored and already unlocalized, so they are shown as-is. RSS-feed and `yt-dlp` search results are natively original and need no extra lookup. `"original_titles": false` (default) makes no extra network calls and behaves exactly as before.
 
 ---
 

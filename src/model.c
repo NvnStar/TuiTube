@@ -9,6 +9,7 @@
 void media_item_free_fields(MediaItem *it) {
     if (!it) return;
     free(it->title);
+    free(it->original_title);
     free(it->author);
     free(it->author_id);
     free(it->duration_text);
@@ -25,6 +26,7 @@ bool media_item_copy(MediaItem *dst, const MediaItem *src) {
     dst->kind = src->kind;
     snprintf(dst->id, sizeof(dst->id), "%s", src->id);
     dst->title = tt_strdup(src->title);
+    dst->original_title = tt_strdup(src->original_title);
     dst->author = tt_strdup(src->author);
     dst->author_id = tt_strdup(src->author_id);
     dst->duration_text = tt_strdup(src->duration_text);
@@ -38,6 +40,11 @@ bool media_item_copy(MediaItem *dst, const MediaItem *src) {
     dst->watched = src->watched;
     dst->details_loaded = src->details_loaded;
     return true;
+}
+
+const char *media_item_display_title(const MediaItem *it) {
+    if (it && it->original_title && it->original_title[0]) return it->original_title;
+    return it ? it->title : NULL;
 }
 
 void media_list_init(MediaList *list) {

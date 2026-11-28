@@ -482,6 +482,7 @@ void config_init_defaults(TuiTubeConfig *cfg) {
     cfg->allow_hdr = false;
     cfg->all_codecs = false;
     cfg->hide_members_only = false;
+    cfg->original_titles = false;
     cfg->download_dir = tt_strdup("");
     add_default_keybindings(cfg);
     theme_init_builtin(&cfg->theme, "dark");
@@ -754,6 +755,7 @@ bool config_load_from(TuiTubeConfig *cfg, const char *cli_config_dir,
     } else {
         read_bool_field(root, "hide_member_videos", &cfg->hide_members_only);
     }
+    read_bool_field(root, "original_titles", &cfg->original_titles);
     replace_str_field(root, "download_dir", &cfg->download_dir);
 
     v = yyjson_obj_get(root, "max_feed_videos_per_channel");

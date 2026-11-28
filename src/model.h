@@ -19,6 +19,7 @@ typedef struct {
     ItemKind kind;
     char id[64];
     char *title;
+    char *original_title;
     char *author;
     char *author_id;
     char *duration_text;
@@ -94,6 +95,7 @@ typedef struct {
 
 void media_item_free_fields(MediaItem *it);
 bool media_item_copy(MediaItem *dst, const MediaItem *src);
+const char *media_item_display_title(const MediaItem *it);
 
 void media_list_init(MediaList *list);
 void media_list_clear(MediaList *list);

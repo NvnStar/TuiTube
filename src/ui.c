@@ -1144,7 +1144,7 @@ static void merge_media_details(MediaItem *dst, const MediaItem *src) {
     }
     dst->is_live = dst->is_live || src->is_live;
     dst->is_members_only = dst->is_members_only || src->is_members_only;
-    dst->details_loaded = true;
+    dst->details_loaded = dst->details_loaded || src->details_loaded;
 }
 
 void ui_set_detail_item(UiState *ui, const MediaItem *detail) {
@@ -1568,12 +1568,13 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
     y += max_th + SP_MD;
 
     /* Title (wrapped, 1.22x bold) */
-    if (item->title && item->title[0]) {
+    const char *disp_title = media_item_display_title(item);
+    if (disp_title && disp_title[0]) {
         PangoLayout *tl = pango_cairo_create_layout(cr);
         PangoFontDescription *td = make_font_desc(ui, 1.22, true);
         pango_layout_set_font_description(tl, td);
         pango_font_description_free(td);
-        pango_layout_set_text(tl, item->title, -1);
+        pango_layout_set_text(tl, disp_title, -1);
         pango_layout_set_width(tl, (int)(cw * PANGO_SCALE));
         pango_layout_set_wrap(tl, PANGO_WRAP_WORD_CHAR);
         set_cairo_color(cr, t->text_normal.fg, 1.0);
@@ -2070,7 +2071,8 @@ static void build_ctx_menu(UiState *ui, const MediaItem *item, double x, double 
     snprintf(m->labels[c], sizeof(m->labels[c]), "Copy URL");
     m->icons[c++] = ICON_COPY;
 
-    if (item->title && item->title[0]) {
+    const char *ctx_disp_title = media_item_display_title(item);
+    if (ctx_disp_title && ctx_disp_title[0]) {
         m->actions[c] = CTX_ACT_COPY_TITLE;
         snprintf(m->labels[c], sizeof(m->labels[c]), "Copy Title");
         m->icons[c++] = ICON_COPY;
@@ -2442,12 +2444,13 @@ void ui_on_render(void *ctx, cairo_t *cr, int width, int height) {
             double avail_w = (card.x + card.w) - tx - SP_SM;
             if (avail_w > 10.0) {
                 double ty = ry + 6.0;
-                if (it->title && it->title[0]) {
+                const char *disp_title = media_item_display_title(it);
+                if (disp_title && disp_title[0]) {
                     PangoLayout *tl = pango_cairo_create_layout(cr);
                     PangoFontDescription *td = make_font_desc_w(ui, 0.96, PANGO_WEIGHT_SEMIBOLD);
                     pango_layout_set_font_description(tl, td);
                     pango_font_description_free(td);
-                    pango_layout_set_text(tl, it->title, -1);
+                    pango_layout_set_text(tl, disp_title, -1);
                     pango_layout_set_width(tl, (int)(avail_w * PANGO_SCALE));
                     pango_layout_set_wrap(tl, PANGO_WRAP_WORD_CHAR);
                     pango_layout_set_ellipsize(tl, PANGO_ELLIPSIZE_END);
@@ -2875,9 +2878,12 @@ static void copy_item_field(UiState *ui, int which) {
         else snprintf(url, sizeof(url), "https://www.youtube.com/playlist?list=%s", it->id);
         wayland_clipboard_copy(ui->wl, url);
         ui_set_status(ui, "Copied URL to clipboard");
-    } else if (which == 1 && it->title) {
-        wayland_clipboard_copy(ui->wl, it->title);
-        ui_set_status(ui, "Copied title to clipboard");
+    } else if (which == 1) {
+        const char *disp_title = media_item_display_title(it);
+        if (disp_title && disp_title[0]) {
+            wayland_clipboard_copy(ui->wl, disp_title);
+            ui_set_status(ui, "Copied title to clipboard");
+        }
     } else if (which == 2 && it->description) {
         wayland_clipboard_copy(ui->wl, it->description);
         ui_set_status(ui, "Copied description to clipboard");

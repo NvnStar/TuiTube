@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <yyjson.h>
 
@@ -13,6 +14,36 @@
 static char g_innertube_hl[16] = "en";
 static char g_innertube_gl[8] = "US";
 static char g_innertube_ytdlp_path[PATH_MAX] = "yt-dlp";
+
+#define ORIGINAL_TITLE_CACHE_SIZE 256
+#define ORIGINAL_TITLE_MAX 512
+
+typedef struct {
+    char video_id[32];
+    char title[ORIGINAL_TITLE_MAX];
+} OriginalTitleEntry;
+
+static OriginalTitleEntry g_orig_cache[ORIGINAL_TITLE_CACHE_SIZE];
+static size_t g_orig_cache_count;
+static unsigned g_orig_cache_next;
+static atomic_flag g_orig_cache_lock = ATOMIC_FLAG_INIT;
+
+static void orig_cache_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_orig_cache_lock, memory_order_acquire)) {
+    }
+}
+
+static void orig_cache_unlock(void) {
+    atomic_flag_clear_explicit(&g_orig_cache_lock, memory_order_release);
+}
+
+void innertube_original_title_cache_reset(void) {
+    orig_cache_lock();
+    memset(g_orig_cache, 0, sizeof(g_orig_cache));
+    g_orig_cache_count = 0;
+    g_orig_cache_next = 0;
+    orig_cache_unlock();
+}
 
 void innertube_set_ytdlp_path(const char *path) {
     if (!path || !path[0]) {
@@ -1293,6 +1324,7 @@ bool innertube_parse_ytdlp_json(const char *json, size_t len, MediaList *out_lis
 
         yyjson_val *t = yyjson_obj_get(e, "title");
         it.title = tt_strdup((t && yyjson_is_str(t)) ? yyjson_get_str(t) : it.id);
+        it.original_title = tt_strdup(it.title);
 
         yyjson_val *up = yyjson_obj_get(e, "uploader");
         if (!up || !yyjson_is_str(up)) up = yyjson_obj_get(e, "channel");
@@ -1349,6 +1381,87 @@ bool innertube_parse_ytdlp_json(const char *json, size_t len, MediaList *out_lis
 
     yyjson_doc_free(doc);
     return out_list->count > 0;
+}
+
+bool innertube_parse_oembed_json(const char *json, size_t len, char *out, size_t out_cap) {
+    if (out && out_cap > 0) out[0] = '\0';
+    if (!json || len == 0 || !out || out_cap == 0) return false;
+
+    yyjson_read_flag flags = YYJSON_READ_ALLOW_TRAILING_COMMAS | YYJSON_READ_ALLOW_COMMENTS;
+    /* yyjson_read_opts takes char* for optional in-situ mutation; we never set
+       YYJSON_READ_IN_SITU, so the buffer is only read. */
+    yyjson_doc *doc = yyjson_read_opts((char *)json, len, flags, NULL, NULL);
+    if (!doc) return false;
+
+    bool ok = false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *title = yyjson_is_obj(root) ? yyjson_obj_get(root, "title") : NULL;
+    if (title && yyjson_is_str(title)) {
+        const char *s = yyjson_get_str(title);
+        if (s && s[0]) {
+            snprintf(out, out_cap, "%s", s);
+            ok = true;
+        }
+    }
+    yyjson_doc_free(doc);
+    return ok;
+}
+
+static bool is_valid_video_id(const char *video_id) {
+    if (!video_id || !video_id[0]) return false;
+    size_t len = strlen(video_id);
+    if (len < 6 || len >= sizeof(((OriginalTitleEntry *)0)->video_id)) return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)video_id[i];
+        if (!(isalnum(c) || c == '_' || c == '-')) return false;
+    }
+    return true;
+}
+
+bool innertube_resolve_original_title(CURL *curl, const char *video_id, char *out, size_t out_cap) {
+    if (out && out_cap > 0) out[0] = '\0';
+    if (!is_valid_video_id(video_id) || !out || out_cap == 0) return false;
+
+    orig_cache_lock();
+    for (size_t i = 0; i < g_orig_cache_count; i++) {
+        if (strcmp(g_orig_cache[i].video_id, video_id) == 0) {
+            snprintf(out, out_cap, "%s", g_orig_cache[i].title);
+            orig_cache_unlock();
+            return out[0] != '\0';
+        }
+    }
+    orig_cache_unlock();
+
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=%s&format=json",
+             video_id);
+
+    HttpResponse resp;
+    memset(&resp, 0, sizeof(resp));
+    bool ok = false;
+    if (http_get(curl, url, 256u * 1024u, &resp)) {
+        if (resp.status_code >= 200 && resp.status_code < 300 && resp.data) {
+            ok = innertube_parse_oembed_json(resp.data, resp.len, out, out_cap);
+        }
+    }
+    http_response_free(&resp);
+    if (!ok) {
+        if (out_cap > 0) out[0] = '\0';
+        return false;
+    }
+
+    orig_cache_lock();
+    size_t slot;
+    if (g_orig_cache_count < ORIGINAL_TITLE_CACHE_SIZE) {
+        slot = g_orig_cache_count++;
+    } else {
+        slot = g_orig_cache_next++ % ORIGINAL_TITLE_CACHE_SIZE;
+    }
+    snprintf(g_orig_cache[slot].video_id, sizeof(g_orig_cache[slot].video_id), "%s", video_id);
+    snprintf(g_orig_cache[slot].title, sizeof(g_orig_cache[slot].title), "%s", out);
+    orig_cache_unlock();
+    return true;
 }
 
 static char *extract_xml_tag_text(const char *block, const char *block_end, const char *tag) {
@@ -1432,6 +1545,7 @@ bool innertube_parse_rss_xml(const char *xml, size_t xml_len, MediaList *out_lis
             it.kind = ITEM_VIDEO;
             snprintf(it.id, sizeof(it.id), "%s", vid);
             it.title = extract_xml_tag_text(entry_start, entry_end, "title");
+            it.original_title = tt_strdup(it.title);
             it.author = extract_xml_tag_text(entry_start, entry_end, "name");
             it.author_id = extract_xml_tag_text(entry_start, entry_end, "yt:channelId");
             it.description = extract_xml_tag_text(entry_start, entry_end, "media:description");
