@@ -201,7 +201,7 @@ Starter files: [examples/tuitube.json](examples/tuitube.json) · [examples/sampl
 | :--- | :--- | :--- |
 | `language` | UI/YouTube metadata language (`"auto"` detects OS locale, or `"vi"`, `"en"`, `"ja"`, `"zh-TW"`, etc.) | `"auto"` |
 | `region` | Optional 2-letter country override (`"US"`, `"VN"`, `"JP"`, etc.) | `""` |
-| `original_titles` | Show uploader-original video titles instead of locale-translated ones (UI stays localized; resolved lazily). Set `false` to opt back into localized titles | `true` |
+| `original_titles` | Show uploader-original video titles and the selected video's description (UI stays localized; links in the description are clickable). Set `false` to opt back into localized text | `true` |
 | `player_path` | Standalone external player (`"mpv"`, `"vlc"`, or full path) | `"mpv"` |
 | `ytdlp_path` | Custom `yt-dlp` binary or directory (`""` auto-detects config dir, app dir, and `PATH`) | `""` |
 | `video_format` | Quality/codec format (empty = `"1080p60"` standalone / `mpv.conf` in plugin) | `""` |

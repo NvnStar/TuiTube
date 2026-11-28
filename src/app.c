@@ -197,11 +197,29 @@ static void *run_next_job(CURL *curl, void *arg, uint64_t gen, HttpPool *pool) {
                              req->continuation ? NULL : &res->details,
                              req->load_list ? &res->recommended : NULL,
                              res->error, sizeof(res->error));
-    if (res->ok && req->original_titles && res->details.id[0] &&
-        (!res->details.original_title || !res->details.original_title[0])) {
+    if (res->ok && req->original_titles && res->details.id[0]) {
         char orig[512];
-        if (innertube_resolve_original_title(curl, res->details.id, orig, sizeof(orig))) {
-            res->details.original_title = tt_strdup(orig);
+        char *orig_desc = NULL;
+        if (innertube_resolve_original_metadata(curl, res->details.id, orig, sizeof(orig),
+                                                &orig_desc)) {
+            if (orig[0]) {
+                free(res->details.original_title);
+                res->details.original_title = tt_strdup(orig);
+            }
+            if (orig_desc && orig_desc[0]) {
+                free(res->details.original_description);
+                res->details.original_description = orig_desc;
+            } else {
+                free(orig_desc);
+            }
+        }
+        if (!res->details.original_title || !res->details.original_title[0]) {
+            char fallback[512];
+            if (innertube_resolve_original_title(curl, res->details.id, fallback,
+                                                 sizeof(fallback))) {
+                free(res->details.original_title);
+                res->details.original_title = tt_strdup(fallback);
+            }
         }
     }
     if (res->ok && req->load_list && req->hide_members_only) {

@@ -13,9 +13,11 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
 #include <wchar.h>
 #include <wctype.h>
 #else
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -2075,6 +2077,293 @@ static void copy_utf8_bounded(char *dst, size_t cap, const char *src) {
     }
     memcpy(dst, src, n);
     dst[n] = '\0';
+}
+
+static bool url_char_is_space_or_control(unsigned char c) {
+    return c <= 0x20 || c == 0x7f;
+}
+
+static bool url_span_prefix_ci(const char *text, size_t start, size_t len, const char *prefix) {
+    size_t plen = strlen(prefix);
+    if (start + plen > len) return false;
+    return tt_strncasecmp(text + start, prefix, plen) == 0;
+}
+
+static bool url_start_boundary(const char *text, size_t start, bool allow_at) {
+    if (start == 0) return true;
+    unsigned char prev = (unsigned char)text[start - 1];
+    if (isalnum(prev) || prev == '_' || prev == '-' || prev == '.' || prev == '/' || prev == ':') {
+        return false;
+    }
+    if (!allow_at && prev == '@') return false;
+    return true;
+}
+
+static bool url_ascii_label(const char *s, size_t len) {
+    if (len == 0 || len > 63) return false;
+    if (s[0] == '-' || s[len - 1] == '-') return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!(isalnum(c) || c == '-')) return false;
+    }
+    return true;
+}
+
+static bool url_tld_ok(const char *s, size_t len) {
+    if (len < 2 || len > 24) return false;
+    for (size_t i = 0; i < len; i++) {
+        if (!isalpha((unsigned char)s[i])) return false;
+    }
+    return true;
+}
+
+static bool url_bare_host_ok(const char *host, size_t len) {
+    if (!host || len == 0) return false;
+    size_t label_start = 0;
+    size_t labels = 0;
+    for (size_t i = 0; i <= len; i++) {
+        if (i == len || host[i] == '.') {
+            if (!url_ascii_label(host + label_start, i - label_start)) return false;
+            label_start = i + 1;
+            labels++;
+        }
+    }
+    if (labels < 2) return false;
+    size_t tld_start = len;
+    while (tld_start > 0 && host[tld_start - 1] != '.') tld_start--;
+    return url_tld_ok(host + tld_start, len - tld_start);
+}
+
+static bool url_validate_token(const char *text, size_t start, size_t end, bool explicit_scheme) {
+    if (end <= start) return false;
+    size_t len = end - start;
+    if (len >= 3 && memcmp(text + end - 3, "...", 3) == 0) return false;
+
+    size_t host_start = start;
+    if (explicit_scheme) {
+        host_start += url_span_prefix_ci(text, start, end, "https://") ? 8 : 7;
+    }
+    if (host_start >= end) return false;
+
+    size_t host_end = host_start;
+    while (host_end < end && text[host_end] != '/' && text[host_end] != '?' && text[host_end] != '#') {
+        unsigned char c = (unsigned char)text[host_end];
+        if (url_char_is_space_or_control(c)) return false;
+        host_end++;
+    }
+    if (host_end == host_start) return false;
+
+    if (!explicit_scheme) {
+        for (size_t i = start; i < end; i++) {
+            if (text[i] == '/') break;
+            if (text[i] == '@') return false;
+        }
+    }
+
+    for (size_t i = host_start; i < host_end; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (url_char_is_space_or_control(c)) return false;
+    }
+    if (explicit_scheme) return true;
+
+    size_t check_end = host_end;
+    size_t colon = host_end;
+    for (size_t i = host_start; i < host_end; i++) {
+        if (text[i] == ':') {
+            colon = i;
+            break;
+        }
+    }
+    if (colon < host_end) {
+        check_end = colon;
+        if (colon + 1 >= host_end) return false;
+        for (size_t i = colon + 1; i < host_end; i++) {
+            if (!isdigit((unsigned char)text[i])) return false;
+        }
+    }
+    return url_bare_host_ok(text + host_start, check_end - host_start);
+}
+
+static size_t url_trim_end(const char *text, size_t start, size_t end) {
+    while (end > start) {
+        char c = text[end - 1];
+        if (c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == '?' ||
+            c == '\'' || c == '"') {
+            end--;
+            continue;
+        }
+        if (c == ')' || c == ']' || c == '}') {
+            char open = c == ')' ? '(' : (c == ']' ? '[' : '{');
+            size_t opens = 0, closes = 0;
+            for (size_t i = start; i < end; i++) {
+                if (text[i] == open) opens++;
+                else if (text[i] == c) closes++;
+            }
+            if (closes > opens) {
+                end--;
+                continue;
+            }
+        }
+        break;
+    }
+    return end;
+}
+
+static bool url_token_is_truncated(const char *text, size_t start, size_t end) {
+    while (end > start) {
+        char c = text[end - 1];
+        if (c == ')' || c == ']' || c == '}' || c == ',' || c == ';' || c == ':' ||
+            c == '!' || c == '?' || c == '\'' || c == '"') {
+            end--;
+            continue;
+        }
+        break;
+    }
+    return end >= start + 3 && memcmp(text + end - 3, "...", 3) == 0;
+}
+
+size_t tt_find_url_spans(const char *text, TtTextSpan *out, size_t max) {
+    if (!text || !out || max == 0) return 0;
+    size_t len = strlen(text);
+    size_t count = 0;
+    for (size_t i = 0; i < len && count < max; i++) {
+        unsigned char c = (unsigned char)text[i];
+        bool explicit_scheme = false;
+        bool candidate = false;
+        if (url_span_prefix_ci(text, i, len, "http://") ||
+            url_span_prefix_ci(text, i, len, "https://")) {
+            if (url_start_boundary(text, i, true)) candidate = explicit_scheme = true;
+        } else if (url_span_prefix_ci(text, i, len, "www.")) {
+            if (url_start_boundary(text, i, false)) candidate = true;
+        } else if (c < 0x80 && isalpha(c) && url_start_boundary(text, i, false)) {
+            candidate = true;
+        }
+        if (!candidate) continue;
+
+        size_t end = i;
+        while (end < len && !url_char_is_space_or_control((unsigned char)text[end])) end++;
+        if (url_token_is_truncated(text, i, end)) continue;
+        end = url_trim_end(text, i, end);
+        if (end > i && url_validate_token(text, i, end, explicit_scheme)) {
+            out[count++] = (TtTextSpan){i, end};
+            i = end - 1;
+        }
+    }
+    return count;
+}
+
+static bool url_is_http_scheme(const char *url) {
+    size_t len = url ? strlen(url) : 0;
+    return url && (url_span_prefix_ci(url, 0, len, "http://") ||
+                   url_span_prefix_ci(url, 0, len, "https://"));
+}
+
+bool tt_url_from_span(const char *text, TtTextSpan span, char *out, size_t out_cap) {
+    if (out && out_cap > 0) out[0] = '\0';
+    if (!text || !out || out_cap == 0 || span.end <= span.start) return false;
+    size_t len = span.end - span.start;
+    const char *src = text + span.start;
+    bool has_scheme = url_span_prefix_ci(src, 0, len, "http://") ||
+                      url_span_prefix_ci(src, 0, len, "https://");
+    int n = has_scheme ? snprintf(out, out_cap, "%.*s", (int)len, src)
+                       : snprintf(out, out_cap, "https://%.*s", (int)len, src);
+    return n > 0 && (size_t)n < out_cap;
+}
+
+static void set_url_error(char *err_buf, size_t err_cap, const char *msg) {
+    if (err_buf && err_cap > 0) snprintf(err_buf, err_cap, "%s", msg ? msg : "Browser launch failed");
+}
+
+bool tt_open_url(const char *url, char *err_buf, size_t err_cap) {
+    if (err_buf && err_cap > 0) err_buf[0] = '\0';
+    if (!url || !url[0] || !url_is_http_scheme(url)) {
+        set_url_error(err_buf, err_cap, "Unsupported URL");
+        return false;
+    }
+    for (const char *p = url; *p; p++) {
+        if (url_char_is_space_or_control((unsigned char)*p)) {
+            set_url_error(err_buf, err_cap, "Invalid URL");
+            return false;
+        }
+    }
+
+#ifdef _WIN32
+    wchar_t *wide = tt_utf8_to_wide(url);
+    if (!wide) {
+        set_url_error(err_buf, err_cap, "Out of memory");
+        return false;
+    }
+    HINSTANCE r = ShellExecuteW(NULL, L"open", wide, NULL, NULL, SW_SHOWNORMAL);
+    free(wide);
+    if ((uintptr_t)r <= 32u) {
+        set_url_error(err_buf, err_cap, "Could not open browser");
+        return false;
+    }
+    return true;
+#else
+    int fds[2];
+    if (pipe(fds) != 0) {
+        set_url_error(err_buf, err_cap, "Could not start browser");
+        return false;
+    }
+    int err_fd = fcntl(fds[1], F_DUPFD_CLOEXEC, 3);
+    close(fds[1]);
+    if (err_fd < 0) {
+        close(fds[0]);
+        set_url_error(err_buf, err_cap, "Could not start browser");
+        return false;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        close(fds[0]);
+        close(err_fd);
+        set_url_error(err_buf, err_cap, "Could not start browser");
+        return false;
+    }
+    if (child == 0) {
+        close(fds[0]);
+        pid_t grandchild = fork();
+        if (grandchild < 0) {
+            int err = errno;
+            (void)write(err_fd, &err, sizeof(err));
+            _exit(127);
+        }
+        if (grandchild > 0) _exit(0);
+
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
+        char *url_arg = (char *)url;
+        char *const argv_xdg[] = {"xdg-open", url_arg, NULL};
+        execvp(argv_xdg[0], argv_xdg);
+        char *const argv_gio[] = {"gio", "open", url_arg, NULL};
+        execvp(argv_gio[0], argv_gio);
+        int err = errno;
+        (void)write(err_fd, &err, sizeof(err));
+        _exit(127);
+    }
+
+    close(err_fd);
+    int child_status = 0;
+    while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {
+    }
+    int child_errno = 0;
+    ssize_t got = 0;
+    do {
+        got = read(fds[0], &child_errno, sizeof(child_errno));
+    } while (got < 0 && errno == EINTR);
+    close(fds[0]);
+    if (got > 0) {
+        set_url_error(err_buf, err_cap, strerror(child_errno));
+        return false;
+    }
+    return true;
+#endif
 }
 
 bool tt_mpv_parse_key_event(const char *state_str, const char *key_name,

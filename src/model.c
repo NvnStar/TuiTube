@@ -10,6 +10,7 @@ void media_item_free_fields(MediaItem *it) {
     if (!it) return;
     free(it->title);
     free(it->original_title);
+    free(it->original_description);
     free(it->author);
     free(it->author_id);
     free(it->duration_text);
@@ -27,6 +28,7 @@ bool media_item_copy(MediaItem *dst, const MediaItem *src) {
     snprintf(dst->id, sizeof(dst->id), "%s", src->id);
     dst->title = tt_strdup(src->title);
     dst->original_title = tt_strdup(src->original_title);
+    dst->original_description = tt_strdup(src->original_description);
     dst->author = tt_strdup(src->author);
     dst->author_id = tt_strdup(src->author_id);
     dst->duration_text = tt_strdup(src->duration_text);
@@ -47,6 +49,11 @@ const char *media_item_display_title(const MediaItem *it) {
     return it ? it->title : NULL;
 }
 
+const char *media_item_display_description(const MediaItem *it) {
+    if (it && it->original_description && it->original_description[0]) return it->original_description;
+    return it ? it->description : NULL;
+}
+
 static void replace_if_nonempty(char **dst, const char *src) {
     if (src && src[0]) {
         free(*dst);
@@ -58,6 +65,7 @@ void media_item_merge_details(MediaItem *dst, const MediaItem *src) {
     if (!dst || !src) return;
     replace_if_nonempty(&dst->title, src->title);
     replace_if_nonempty(&dst->original_title, src->original_title);
+    replace_if_nonempty(&dst->original_description, src->original_description);
     replace_if_nonempty(&dst->author, src->author);
     replace_if_nonempty(&dst->author_id, src->author_id);
     replace_if_nonempty(&dst->view_count_text, src->view_count_text);
@@ -105,6 +113,15 @@ bool media_item_apply_detail_merge(MediaItem *selected, MediaItem *detail_item,
                    selected->original_title && selected->original_title[0]) {
             free(detail_item->original_title);
             detail_item->original_title = tt_strdup(selected->original_title);
+        }
+        if ((!selected->original_description || !selected->original_description[0]) &&
+            detail_item->original_description && detail_item->original_description[0]) {
+            free(selected->original_description);
+            selected->original_description = tt_strdup(detail_item->original_description);
+        } else if ((!detail_item->original_description || !detail_item->original_description[0]) &&
+                   selected->original_description && selected->original_description[0]) {
+            free(detail_item->original_description);
+            detail_item->original_description = tt_strdup(selected->original_description);
         }
     }
     return true;

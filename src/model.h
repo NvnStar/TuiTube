@@ -20,6 +20,7 @@ typedef struct {
     char id[64];
     char *title;
     char *original_title;
+    char *original_description;
     char *author;
     char *author_id;
     char *duration_text;
@@ -97,6 +98,7 @@ typedef struct {
 void media_item_free_fields(MediaItem *it);
 bool media_item_copy(MediaItem *dst, const MediaItem *src);
 const char *media_item_display_title(const MediaItem *it);
+const char *media_item_display_description(const MediaItem *it);
 void media_item_merge_details(MediaItem *dst, const MediaItem *src);
 bool media_item_apply_detail_merge(MediaItem *selected, MediaItem *detail_item,
                                    bool has_detail_item, const MediaItem *detail);

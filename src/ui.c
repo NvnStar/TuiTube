@@ -91,6 +91,7 @@ typedef enum {
     HIT_ACT_FAVORITE,
     HIT_ACT_COPY_URL,
     HIT_DESC_SCROLLBAR,
+    HIT_DESC_LINK,
     HIT_RIGHT_PANE,
     HIT_CTX_ITEM,
     HIT_CTX_MENU,
@@ -193,6 +194,15 @@ struct UiState {
     double list_scroll_y;
     double desc_scroll_y;
     double desc_max_scroll;
+    TtTextSpan desc_link_spans[64];
+    size_t desc_link_count;
+    struct {
+        Rect rect;
+        size_t link;
+    } desc_link_rects[512];
+    size_t desc_link_rect_count;
+    char *desc_link_cache_text;
+    ssize_t hover_desc_link;
     bool loading_more;
 
     char status_text[256];
@@ -984,6 +994,7 @@ void ui_destroy(UiState *ui) {
 #endif
     free(ui->font_family);
     if (ui->mascot_surf) cairo_surface_destroy(ui->mascot_surf);
+    free(ui->desc_link_cache_text);
     free(ui->search_buf);
     ime_clear_preedit(ui);
     media_list_free(&ui->list);
@@ -1072,6 +1083,11 @@ void ui_set_status(UiState *ui, const char *fmt, ...) {
 }
 
 static void sync_detail_from_selection(UiState *ui) {
+    ui->desc_link_count = 0;
+    ui->desc_link_rect_count = 0;
+    free(ui->desc_link_cache_text);
+    ui->desc_link_cache_text = NULL;
+    ui->hover_desc_link = -1;
     media_item_free_fields(&ui->detail_item);
     ui->has_detail_item = false;
     ui->desc_scroll_y = 0.0;
@@ -1121,6 +1137,11 @@ void ui_set_list(UiState *ui, MediaList *new_list, bool append) {
 
 void ui_set_detail_item(UiState *ui, const MediaItem *detail) {
     if (!ui || !detail) return;
+    ui->desc_link_count = 0;
+    ui->desc_link_rect_count = 0;
+    free(ui->desc_link_cache_text);
+    ui->desc_link_cache_text = NULL;
+    ui->hover_desc_link = -1;
     bool sel_matches = (ui->selected_idx >= 0 && (size_t)ui->selected_idx < ui->list.count &&
                         strcmp(ui->list.items[ui->selected_idx].id, detail->id) == 0);
     if (ui->view_kind != UI_VIEW_NEXT && !sel_matches) {
@@ -1246,6 +1267,11 @@ static void clamp_list_scroll(UiState *ui, const Layout *L) {
 
 void ui_restore_list_state(UiState *ui, MediaList *restored, ssize_t selected_idx, double scroll_y) {
     if (!ui || !restored) return;
+    ui->desc_link_count = 0;
+    ui->desc_link_rect_count = 0;
+    free(ui->desc_link_cache_text);
+    ui->desc_link_cache_text = NULL;
+    ui->hover_desc_link = -1;
     ui->loading_more = false;
     ui->busy = false;
     ui->error_text[0] = '\0';
@@ -1402,6 +1428,95 @@ static void draw_badge_pill(cairo_t *cr, const UiState *ui, double x, double y,
     draw_text_line(cr, ui, text, br.x + 4.0, br.y, br.w - 8.0, br.h,
                    (ColorRGBA){255, 255, 255, 255}, 1.0, 0.78, true,
                    PANGO_ALIGN_CENTER, true);
+}
+
+static void desc_links_sync(UiState *ui, const char *desc) {
+    if (!ui) return;
+    if (!desc) desc = "";
+    if (ui->desc_link_cache_text && strcmp(ui->desc_link_cache_text, desc) == 0) return;
+    free(ui->desc_link_cache_text);
+    ui->desc_link_cache_text = tt_strdup(desc);
+    ui->desc_link_count = tt_find_url_spans(desc, ui->desc_link_spans,
+                                            sizeof(ui->desc_link_spans) / sizeof(ui->desc_link_spans[0]));
+    ui->desc_link_rect_count = 0;
+    ui->hover_desc_link = -1;
+}
+
+static PangoAttrList *desc_links_attrs(const UiState *ui) {
+    if (!ui || ui->desc_link_count == 0) return NULL;
+    PangoAttrList *attrs = pango_attr_list_new();
+    if (!attrs) return NULL;
+    ColorRGBA accent = ui->cfg->theme.elem_selected.bg;
+    for (size_t i = 0; i < ui->desc_link_count; i++) {
+        TtTextSpan span = ui->desc_link_spans[i];
+        PangoAttribute *u = pango_attr_underline_new(PANGO_UNDERLINE_SINGLE);
+        u->start_index = (guint)span.start;
+        u->end_index = (guint)span.end;
+        pango_attr_list_insert(attrs, u);
+        PangoAttribute *fg = pango_attr_foreground_new(
+            (guint16)(accent.r * 257u), (guint16)(accent.g * 257u),
+            (guint16)(accent.b * 257u));
+        fg->start_index = (guint)span.start;
+        fg->end_index = (guint)span.end;
+        pango_attr_list_insert(attrs, fg);
+        PangoAttribute *fa = pango_attr_foreground_alpha_new((guint16)(accent.a * 257u));
+        fa->start_index = (guint)span.start;
+        fa->end_index = (guint)span.end;
+        pango_attr_list_insert(attrs, fa);
+    }
+    return attrs;
+}
+
+static void desc_links_update_rects(UiState *ui, PangoLayout *layout) {
+    ui->desc_link_rect_count = 0;
+    if (!ui || !layout || ui->desc_link_count == 0) return;
+
+    PangoLayoutIter *iter = pango_layout_get_iter(layout);
+    if (!iter) return;
+    for (;;) {
+        PangoLayoutLine *line = pango_layout_iter_get_line_readonly(iter);
+        if (!line) break;
+        int line_start = line->start_index;
+        int line_end = line_start + line->length;
+        PangoRectangle logical;
+        pango_layout_iter_get_line_extents(iter, NULL, &logical);
+        for (size_t i = 0; i < ui->desc_link_count; i++) {
+            TtTextSpan span = ui->desc_link_spans[i];
+            if ((int)span.end <= line_start || (int)span.start >= line_end) continue;
+            int local_start = (int)span.start > line_start ? (int)span.start - line_start : 0;
+            int local_end = (int)span.end < line_end ? (int)span.end - line_start : line->length;
+            if (local_end <= local_start) continue;
+            int *ranges = NULL;
+            int n_ranges = 0;
+            pango_layout_line_get_x_ranges(line, local_start, local_end, &ranges, &n_ranges);
+            for (int r = 0; r < n_ranges; r++) {
+                double x1 = (double)ranges[r * 2] / PANGO_SCALE;
+                double x2 = (double)ranges[r * 2 + 1] / PANGO_SCALE;
+                if (x2 < x1) {
+                    double t = x1;
+                    x1 = x2;
+                    x2 = t;
+                }
+                if (x2 - x1 < 0.5) continue;
+                if (ui->desc_link_rect_count >= sizeof(ui->desc_link_rects) / sizeof(ui->desc_link_rects[0])) {
+                    g_free(ranges);
+                    pango_layout_iter_free(iter);
+                    return;
+                }
+                size_t slot = ui->desc_link_rect_count++;
+                ui->desc_link_rects[slot].rect = (Rect){
+                    x1,
+                    (double)logical.y / PANGO_SCALE,
+                    x2 - x1,
+                    (double)logical.height / PANGO_SCALE
+                };
+                ui->desc_link_rects[slot].link = i;
+            }
+            g_free(ranges);
+        }
+        if (!pango_layout_iter_next_line(iter)) break;
+    }
+    pango_layout_iter_free(iter);
 }
 
 static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
@@ -1663,7 +1778,10 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
             cairo_stroke(cr);
         }
 
-        if (item->description && item->description[0]) {
+        const char *desc = media_item_display_description(item);
+        desc_links_sync(ui, desc ? desc : "");
+        ui->desc_link_rect_count = 0;
+        if (desc && desc[0]) {
             double text_w = cw - 12.0;
             if (text_w < 40.0) text_w = cw;
 
@@ -1671,13 +1789,19 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
             PangoFontDescription *dd = make_font_desc(ui, 0.95, false);
             pango_layout_set_font_description(dl, dd);
             pango_font_description_free(dd);
-            pango_layout_set_text(dl, item->description, -1);
+            pango_layout_set_text(dl, desc, -1);
             pango_layout_set_width(dl, (int)(text_w * PANGO_SCALE));
             pango_layout_set_wrap(dl, PANGO_WRAP_WORD_CHAR);
             pango_layout_set_spacing(dl, (int)(ui->cfg->font_size * 0.35 * PANGO_SCALE));
+            PangoAttrList *attrs = desc_links_attrs(ui);
+            if (attrs) {
+                pango_layout_set_attributes(dl, attrs);
+                pango_attr_list_unref(attrs);
+            }
 
             int dw = 0, dh = 0;
             pango_layout_get_pixel_size(dl, &dw, &dh);
+            desc_links_update_rects(ui, dl);
             ui->desc_max_scroll = (double)dh - desc_h;
             if (ui->desc_max_scroll < 0.0) ui->desc_max_scroll = 0.0;
             if (ui->desc_scroll_y > ui->desc_max_scroll) ui->desc_scroll_y = ui->desc_max_scroll;
@@ -2578,6 +2702,7 @@ void ui_on_resize(void *ctx, int width, int height) {
 }
 
 static HitId hit_test(UiState *ui, const Layout *L, double x, double y) {
+    ui->hover_desc_link = -1;
     if (ui->show_help) {
         if (pt_in_rect(x, y, L->help_close_btn)) return HIT_HELP_CLOSE;
         if (pt_in_rect(x, y, L->help_modal_box)) return HIT_HELP_MODAL;
@@ -2647,6 +2772,25 @@ static HitId hit_test(UiState *ui, const Layout *L, double x, double y) {
         if (pt_in_rect(x, y, L->act_copy)) return HIT_ACT_COPY_URL;
         if (ui->desc_max_scroll > 0.0 && pt_in_rect(x, y, L->desc_scrollbar)) {
             return HIT_DESC_SCROLLBAR;
+        }
+        if (pt_in_rect(x, y, L->desc_area)) {
+            for (size_t i = ui->desc_link_rect_count; i > 0; i--) {
+                Rect r = ui->desc_link_rects[i - 1].rect;
+                Rect hit_rect = {
+                    L->desc_area.x + r.x,
+                    L->desc_area.y - ui->desc_scroll_y + r.y,
+                    r.w,
+                    r.h
+                };
+                if (hit_rect.y + hit_rect.h < L->desc_area.y ||
+                    hit_rect.y > L->desc_area.y + L->desc_area.h) {
+                    continue;
+                }
+                if (pt_in_rect(x, y, hit_rect)) {
+                    ui->hover_desc_link = (ssize_t)ui->desc_link_rects[i - 1].link;
+                    return HIT_DESC_LINK;
+                }
+            }
         }
         return HIT_RIGHT_PANE;
     }
@@ -2719,6 +2863,7 @@ static TtCursorShape cursor_for_hit(const UiState *ui, HitId h) {
         case HIT_ACT_COPY_URL:
         case HIT_CTX_ITEM:
         case HIT_HELP_CLOSE:
+        case HIT_DESC_LINK:
             return TT_CURSOR_POINTER;
         case HIT_ACT_DOWNLOAD: {
             const MediaItem *it = ui_get_detail_item(ui);
@@ -2819,6 +2964,7 @@ void ui_on_pointer_leave(void *ctx) {
     UiState *ui = ctx;
     ui->hover_id = HIT_NONE;
     ui->hover_idx = -1;
+    ui->hover_desc_link = -1;
     ui->ctx_menu.hover_idx = -1;
     wayland_request_redraw(ui->wl);
 }
@@ -2839,15 +2985,41 @@ static void copy_item_field(UiState *ui, int which) {
             wayland_clipboard_copy(ui->wl, disp_title);
             ui_set_status(ui, "Copied title to clipboard");
         }
-    } else if (which == 2 && it->description) {
-        wayland_clipboard_copy(ui->wl, it->description);
-        ui_set_status(ui, "Copied description to clipboard");
+    } else if (which == 2) {
+        const char *desc = media_item_display_description(it);
+        if (desc && desc[0]) {
+            wayland_clipboard_copy(ui->wl, desc);
+            ui_set_status(ui, "Copied description to clipboard");
+        }
+    }
+}
+
+static void open_desc_link(UiState *ui) {
+    const MediaItem *it = ui_get_detail_item(ui);
+    const char *desc = media_item_display_description(it);
+    if (!desc || !desc[0] || ui->hover_desc_link < 0 ||
+        (size_t)ui->hover_desc_link >= ui->desc_link_count) {
+        return;
+    }
+    char url[2048];
+    TtTextSpan span = ui->desc_link_spans[ui->hover_desc_link];
+    if (!tt_url_from_span(desc, span, url, sizeof(url))) return;
+    char err[256] = {0};
+    if (!tt_open_url(url, err, sizeof(err))) {
+        ui_set_status(ui, "Could not open link: %s", err[0] ? err : "unknown error");
     }
 }
 
 static void select_list_row(UiState *ui, size_t idx) {
     if (idx >= ui->list.count) return;
     bool changed = ((ssize_t)idx != ui->selected_idx);
+    if (changed) {
+        ui->desc_link_count = 0;
+        ui->desc_link_rect_count = 0;
+        free(ui->desc_link_cache_text);
+        ui->desc_link_cache_text = NULL;
+        ui->hover_desc_link = -1;
+    }
     ui->selected_idx = (ssize_t)idx;
     const MediaItem *it = &ui->list.items[idx];
     if (changed) {
@@ -3184,6 +3356,9 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
             break;
         case HIT_ACT_COPY_URL:
             copy_item_field(ui, 0);
+            break;
+        case HIT_DESC_LINK:
+            open_desc_link(ui);
             break;
         case HIT_RIGHT_PANE:
             ui->search_sel_all = false;

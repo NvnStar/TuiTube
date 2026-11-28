@@ -52,6 +52,15 @@ int tt_base64_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap
 char *tt_url_encode(const char *s);
 char *tt_xml_unescape(const char *s);
 
+typedef struct {
+    size_t start;
+    size_t end;
+} TtTextSpan;
+
+size_t tt_find_url_spans(const char *text, TtTextSpan *out, size_t max);
+bool tt_url_from_span(const char *text, TtTextSpan span, char *out, size_t out_cap);
+bool tt_open_url(const char *url, char *err_buf, size_t err_cap);
+
 bool tt_parse_age_seconds(const char *spec, int64_t *out_seconds);
 bool tt_parse_iso8601_utc(const char *s, int64_t *out_epoch);
 

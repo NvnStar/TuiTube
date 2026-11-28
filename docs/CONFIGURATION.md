@@ -125,7 +125,7 @@ All 28 configuration keys are optional; omitted keys keep their built-in default
 | `max_feed_videos_per_channel` | `integer` | `15` | Clamped `[1, 100]` | Maximum items fetched per favorite channel/playlist for Subscription Feed. |
 | `max_feed_age` | `string` | `"1 month"` | `"<N> hour(s)\|day(s)\|week(s)\|month(s)\|year(s)"` | Filter out feed videos older than this age. |
 | `hide_members_only` | `boolean` | `false` | `true` / `false` | Also accepts alias `"hide_member_videos"`. Hides channel-members-only videos in search/browse/recommended (and Feed when `feed_use_rss: false`). |
-| `original_titles` | `boolean` | `true` | `true` / `false` | When `true` (default), video titles show the uploader's **original** title instead of the locale-translated one, resolved lazily and best-effort. Set `false` to explicitly keep localized titles. UI language is still controlled by `language`. |
+| `original_titles` | `boolean` | `true` | `true` / `false` | When `true` (default), video titles show the uploader's **original** title instead of the locale-translated one, resolved lazily and best-effort. For the selected detail video, the original title **and description** come from neutral `youtubei/v1/player` metadata. Set `false` to explicitly keep localized metadata. UI language is still controlled by `language`. |
 | `download_dir` | `string` | `""` | Directory path (`~`, `~/...`, absolute, or relative to `config_dir`) | Target folder for `yt-dlp` downloads (`Ctrl+S`). |
 | `key_bindings` | `array` | `[]` *(appends over defaults)* | Array of `{"action", "mod", "key"}` objects | Custom bindings override earlier/default bindings on matching `mod` + `key`. |
 
@@ -135,12 +135,15 @@ YouTube's InnerTube API returns localized video titles and descriptions accordin
 - `"language": "auto"` (default) aligns YouTube results with your OS language (e.g., Vietnamese `"vi"` / `"VN"`, Japanese `"ja"` / `"JP"`, English `"en"` / `"US"`).
 - To force a consistent language regardless of OS settings, set `"language": "en"` or `"language": "vi"`, etc.
 
-By default, video titles use the uploader's **original** title while the UI chrome stays localized. Originals are resolved lazily and best-effort:
-- Originals are resolved first via YouTube's public **oEmbed** endpoint (`https://www.youtube.com/oembed?url=...&format=json`), with a `youtubei/v1/player` fallback using an English/neutral request context when oEmbed fails.
-- Resolution is **lazy, non-blocking, and best-effort**: lists render immediately, then originals are filled in on background workers (first ~30 unresolved video rows per list, with a bounded success-only cache). Failed/private/deleted lookups silently keep the localized title — no error is surfaced.
+By default, video titles and the selected video's description use the uploader's **original** metadata while the UI chrome stays localized. Originals are resolved lazily and best-effort:
+- List-row titles are resolved first via YouTube's public **oEmbed** endpoint (`https://www.youtube.com/oembed?url=...&format=json`), with a `youtubei/v1/player` fallback using an English/neutral request context when oEmbed fails.
+- The selected detail video additionally fetches `youtubei/v1/player` once to restore `videoDetails.title` and `videoDetails.shortDescription`, which are less affected by the configured locale than `next`.
+- Resolution is **lazy, non-blocking, and best-effort**: lists render immediately, then originals are filled in on background workers (first ~30 unresolved video rows per list, with a bounded success-only cache). Failed/private/deleted lookups silently keep the localized text — no error is surfaced.
+- If the player metadata lacks a title or description, the existing original-title lookup and localized `next` description remain as fallbacks.
 - Resolved originals are used consistently for list rows, the detail pane, player window titles, download status, Favorites and History; history persistence keeps the original so it survives a restart.
+- URLs in the displayed description are underlined and clickable; HTTP(S), `www.`, and conservative bare-domain links open in the default browser. Unsupported schemes and truncated `...` links are ignored. Copy Description always copies the displayed description text.
 - Channel and playlist names are uploader-authored and already unlocalized, so they are shown as-is. RSS-feed and `yt-dlp` search results are natively original and need no extra lookup.
-- Set `"original_titles": false` to explicitly opt back into locale-translated titles and avoid the extra lookups.
+- Set `"original_titles": false` to explicitly opt back into locale-translated titles/descriptions and avoid the extra lookups (description links remain clickable).
 
 ---
 

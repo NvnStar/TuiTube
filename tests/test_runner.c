@@ -1875,6 +1875,111 @@ static void test_original_title_detail_merge(void) {
     media_item_free_fields(&detail_without_original);
 }
 
+static void test_original_description_and_url_links(void) {
+    char title[128];
+    char *desc = NULL;
+    const char *player =
+        "{\"videoDetails\":{\"title\":\"Vinh Xo goc\","
+        "\"shortDescription\":\"Dong 1\\nXem https://youtube.com/@VinhXo (nguon).\"}}";
+    assert(innertube_parse_player_metadata_json(player, strlen(player), title, sizeof(title), &desc));
+    assert(strcmp(title, "Vinh Xo goc") == 0);
+    assert(desc && strcmp(desc, "Dong 1\nXem https://youtube.com/@VinhXo (nguon).") == 0);
+    free(desc);
+    desc = NULL;
+
+    const char *desc_only =
+        "{\"videoDetails\":{\"title\":\"\",\"shortDescription\":\"Only description\"}}";
+    assert(innertube_parse_player_metadata_json(desc_only, strlen(desc_only), title,
+                                                sizeof(title), &desc));
+    assert(title[0] == '\0');
+    assert(desc && strcmp(desc, "Only description") == 0);
+    free(desc);
+    desc = NULL;
+
+    const char *no_details = "{\"playabilityStatus\":{\"status\":\"OK\"}}";
+    assert(!innertube_parse_player_metadata_json(no_details, strlen(no_details), title,
+                                                 sizeof(title), &desc));
+    assert(desc == NULL);
+    const char *empty_meta = "{\"videoDetails\":{\"title\":\"\",\"shortDescription\":\"\"}}";
+    assert(!innertube_parse_player_metadata_json(empty_meta, strlen(empty_meta), title,
+                                                 sizeof(title), &desc));
+    assert(desc == NULL);
+    const char *malformed = "{\"videoDetails\":";
+    assert(!innertube_parse_player_metadata_json(malformed, strlen(malformed), title,
+                                                 sizeof(title), &desc));
+    assert(desc == NULL);
+
+    MediaItem item = {0};
+    item.kind = ITEM_VIDEO;
+    snprintf(item.id, sizeof(item.id), "descVid01");
+    item.title = tt_strdup("Localized title");
+    item.description = tt_strdup("Localized description");
+    item.original_description = tt_strdup("Original description");
+    assert(strcmp(media_item_display_description(&item), "Original description") == 0);
+
+    MediaItem copy;
+    assert(media_item_copy(&copy, &item));
+    assert(copy.original_description &&
+           strcmp(copy.original_description, "Original description") == 0);
+    assert(strcmp(media_item_display_description(&copy), "Original description") == 0);
+    media_item_free_fields(&copy);
+    assert(copy.original_description == NULL);
+
+    MediaItem localized = {0};
+    localized.kind = ITEM_VIDEO;
+    snprintf(localized.id, sizeof(localized.id), "descVid01");
+    localized.description = tt_strdup("Localized refresh");
+    MediaItem pane;
+    assert(media_item_copy(&pane, &item));
+    assert(media_item_apply_detail_merge(&item, &pane, true, &localized));
+    assert(strcmp(media_item_display_description(&item), "Original description") == 0);
+    assert(strcmp(media_item_display_description(&pane), "Original description") == 0);
+
+    item.original_description[0] = '\0';
+    assert(strcmp(media_item_display_description(&item), "Localized refresh") == 0);
+    media_item_free_fields(&item);
+    media_item_free_fields(&pane);
+    media_item_free_fields(&localized);
+
+    const char *text =
+        "Read https://Example.com/a_(b), www.youtube.com/@chan and youtu.be/x. "
+        "Wiki en.wikipedia.org/wiki/Test. Not ftp://example.com or a@b.com or https://x.com/...";
+    TtTextSpan spans[8];
+    size_t n = tt_find_url_spans(text, spans, 8);
+    assert(n == 4);
+    char url[256];
+    assert(tt_url_from_span(text, spans[0], url, sizeof(url)));
+    assert(strcmp(url, "https://Example.com/a_(b)") == 0);
+    assert(tt_url_from_span(text, spans[1], url, sizeof(url)));
+    assert(strcmp(url, "https://www.youtube.com/@chan") == 0);
+    assert(tt_url_from_span(text, spans[2], url, sizeof(url)));
+    assert(strcmp(url, "https://youtu.be/x") == 0);
+    assert(tt_url_from_span(text, spans[3], url, sizeof(url)));
+    assert(strcmp(url, "https://en.wikipedia.org/wiki/Test") == 0);
+
+    const char *shortener = "Mirror: bit.ly/abc123 and t.co/x";
+    n = tt_find_url_spans(shortener, spans, 8);
+    assert(n == 2);
+    assert(tt_url_from_span(shortener, spans[0], url, sizeof(url)));
+    assert(strcmp(url, "https://bit.ly/abc123") == 0);
+    assert(tt_url_from_span(shortener, spans[1], url, sizeof(url)));
+    assert(strcmp(url, "https://t.co/x") == 0);
+
+    TtTextSpan none[4];
+    assert(tt_find_url_spans("mail me at a@b.com or ftp://x", none, 4) == 0);
+    const char *caps = "HTTP://Example.COM/path";
+    assert(tt_find_url_spans(caps, spans, 8) == 1);
+    assert(tt_url_from_span(caps, spans[0], url, sizeof(url)));
+    assert(strcmp(url, "HTTP://Example.COM/path") == 0);
+
+    char err[64] = {0};
+    assert(!tt_open_url("ftp://example.com", err, sizeof(err)));
+    assert(err[0] != '\0');
+    assert(!tt_open_url("javascript:alert(1)", err, sizeof(err)));
+    assert(!tt_open_url("https://exa mple.com", err, sizeof(err)));
+    assert(!tt_open_url("", err, sizeof(err)));
+}
+
 static void test_history_original_title_roundtrip(void) {
     HistoryList hl;
     history_init(&hl);
@@ -2341,6 +2446,7 @@ int main(void) {
     RUN_TEST(test_locale_parsing_and_innertube_headers);
     RUN_TEST(test_original_titles);
     RUN_TEST(test_original_title_detail_merge);
+    RUN_TEST(test_original_description_and_url_links);
     RUN_TEST(test_history_original_title_roundtrip);
     RUN_TEST(test_player_original_title_selection);
     RUN_TEST(test_non_english_lockup_and_badges);
