@@ -522,6 +522,39 @@ char *player_resolve_ytdlp_path(const TuiTubeConfig *cfg, bool *out_needs_mpv_op
     return NULL;
 }
 
+const char *player_video_title_for(const MediaItem *video, bool use_original) {
+    if (!video) return NULL;
+    const char *title = media_item_display_title_for(video, use_original);
+    return (title && title[0]) ? title : video->id;
+}
+
+const char *player_video_title(const MediaItem *video) {
+    return player_video_title_for(video, true);
+}
+
+bool player_build_title_args_for(const MediaItem *video, bool use_original,
+                                 char **out_mpv, char **out_vlc) {
+    if (out_mpv) *out_mpv = NULL;
+    if (out_vlc) *out_vlc = NULL;
+    if (!video || !out_mpv || !out_vlc) return false;
+    const char *title = player_video_title_for(video, use_original);
+    if (!title) return false;
+    *out_mpv = tt_asprintf("--force-media-title=%s", title);
+    *out_vlc = tt_asprintf("--meta-title=%s", title);
+    if (!*out_mpv || !*out_vlc) {
+        free(*out_mpv);
+        free(*out_vlc);
+        *out_mpv = NULL;
+        *out_vlc = NULL;
+        return false;
+    }
+    return true;
+}
+
+bool player_build_title_args(const MediaItem *video, char **out_mpv, char **out_vlc) {
+    return player_build_title_args_for(video, true, out_mpv, out_vlc);
+}
+
 bool player_build_mpv_ytdl_script_opt(const TuiTubeConfig *cfg, char *out, size_t out_cap) {
     if (out && out_cap > 0) out[0] = '\0';
     if (!cfg || !out || out_cap == 0) return false;
@@ -603,15 +636,19 @@ bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
     char url[128];
     snprintf(url, sizeof(url), "https://www.youtube.com/watch?v=%s", video->id);
 
-    const char *title = (video->title && video->title[0]) ? video->title : video->id;
-
     char ytdl_fmt[512];
     player_map_video_format(cfg->video_format, cfg->allow_hdr, cfg->all_codecs,
                             ytdl_fmt, sizeof(ytdl_fmt));
 
     char *arg_fmt = tt_asprintf("--ytdl-format=%s", ytdl_fmt);
-    char *arg_title_mpv = tt_asprintf("--force-media-title=%s", title);
-    char *arg_title_vlc = tt_asprintf("--meta-title=%s", title);
+    char *arg_title_mpv = NULL;
+    char *arg_title_vlc = NULL;
+    if (!player_build_title_args_for(video, cfg->original_titles,
+                                     &arg_title_mpv, &arg_title_vlc)) {
+        free(arg_fmt);
+        if (err_buf && err_cap) snprintf(err_buf, err_cap, "Out of memory");
+        return false;
+    }
     char *arg_slang = (cfg->sub_language && cfg->sub_language[0])
                           ? tt_asprintf("--slang=%s", cfg->sub_language)
                           : NULL;
@@ -1064,7 +1101,7 @@ bool player_download_start(const TuiTubeConfig *cfg, const MediaItem *video,
         return false;
     }
 
-    const char *title = (video->title && video->title[0]) ? video->title : video->id;
+    const char *title = player_video_title_for(video, cfg->original_titles);
     if (player_is_downloading(video->id)) {
         if (err_buf && err_cap) snprintf(err_buf, err_cap, "Already downloading: %s", title);
         return false;

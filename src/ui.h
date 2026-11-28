@@ -54,6 +54,7 @@ void ui_reload_mascot(UiState *ui);
 void ui_set_status(UiState *ui, const char *fmt, ...);
 void ui_set_list(UiState *ui, MediaList *new_list, bool append);
 void ui_set_detail_item(UiState *ui, const MediaItem *detail);
+bool ui_set_detail_original_title(UiState *ui, const char *video_id, const char *title);
 void ui_mark_video_watched(UiState *ui, const char *video_id);
 void ui_on_thumb_loaded(UiState *ui, const char *key, cairo_surface_t *surf);
 void ui_set_loading_more(UiState *ui, bool loading);

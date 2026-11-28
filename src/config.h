@@ -114,6 +114,7 @@ typedef struct {
     bool allow_hdr;
     bool all_codecs;
     bool hide_members_only;
+    bool original_titles;
     char *download_dir;
 
     KeyBinding *key_bindings;

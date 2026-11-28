@@ -603,6 +603,9 @@ static void cb_show_history(void *ctx) {
         it.kind = ITEM_VIDEO;
         snprintf(it.id, sizeof(it.id), "%s", h->video_id);
         it.title = tt_strdup(h->title);
+        if (app->cfg.original_titles) {
+            it.original_title = tt_strdup(h->original_title);
+        }
         it.author = tt_strdup(h->author);
         it.author_id = tt_strdup(h->author_id);
         it.duration_text = tt_strdup(h->duration_text);
@@ -639,6 +642,15 @@ static bool is_vlc_player_name(const char *player_path) {
     return tt_strcasecmp(base, "vlc") == 0 || tt_strcasecmp(base, "vlc.exe") == 0;
 }
 
+/* Play hooks only read id/title fields. Expose the display title as `title` so
+   the play hook (including the untouched mpv plugin) honours the config flag. */
+static MediaItem play_item_for_config(const MediaItem *it, bool original_titles) {
+    MediaItem view = *it;
+    view.title = (char *)media_item_display_title_for(it, original_titles);
+    view.original_title = NULL;
+    return view;
+}
+
 static void cb_activate_item(void *ctx, size_t index) {
     AppState *app = ctx;
     MediaList *ml = ui_get_list(app->ui);
@@ -646,12 +658,13 @@ static void cb_activate_item(void *ctx, size_t index) {
     MediaItem *it = &ml->items[index];
 
     if (it->kind == ITEM_VIDEO) {
+        MediaItem playback = play_item_for_config(it, app->cfg.original_titles);
         char err[256] = {0};
-        if (app->play_fn && app->play_fn(app->play_ctx, &app->cfg, it, err, sizeof(err))) {
+        if (app->play_fn && app->play_fn(app->play_ctx, &app->cfg, &playback, err, sizeof(err))) {
             const char *pname = app->player_label[0]
                                     ? app->player_label
                                     : (app->cfg.player_path ? app->cfg.player_path : "mpv");
-            const char *vtitle = (it->title && it->title[0]) ? it->title : it->id;
+            const char *vtitle = player_video_title_for(it, app->cfg.original_titles);
             bool warn_ytdlp = false;
             bool has_custom_ytdlp = (app->cfg.ytdlp_path && app->cfg.ytdlp_path[0] != '\0');
             if ((!app->player_label[0] && !is_vlc_player_name(pname)) || has_custom_ytdlp) {

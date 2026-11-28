@@ -9,6 +9,8 @@
 void media_item_free_fields(MediaItem *it) {
     if (!it) return;
     free(it->title);
+    free(it->original_title);
+    free(it->original_description);
     free(it->author);
     free(it->author_id);
     free(it->duration_text);
@@ -25,6 +27,8 @@ bool media_item_copy(MediaItem *dst, const MediaItem *src) {
     dst->kind = src->kind;
     snprintf(dst->id, sizeof(dst->id), "%s", src->id);
     dst->title = tt_strdup(src->title);
+    dst->original_title = tt_strdup(src->original_title);
+    dst->original_description = tt_strdup(src->original_description);
     dst->author = tt_strdup(src->author);
     dst->author_id = tt_strdup(src->author_id);
     dst->duration_text = tt_strdup(src->duration_text);
@@ -37,6 +41,114 @@ bool media_item_copy(MediaItem *dst, const MediaItem *src) {
     dst->is_members_only = src->is_members_only;
     dst->watched = src->watched;
     dst->details_loaded = src->details_loaded;
+    return true;
+}
+
+const char *media_item_display_title_for(const MediaItem *it, bool use_original) {
+    if (it && use_original && it->original_title && it->original_title[0]) {
+        return it->original_title;
+    }
+    return it ? it->title : NULL;
+}
+
+const char *media_item_display_title(const MediaItem *it) {
+    return media_item_display_title_for(it, true);
+}
+
+const char *media_item_display_description_for(const MediaItem *it, bool use_original) {
+    if (it && use_original && it->original_description && it->original_description[0]) {
+        return it->original_description;
+    }
+    return it ? it->description : NULL;
+}
+
+const char *media_item_display_description(const MediaItem *it) {
+    return media_item_display_description_for(it, true);
+}
+
+bool media_item_has_description_for(const MediaItem *it, bool use_original) {
+    const char *desc = media_item_display_description_for(it, use_original);
+    return desc && desc[0];
+}
+
+bool media_item_set_original_title(MediaItem *it, const char *title) {
+    if (!it || !title || !title[0]) return false;
+    if (it->original_title && it->original_title[0]) return false;
+    free(it->original_title);
+    it->original_title = tt_strdup(title);
+    return it->original_title != NULL;
+}
+
+static void replace_if_nonempty(char **dst, const char *src) {
+    if (src && src[0]) {
+        free(*dst);
+        *dst = tt_strdup(src);
+    }
+}
+
+void media_item_merge_details(MediaItem *dst, const MediaItem *src) {
+    if (!dst || !src) return;
+    replace_if_nonempty(&dst->title, src->title);
+    replace_if_nonempty(&dst->original_title, src->original_title);
+    replace_if_nonempty(&dst->original_description, src->original_description);
+    replace_if_nonempty(&dst->author, src->author);
+    replace_if_nonempty(&dst->author_id, src->author_id);
+    replace_if_nonempty(&dst->view_count_text, src->view_count_text);
+    replace_if_nonempty(&dst->published_text, src->published_text);
+    replace_if_nonempty(&dst->description, src->description);
+    if ((!dst->duration_text || !dst->duration_text[0]) && src->duration_text && src->duration_text[0]) {
+        free(dst->duration_text);
+        dst->duration_text = tt_strdup(src->duration_text);
+    }
+    if ((!dst->thumbnail_url || !dst->thumbnail_url[0]) && src->thumbnail_url && src->thumbnail_url[0]) {
+        free(dst->thumbnail_url);
+        dst->thumbnail_url = tt_strdup(src->thumbnail_url);
+    }
+    dst->is_live = dst->is_live || src->is_live;
+    dst->is_members_only = dst->is_members_only || src->is_members_only;
+    dst->details_loaded = dst->details_loaded || src->details_loaded;
+}
+
+bool media_item_apply_detail_merge(MediaItem *selected, MediaItem *detail_item,
+                                   bool has_detail_item, const MediaItem *detail) {
+    if (!detail_item || !detail) return has_detail_item;
+    if (selected) {
+        media_item_merge_details(selected, detail);
+        if (!has_detail_item || strcmp(detail_item->id, detail->id) != 0) {
+            media_item_free_fields(detail_item);
+            media_item_copy(detail_item, selected);
+        } else {
+            media_item_merge_details(detail_item, detail);
+        }
+    } else {
+        if (!has_detail_item || strcmp(detail_item->id, detail->id) != 0) {
+            media_item_free_fields(detail_item);
+            media_item_copy(detail_item, detail);
+        } else {
+            media_item_merge_details(detail_item, detail);
+        }
+        detail_item->details_loaded = true;
+    }
+    if (selected) {
+        if ((!selected->original_title || !selected->original_title[0]) &&
+            detail_item->original_title && detail_item->original_title[0]) {
+            free(selected->original_title);
+            selected->original_title = tt_strdup(detail_item->original_title);
+        } else if ((!detail_item->original_title || !detail_item->original_title[0]) &&
+                   selected->original_title && selected->original_title[0]) {
+            free(detail_item->original_title);
+            detail_item->original_title = tt_strdup(selected->original_title);
+        }
+        if ((!selected->original_description || !selected->original_description[0]) &&
+            detail_item->original_description && detail_item->original_description[0]) {
+            free(selected->original_description);
+            selected->original_description = tt_strdup(detail_item->original_description);
+        } else if ((!detail_item->original_description || !detail_item->original_description[0]) &&
+                   selected->original_description && selected->original_description[0]) {
+            free(detail_item->original_description);
+            detail_item->original_description = tt_strdup(selected->original_description);
+        }
+    }
     return true;
 }
 
@@ -287,6 +399,7 @@ bool favlist_remove(FavoriteList *fl, const char *id) {
 static void history_entry_free_fields(HistoryEntry *e) {
     if (!e) return;
     free(e->title);
+    free(e->original_title);
     free(e->author);
     free(e->author_id);
     free(e->duration_text);
@@ -347,6 +460,7 @@ bool history_load(HistoryList *hl, const char *path) {
         }
 
         yyjson_val *vt = yyjson_obj_get(elem, "title");
+        yyjson_val *vo = yyjson_obj_get(elem, "original_title");
         yyjson_val *va = yyjson_obj_get(elem, "author");
         yyjson_val *vai = yyjson_obj_get(elem, "author_id");
         yyjson_val *vd = yyjson_obj_get(elem, "duration_text");
@@ -356,6 +470,7 @@ bool history_load(HistoryList *hl, const char *path) {
         HistoryEntry e = {0};
         snprintf(e.video_id, sizeof(e.video_id), "%s", video_id);
         e.title = tt_strdup((vt && yyjson_is_str(vt)) ? yyjson_get_str(vt) : "");
+        e.original_title = tt_strdup((vo && yyjson_is_str(vo)) ? yyjson_get_str(vo) : "");
         e.author = tt_strdup((va && yyjson_is_str(va)) ? yyjson_get_str(va) : "");
         e.author_id = tt_strdup((vai && yyjson_is_str(vai)) ? yyjson_get_str(vai) : "");
         e.duration_text = tt_strdup((vd && yyjson_is_str(vd)) ? yyjson_get_str(vd) : "");
@@ -381,6 +496,7 @@ bool history_save(const HistoryList *hl, const char *path) {
         yyjson_mut_val *obj = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, obj, "video_id", e->video_id);
         yyjson_mut_obj_add_str(doc, obj, "title", e->title ? e->title : "");
+        yyjson_mut_obj_add_str(doc, obj, "original_title", e->original_title ? e->original_title : "");
         yyjson_mut_obj_add_str(doc, obj, "author", e->author ? e->author : "");
         yyjson_mut_obj_add_str(doc, obj, "author_id", e->author_id ? e->author_id : "");
         yyjson_mut_obj_add_str(doc, obj, "duration_text", e->duration_text ? e->duration_text : "");
@@ -402,9 +518,13 @@ bool history_save(const HistoryList *hl, const char *path) {
 bool history_record(HistoryList *hl, const MediaItem *video, int64_t now) {
     if (!hl || !video || !video->id[0]) return false;
 
+    char *prior_original = NULL;
+
     /* Remove existing duplicate so newest moves to front */
     for (size_t i = 0; i < hl->count; i++) {
         if (strcmp(hl->items[i].video_id, video->id) == 0) {
+            prior_original = hl->items[i].original_title;
+            hl->items[i].original_title = NULL;
             history_entry_free_fields(&hl->items[i]);
             if (i + 1 < hl->count) {
                 memmove(&hl->items[i], &hl->items[i + 1],
@@ -424,7 +544,10 @@ bool history_record(HistoryList *hl, const MediaItem *video, int64_t now) {
         size_t new_cap = hl->cap ? hl->cap * 2 : 32;
         if (new_cap > HISTORY_MAX_ENTRIES) new_cap = HISTORY_MAX_ENTRIES;
         HistoryEntry *arr = realloc(hl->items, new_cap * sizeof(HistoryEntry));
-        if (!arr) return false;
+        if (!arr) {
+            free(prior_original);
+            return false;
+        }
         hl->items = arr;
         hl->cap = new_cap;
     }
@@ -436,11 +559,15 @@ bool history_record(HistoryList *hl, const MediaItem *video, int64_t now) {
     HistoryEntry e = {0};
     snprintf(e.video_id, sizeof(e.video_id), "%.31s", video->id);
     e.title = tt_strdup(video->title ? video->title : "");
+    e.original_title = tt_strdup((video->original_title && video->original_title[0])
+                                     ? video->original_title
+                                     : (prior_original ? prior_original : ""));
     e.author = tt_strdup(video->author ? video->author : "");
     e.author_id = tt_strdup(video->author_id ? video->author_id : "");
     e.duration_text = tt_strdup(video->duration_text ? video->duration_text : "");
     e.thumbnail_url = tt_strdup(video->thumbnail_url ? video->thumbnail_url : "");
     e.watched_at = now;
+    free(prior_original);
     hl->items[0] = e;
     hl->count++;
     return true;

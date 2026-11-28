@@ -8,6 +8,7 @@
 
 #include <assert.h>
 #include <math.h>
+#include <pango/pangocairo.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1642,6 +1643,175 @@ static void test_locale_parsing_and_innertube_headers(void) {
     innertube_set_locale("en", "US");
 }
 
+static void test_original_titles(void) {
+    /* (a) Config parsing: true / false / omitted / non-bool */
+    char tmpdir[PATH_MAX];
+    test_make_temp_dir("tuitube_test_orig_cfg", tmpdir, sizeof(tmpdir));
+    char cfg_file[PATH_MAX + 32];
+    snprintf(cfg_file, sizeof(cfg_file), "%s/tuitube.json", tmpdir);
+
+    const char *cfg_true = "{ \"original_titles\": true }\n";
+    assert(tt_write_file_atomic(cfg_file, cfg_true, strlen(cfg_true)));
+    TuiTubeConfig cfg;
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.original_titles == true);
+    config_free(&cfg);
+
+    const char *cfg_false = "{ \"original_titles\": false }\n";
+    assert(tt_write_file_atomic(cfg_file, cfg_false, strlen(cfg_false)));
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.original_titles == false);
+    config_free(&cfg);
+
+    const char *cfg_omitted = "{ \"language\": \"vi\" }\n";
+    assert(tt_write_file_atomic(cfg_file, cfg_omitted, strlen(cfg_omitted)));
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.original_titles == true);
+    config_free(&cfg);
+
+    const char *cfg_nonbool = "{ \"original_titles\": \"yes\" }\n";
+    assert(tt_write_file_atomic(cfg_file, cfg_nonbool, strlen(cfg_nonbool)));
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.original_titles == true);
+    config_free(&cfg);
+
+    assert(tt_write_file_atomic(cfg_file, "{}\n", 3));
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.original_titles == true);
+    config_free(&cfg);
+
+    test_unlink_file(cfg_file);
+    test_rmdir(tmpdir);
+
+    /* (b) Config-aware display helpers default to originals and honour opt-out */
+    MediaItem src = {0};
+    src.kind = ITEM_VIDEO;
+    snprintf(src.id, sizeof(src.id), "abc123XYZ");
+    src.title = tt_strdup("Vietnamese title");
+    src.original_title = tt_strdup("Original English Title");
+
+    assert(strcmp(media_item_display_title(&src), "Original English Title") == 0);
+    assert(strcmp(media_item_display_title_for(&src, true), "Original English Title") == 0);
+    assert(strcmp(media_item_display_title_for(&src, false), "Vietnamese title") == 0);
+
+    MediaItem copy;
+    assert(media_item_copy(&copy, &src));
+    assert(copy.original_title && strcmp(copy.original_title, "Original English Title") == 0);
+    assert(strcmp(media_item_display_title(&copy), "Original English Title") == 0);
+    media_item_free_fields(&copy);
+    assert(copy.title == NULL && copy.original_title == NULL);
+
+    /* Empty original_title falls back to the localized title */
+    MediaItem empty_orig = {0};
+    empty_orig.title = tt_strdup("Localized");
+    empty_orig.original_title = tt_strdup("");
+    assert(strcmp(media_item_display_title(&empty_orig), "Localized") == 0);
+    media_item_free_fields(&empty_orig);
+
+    /* NULL original_title falls back too, and NULL item is safe */
+    MediaItem no_orig = {0};
+    no_orig.title = tt_strdup("Only Title");
+    assert(strcmp(media_item_display_title(&no_orig), "Only Title") == 0);
+    media_item_free_fields(&no_orig);
+    assert(media_item_display_title(NULL) == NULL);
+    media_item_free_fields(&src);
+}
+
+static void test_original_title_detail_merge(void) {
+    MediaItem selected = {0};
+    selected.kind = ITEM_VIDEO;
+    snprintf(selected.id, sizeof(selected.id), "mergeVid1");
+    selected.title = tt_strdup("Localized listed title");
+    selected.original_title = tt_strdup("Resolved original title");
+
+    MediaItem detail_item;
+    assert(media_item_copy(&detail_item, &selected));
+
+    MediaItem localized_detail = {0};
+    localized_detail.kind = ITEM_VIDEO;
+    snprintf(localized_detail.id, sizeof(localized_detail.id), "mergeVid1");
+    localized_detail.title = tt_strdup("Localized detail title");
+    localized_detail.author = tt_strdup("Channel");
+    localized_detail.description = tt_strdup("Description");
+    localized_detail.details_loaded = true;
+
+    assert(media_item_apply_detail_merge(&selected, &detail_item, true, &localized_detail));
+    assert(strcmp(selected.title, "Localized detail title") == 0);
+    assert(selected.original_title && strcmp(selected.original_title, "Resolved original title") == 0);
+    assert(detail_item.original_title &&
+           strcmp(detail_item.original_title, "Resolved original title") == 0);
+    assert(strcmp(media_item_display_title(&detail_item), "Resolved original title") == 0);
+
+    /* With originals disabled the resolved original is ignored, not shown. */
+    assert(strcmp(media_item_display_title_for(&detail_item, false),
+                  "Localized detail title") == 0);
+
+    MediaItem localized_refresh = {0};
+    localized_refresh.kind = ITEM_VIDEO;
+    snprintf(localized_refresh.id, sizeof(localized_refresh.id), "mergeVid1");
+    localized_refresh.title = tt_strdup("Localized again");
+    assert(media_item_apply_detail_merge(&selected, &detail_item, true, &localized_refresh));
+    assert(strcmp(media_item_display_title_for(&selected, true), "Resolved original title") == 0);
+    assert(strcmp(media_item_display_title_for(&selected, false), "Localized again") == 0);
+    assert(strcmp(media_item_display_title_for(&detail_item, false), "Localized again") == 0);
+
+    media_item_free_fields(&selected);
+    media_item_free_fields(&detail_item);
+    media_item_free_fields(&localized_detail);
+    media_item_free_fields(&localized_refresh);
+}
+
+static void test_background_title_patch_is_field_only(void) {
+    MediaItem detail = {0};
+    detail.kind = ITEM_VIDEO;
+    snprintf(detail.id, sizeof(detail.id), "patchVid1");
+    detail.title = tt_strdup("Newest detail title");
+    detail.author = tt_strdup("Channel");
+    detail.description = tt_strdup("Newest detail description");
+
+    assert(media_item_set_original_title(&detail, "Late original title"));
+    assert(strcmp(detail.original_title, "Late original title") == 0);
+    assert(strcmp(detail.title, "Newest detail title") == 0);
+    assert(strcmp(detail.description, "Newest detail description") == 0);
+    assert(strcmp(detail.author, "Channel") == 0);
+
+    /* A resolved original is never overwritten by a later background result. */
+    assert(!media_item_set_original_title(&detail, "Stale original title"));
+    assert(strcmp(detail.original_title, "Late original title") == 0);
+    assert(!media_item_set_original_title(&detail, ""));
+    assert(!media_item_set_original_title(NULL, "x"));
+
+    media_item_free_fields(&detail);
+}
+
+static void test_copy_description_gating_and_player_opt_out(void) {
+    MediaItem item = {0};
+    item.kind = ITEM_VIDEO;
+    snprintf(item.id, sizeof(item.id), "copyVid01");
+    item.title = tt_strdup("Localized copy title");
+    item.original_title = tt_strdup("Original copy title");
+
+    /* Player titles and title args follow the config flag. */
+    assert(strcmp(player_video_title_for(&item, true), "Original copy title") == 0);
+    assert(strcmp(player_video_title_for(&item, false), "Localized copy title") == 0);
+    assert(player_video_title_for(NULL, true) == NULL);
+
+    char *mpv_arg = NULL;
+    char *vlc_arg = NULL;
+    assert(player_build_title_args_for(&item, false, &mpv_arg, &vlc_arg));
+    assert(strcmp(mpv_arg, "--force-media-title=Localized copy title") == 0);
+    assert(strcmp(vlc_arg, "--meta-title=Localized copy title") == 0);
+    free(mpv_arg);
+    free(vlc_arg);
+    assert(player_build_title_args_for(&item, true, &mpv_arg, &vlc_arg));
+    assert(strcmp(mpv_arg, "--force-media-title=Original copy title") == 0);
+    assert(strcmp(vlc_arg, "--meta-title=Original copy title") == 0);
+    free(mpv_arg);
+    free(vlc_arg);
+
+    media_item_free_fields(&item);
+}
+
 static void test_non_english_lockup_and_badges(void) {
     const char *vi_browse =
         "{"
@@ -2006,6 +2176,10 @@ int main(void) {
     RUN_TEST(test_mpv_overlay_section_close_win_and_bindings);
     RUN_TEST(test_player_launch_and_exe_resolution);
     RUN_TEST(test_locale_parsing_and_innertube_headers);
+    RUN_TEST(test_original_titles);
+    RUN_TEST(test_original_title_detail_merge);
+    RUN_TEST(test_background_title_patch_is_field_only);
+    RUN_TEST(test_copy_description_gating_and_player_opt_out);
     RUN_TEST(test_non_english_lockup_and_badges);
     RUN_TEST(test_pe_subsystem_and_runtime_dep_checks);
     RUN_TEST(test_ytdlp_path_resolution_and_mpv_opts);
