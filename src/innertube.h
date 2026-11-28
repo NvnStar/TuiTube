@@ -72,6 +72,11 @@ bool innertube_parse_resolve_url_json(const char *json, size_t len, ParsedUrl *o
 bool innertube_parse_ytdlp_json(const char *json, size_t len, MediaList *out_list);
 
 bool innertube_parse_oembed_json(const char *json, size_t len, char *out, size_t out_cap);
+bool innertube_parse_player_title_json(const char *json, size_t len, char *out, size_t out_cap);
+bool innertube_parse_original_title_fallback(const char *oembed_json, size_t oembed_len,
+                                             bool oembed_ok, const char *player_json,
+                                             size_t player_len, bool player_ok,
+                                             char *out, size_t out_cap);
 bool innertube_resolve_original_title(CURL *curl, const char *video_id, char *out, size_t out_cap);
 void innertube_original_title_cache_reset(void);
 

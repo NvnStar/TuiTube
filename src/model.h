@@ -60,6 +60,7 @@ typedef struct {
 typedef struct {
     char video_id[32];
     char *title;
+    char *original_title;
     char *author;
     char *author_id;
     char *duration_text;
@@ -96,6 +97,9 @@ typedef struct {
 void media_item_free_fields(MediaItem *it);
 bool media_item_copy(MediaItem *dst, const MediaItem *src);
 const char *media_item_display_title(const MediaItem *it);
+void media_item_merge_details(MediaItem *dst, const MediaItem *src);
+bool media_item_apply_detail_merge(MediaItem *selected, MediaItem *detail_item,
+                                   bool has_detail_item, const MediaItem *detail);
 
 void media_list_init(MediaList *list);
 void media_list_clear(MediaList *list);

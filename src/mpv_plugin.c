@@ -475,7 +475,7 @@ static bool mpv_host_play_video(void *play_ctx, const TuiTubeConfig *cfg,
     char url[128];
     snprintf(url, sizeof(url), "https://www.youtube.com/watch?v=%s", video->id);
 
-    const char *title = (video->title && video->title[0]) ? video->title : video->id;
+    const char *title = player_video_title(video);
     char ytdl_fmt[512];
     char ytdl_script_opt[PATH_MAX + 64];
 

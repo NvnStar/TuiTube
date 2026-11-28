@@ -1407,6 +1407,46 @@ bool innertube_parse_oembed_json(const char *json, size_t len, char *out, size_t
     return ok;
 }
 
+bool innertube_parse_player_title_json(const char *json, size_t len, char *out, size_t out_cap) {
+    if (out && out_cap > 0) out[0] = '\0';
+    if (!json || len == 0 || !out || out_cap == 0) return false;
+
+    yyjson_read_flag flags = YYJSON_READ_ALLOW_TRAILING_COMMAS | YYJSON_READ_ALLOW_COMMENTS;
+    yyjson_doc *doc = yyjson_read_opts((char *)json, len, flags, NULL, NULL);
+    if (!doc) return false;
+
+    bool ok = false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *details = yyjson_is_obj(root) ? yyjson_obj_get(root, "videoDetails") : NULL;
+    yyjson_val *title = (details && yyjson_is_obj(details))
+                            ? yyjson_obj_get(details, "title")
+                            : NULL;
+    if (title && yyjson_is_str(title)) {
+        const char *s = yyjson_get_str(title);
+        if (s && s[0]) {
+            snprintf(out, out_cap, "%s", s);
+            ok = true;
+        }
+    }
+    yyjson_doc_free(doc);
+    return ok;
+}
+
+bool innertube_parse_original_title_fallback(const char *oembed_json, size_t oembed_len,
+                                             bool oembed_ok, const char *player_json,
+                                             size_t player_len, bool player_ok,
+                                             char *out, size_t out_cap) {
+    if (out && out_cap > 0) out[0] = '\0';
+    if (oembed_ok && innertube_parse_oembed_json(oembed_json, oembed_len, out, out_cap)) {
+        return true;
+    }
+    if (player_ok && innertube_parse_player_title_json(player_json, player_len, out, out_cap)) {
+        return true;
+    }
+    if (out && out_cap > 0) out[0] = '\0';
+    return false;
+}
+
 static bool is_valid_video_id(const char *video_id) {
     if (!video_id || !video_id[0]) return false;
     size_t len = strlen(video_id);
@@ -1416,6 +1456,45 @@ static bool is_valid_video_id(const char *video_id) {
         if (!(isalnum(c) || c == '_' || c == '-')) return false;
     }
     return true;
+}
+
+static bool fetch_player_original_title_json(CURL *curl, const char *video_id,
+                                             HttpResponse *out_resp) {
+    if (!out_resp) return false;
+    memset(out_resp, 0, sizeof(*out_resp));
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) return false;
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_val *ctx = yyjson_mut_obj(doc);
+    yyjson_mut_val *cli = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, cli, "hl", "en");
+    yyjson_mut_obj_add_str(doc, cli, "gl", "US");
+    yyjson_mut_obj_add_str(doc, cli, "clientName", "WEB");
+    yyjson_mut_obj_add_str(doc, cli, "clientVersion", INNERTUBE_CLIENT_VER);
+    yyjson_mut_obj_add_val(doc, ctx, "client", cli);
+    yyjson_mut_obj_add_val(doc, root, "context", ctx);
+    yyjson_mut_obj_add_str(doc, root, "videoId", video_id);
+
+    char *body = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    if (!body) return false;
+
+    const char *headers[] = {
+        "Content-Type: application/json",
+        "Origin: https://www.youtube.com",
+        "Referer: https://www.youtube.com/",
+        "Accept-Language: en-US,en;q=0.9"
+    };
+    bool ok = false;
+    if (http_post_json(curl, "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                       body, headers, 4, INNERTUBE_MAX_JSON, out_resp)) {
+        ok = out_resp->status_code >= 200 && out_resp->status_code < 300 && out_resp->data;
+    }
+    free(body);
+    if (!ok) http_response_free(out_resp);
+    return ok;
 }
 
 bool innertube_resolve_original_title(CURL *curl, const char *video_id, char *out, size_t out_cap) {
@@ -1437,15 +1516,27 @@ bool innertube_resolve_original_title(CURL *curl, const char *video_id, char *ou
              "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=%s&format=json",
              video_id);
 
-    HttpResponse resp;
-    memset(&resp, 0, sizeof(resp));
-    bool ok = false;
-    if (http_get(curl, url, 256u * 1024u, &resp)) {
-        if (resp.status_code >= 200 && resp.status_code < 300 && resp.data) {
-            ok = innertube_parse_oembed_json(resp.data, resp.len, out, out_cap);
-        }
+    HttpResponse oembed_resp;
+    memset(&oembed_resp, 0, sizeof(oembed_resp));
+    bool oembed_http_ok = false;
+    if (http_get(curl, url, 256u * 1024u, &oembed_resp)) {
+        oembed_http_ok = oembed_resp.status_code >= 200 && oembed_resp.status_code < 300 &&
+                         oembed_resp.data;
     }
-    http_response_free(&resp);
+
+    bool ok = oembed_http_ok &&
+              innertube_parse_oembed_json(oembed_resp.data, oembed_resp.len, out, out_cap);
+    if (!ok) {
+        HttpResponse player_resp;
+        memset(&player_resp, 0, sizeof(player_resp));
+        bool player_http_ok = fetch_player_original_title_json(curl, video_id, &player_resp);
+        ok = innertube_parse_original_title_fallback(oembed_resp.data, oembed_resp.len,
+                                                     oembed_http_ok,
+                                                     player_resp.data, player_resp.len,
+                                                     player_http_ok, out, out_cap);
+        http_response_free(&player_resp);
+    }
+    http_response_free(&oembed_resp);
     if (!ok) {
         if (out_cap > 0) out[0] = '\0';
         return false;

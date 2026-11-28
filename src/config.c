@@ -482,7 +482,7 @@ void config_init_defaults(TuiTubeConfig *cfg) {
     cfg->allow_hdr = false;
     cfg->all_codecs = false;
     cfg->hide_members_only = false;
-    cfg->original_titles = false;
+    cfg->original_titles = true;
     cfg->download_dir = tt_strdup("");
     add_default_keybindings(cfg);
     theme_init_builtin(&cfg->theme, "dark");

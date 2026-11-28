@@ -1665,13 +1665,18 @@ static void test_original_titles(void) {
     const char *cfg_omitted = "{ \"language\": \"vi\" }\n";
     assert(tt_write_file_atomic(cfg_file, cfg_omitted, strlen(cfg_omitted)));
     assert(config_load(&cfg, tmpdir));
-    assert(cfg.original_titles == false);
+    assert(cfg.original_titles == true);
     config_free(&cfg);
 
     const char *cfg_nonbool = "{ \"original_titles\": \"yes\" }\n";
     assert(tt_write_file_atomic(cfg_file, cfg_nonbool, strlen(cfg_nonbool)));
     assert(config_load(&cfg, tmpdir));
-    assert(cfg.original_titles == false);
+    assert(cfg.original_titles == true);
+    config_free(&cfg);
+
+    assert(tt_write_file_atomic(cfg_file, "{}\n", 3));
+    assert(config_load(&cfg, tmpdir));
+    assert(cfg.original_titles == true);
     config_free(&cfg);
 
     test_unlink_file(cfg_file);
@@ -1732,10 +1737,242 @@ static void test_original_titles(void) {
     const char *non_string_title = "{\"title\": 42}";
     assert(!innertube_parse_oembed_json(non_string_title, strlen(non_string_title), out, sizeof(out)));
 
-    /* (d) Cache reset is callable and idempotent */
+    /* (d) player-endpoint fallback JSON title extraction */
+    const char *player_valid =
+        "{\"videoDetails\":{\"videoId\":\"abc123XYZ\","
+        "\"title\":\"Uploader Original Title\"},\"playabilityStatus\":{\"status\":\"OK\"}}";
+    assert(innertube_parse_player_title_json(player_valid, strlen(player_valid), out, sizeof(out)));
+    assert(strcmp(out, "Uploader Original Title") == 0);
+
+    const char *player_no_details = "{\"playabilityStatus\":{\"status\":\"OK\"}}";
+    out[0] = 'x';
+    assert(!innertube_parse_player_title_json(player_no_details, strlen(player_no_details),
+                                              out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *player_no_title = "{\"videoDetails\":{\"videoId\":\"abc123XYZ\"}}";
+    assert(!innertube_parse_player_title_json(player_no_title, strlen(player_no_title),
+                                              out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *player_empty_title = "{\"videoDetails\":{\"title\":\"\"}}";
+    assert(!innertube_parse_player_title_json(player_empty_title, strlen(player_empty_title),
+                                              out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *player_non_string = "{\"videoDetails\":{\"title\":42}}";
+    assert(!innertube_parse_player_title_json(player_non_string, strlen(player_non_string),
+                                              out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *player_malformed = "{\"videoDetails\":{\"title\": ";
+    assert(!innertube_parse_player_title_json(player_malformed, strlen(player_malformed),
+                                              out, sizeof(out)));
+    assert(out[0] == '\0');
+
+    const char *oembed_missing_title = "{\"author_name\":\"Nobody\"}";
+    assert(!innertube_parse_oembed_json(oembed_missing_title, strlen(oembed_missing_title),
+                                        out, sizeof(out)));
+
+    /* oEmbed failure triggers the player fallback; oEmbed success wins. */
+    assert(innertube_parse_original_title_fallback(NULL, 0, false,
+                                                   player_valid, strlen(player_valid), true,
+                                                   out, sizeof(out)));
+    assert(strcmp(out, "Uploader Original Title") == 0);
+    assert(innertube_parse_original_title_fallback(valid, strlen(valid), true,
+                                                   player_valid, strlen(player_valid), true,
+                                                   out, sizeof(out)));
+    assert(strcmp(out, "I Survived 100 Days in a Cave") == 0);
+    out[0] = 'x';
+    assert(!innertube_parse_original_title_fallback(NULL, 0, false,
+                                                    player_malformed, strlen(player_malformed), true,
+                                                    out, sizeof(out)));
+    assert(out[0] == '\0');
+    assert(innertube_parse_original_title_fallback(oembed_missing_title,
+                                                   strlen(oembed_missing_title), true,
+                                                   player_valid, strlen(player_valid), true,
+                                                   out, sizeof(out)));
+    assert(strcmp(out, "Uploader Original Title") == 0);
+
+    /* (e) Cache reset is callable and idempotent */
     innertube_original_title_cache_reset();
     innertube_original_title_cache_reset();
     innertube_original_title_cache_reset();
+}
+
+static void test_original_title_detail_merge(void) {
+    MediaItem selected = {0};
+    selected.kind = ITEM_VIDEO;
+    snprintf(selected.id, sizeof(selected.id), "mergeVid1");
+    selected.title = tt_strdup("Localized listed title");
+    selected.original_title = tt_strdup("Resolved original title");
+
+    MediaItem detail_item;
+    assert(media_item_copy(&detail_item, &selected));
+
+    MediaItem localized_detail = {0};
+    localized_detail.kind = ITEM_VIDEO;
+    snprintf(localized_detail.id, sizeof(localized_detail.id), "mergeVid1");
+    localized_detail.title = tt_strdup("Localized detail title");
+    localized_detail.author = tt_strdup("Channel");
+    localized_detail.description = tt_strdup("Description");
+    localized_detail.details_loaded = true;
+
+    assert(media_item_apply_detail_merge(&selected, &detail_item, true, &localized_detail));
+    assert(strcmp(selected.title, "Localized detail title") == 0);
+    assert(selected.original_title && strcmp(selected.original_title, "Resolved original title") == 0);
+    assert(detail_item.original_title &&
+           strcmp(detail_item.original_title, "Resolved original title") == 0);
+    assert(strcmp(media_item_display_title(&detail_item), "Resolved original title") == 0);
+
+    MediaItem fresh_original = {0};
+    fresh_original.kind = ITEM_VIDEO;
+    snprintf(fresh_original.id, sizeof(fresh_original.id), "mergeVid1");
+    fresh_original.title = tt_strdup("Localized detail title");
+    fresh_original.original_title = tt_strdup("New original from detail");
+    assert(media_item_apply_detail_merge(&selected, &detail_item, true, &fresh_original));
+    assert(strcmp(media_item_display_title(&selected), "New original from detail") == 0);
+    assert(strcmp(media_item_display_title(&detail_item), "New original from detail") == 0);
+
+    /* Detail refresh without an original must not discard the resolved one. */
+    MediaItem localized_refresh = {0};
+    localized_refresh.kind = ITEM_VIDEO;
+    snprintf(localized_refresh.id, sizeof(localized_refresh.id), "mergeVid1");
+    localized_refresh.title = tt_strdup("Localized again");
+    assert(media_item_apply_detail_merge(&selected, &detail_item, true, &localized_refresh));
+    assert(strcmp(media_item_display_title(&selected), "New original from detail") == 0);
+    assert(strcmp(media_item_display_title(&detail_item), "New original from detail") == 0);
+
+    /* A resolved original already in the detail pane must reach the row. */
+    MediaItem pane_only = {0};
+    pane_only.kind = ITEM_VIDEO;
+    snprintf(pane_only.id, sizeof(pane_only.id), "mergeVid2");
+    pane_only.title = tt_strdup("Pane localized");
+    pane_only.original_title = tt_strdup("Pane resolved original");
+
+    MediaItem row_without_original = {0};
+    row_without_original.kind = ITEM_VIDEO;
+    snprintf(row_without_original.id, sizeof(row_without_original.id), "mergeVid2");
+    row_without_original.title = tt_strdup("Row localized");
+
+    MediaItem detail_without_original = {0};
+    detail_without_original.kind = ITEM_VIDEO;
+    snprintf(detail_without_original.id, sizeof(detail_without_original.id), "mergeVid2");
+    detail_without_original.title = tt_strdup("Detail localized");
+    assert(media_item_apply_detail_merge(&row_without_original, &pane_only, true,
+                                         &detail_without_original));
+    assert(strcmp(media_item_display_title(&row_without_original),
+                  "Pane resolved original") == 0);
+    assert(strcmp(media_item_display_title(&pane_only), "Pane resolved original") == 0);
+
+    media_item_free_fields(&selected);
+    media_item_free_fields(&detail_item);
+    media_item_free_fields(&localized_detail);
+    media_item_free_fields(&fresh_original);
+    media_item_free_fields(&localized_refresh);
+    media_item_free_fields(&pane_only);
+    media_item_free_fields(&row_without_original);
+    media_item_free_fields(&detail_without_original);
+}
+
+static void test_history_original_title_roundtrip(void) {
+    HistoryList hl;
+    history_init(&hl);
+
+    MediaItem v = {0};
+    v.kind = ITEM_VIDEO;
+    snprintf(v.id, sizeof(v.id), "histOrig01");
+    v.title = tt_strdup("Localized history title");
+    v.original_title = tt_strdup("Original history title");
+    v.author = tt_strdup("History Channel");
+    assert(history_record(&hl, &v, 1234));
+
+    char hist_path[PATH_MAX];
+    test_make_temp_file("tuitube_test_hist_orig.json", hist_path, sizeof(hist_path));
+    assert(history_save(&hl, hist_path));
+    history_free(&hl);
+
+    history_init(&hl);
+    assert(history_load(&hl, hist_path));
+    assert(hl.count == 1);
+    assert(strcmp(hl.items[0].title, "Localized history title") == 0);
+    assert(hl.items[0].original_title &&
+           strcmp(hl.items[0].original_title, "Original history title") == 0);
+    history_free(&hl);
+    test_unlink_file(hist_path);
+
+    /* Backward compatibility: files without original_title still load. */
+    const char *legacy =
+        "[\n"
+        "  {\"video_id\":\"legacy01\",\"title\":\"Legacy title\",\"author\":\"Old\"}\n"
+        "]\n";
+    assert(tt_write_file_atomic(hist_path, legacy, strlen(legacy)));
+    history_init(&hl);
+    assert(history_load(&hl, hist_path));
+    assert(hl.count == 1 && strcmp(hl.items[0].title, "Legacy title") == 0);
+    assert(hl.items[0].original_title && hl.items[0].original_title[0] == '\0');
+    history_free(&hl);
+
+    /* A later play without a resolved original keeps the persisted one. */
+    history_free(&hl);
+    history_init(&hl);
+    MediaItem with_orig = {0};
+    with_orig.kind = ITEM_VIDEO;
+    snprintf(with_orig.id, sizeof(with_orig.id), "keepOrig01");
+    with_orig.title = tt_strdup("Keep localized");
+    with_orig.original_title = tt_strdup("Keep original");
+    assert(history_record(&hl, &with_orig, 1000));
+    assert(history_save(&hl, hist_path));
+    history_free(&hl);
+
+    history_init(&hl);
+    assert(history_load(&hl, hist_path));
+    MediaItem localized_only = {0};
+    localized_only.kind = ITEM_VIDEO;
+    snprintf(localized_only.id, sizeof(localized_only.id), "keepOrig01");
+    localized_only.title = tt_strdup("Keep localized again");
+    assert(history_record(&hl, &localized_only, 2000));
+    assert(hl.items[0].original_title &&
+           strcmp(hl.items[0].original_title, "Keep original") == 0);
+    assert(strcmp(hl.items[0].title, "Keep localized again") == 0);
+    history_free(&hl);
+    test_unlink_file(hist_path);
+    media_item_free_fields(&v);
+    media_item_free_fields(&with_orig);
+    media_item_free_fields(&localized_only);
+}
+
+static void test_player_original_title_selection(void) {
+    MediaItem video = {0};
+    video.kind = ITEM_VIDEO;
+    snprintf(video.id, sizeof(video.id), "titleVid01");
+    video.title = tt_strdup("Localized player title");
+
+    assert(strcmp(player_video_title(&video), "Localized player title") == 0);
+
+    video.original_title = tt_strdup("Original player title");
+    assert(strcmp(player_video_title(&video), "Original player title") == 0);
+
+    char *mpv_arg = NULL;
+    char *vlc_arg = NULL;
+    assert(player_build_title_args(&video, &mpv_arg, &vlc_arg));
+    assert(strcmp(mpv_arg, "--force-media-title=Original player title") == 0);
+    assert(strcmp(vlc_arg, "--meta-title=Original player title") == 0);
+    free(mpv_arg);
+    free(vlc_arg);
+
+    /* Missing titles fall back to the video id. */
+    media_item_free_fields(&video);
+    video.kind = ITEM_VIDEO;
+    snprintf(video.id, sizeof(video.id), "titleVid01");
+    assert(strcmp(player_video_title(&video), "titleVid01") == 0);
+    assert(player_build_title_args(&video, &mpv_arg, &vlc_arg));
+    assert(strcmp(mpv_arg, "--force-media-title=titleVid01") == 0);
+    assert(strcmp(vlc_arg, "--meta-title=titleVid01") == 0);
+    free(mpv_arg);
+    free(vlc_arg);
+    assert(player_video_title(NULL) == NULL);
+    media_item_free_fields(&video);
 }
 
 static void test_non_english_lockup_and_badges(void) {
@@ -2103,6 +2340,9 @@ int main(void) {
     RUN_TEST(test_player_launch_and_exe_resolution);
     RUN_TEST(test_locale_parsing_and_innertube_headers);
     RUN_TEST(test_original_titles);
+    RUN_TEST(test_original_title_detail_merge);
+    RUN_TEST(test_history_original_title_roundtrip);
+    RUN_TEST(test_player_original_title_selection);
     RUN_TEST(test_non_english_lockup_and_badges);
     RUN_TEST(test_pe_subsystem_and_runtime_dep_checks);
     RUN_TEST(test_ytdlp_path_resolution_and_mpv_opts);

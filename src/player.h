@@ -28,6 +28,9 @@ bool player_build_mpv_ytdl_script_opt(const TuiTubeConfig *cfg, char *out, size_
 bool player_map_video_format(const char *video_format, bool allow_hdr, bool all_codecs,
                              char *out, size_t out_cap);
 
+const char *player_video_title(const MediaItem *video);
+bool player_build_title_args(const MediaItem *video, char **out_mpv, char **out_vlc);
+
 bool player_launch(const TuiTubeConfig *cfg, const MediaItem *video,
                    char *err_buf, size_t err_cap);
 

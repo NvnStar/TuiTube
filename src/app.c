@@ -197,7 +197,8 @@ static void *run_next_job(CURL *curl, void *arg, uint64_t gen, HttpPool *pool) {
                              req->continuation ? NULL : &res->details,
                              req->load_list ? &res->recommended : NULL,
                              res->error, sizeof(res->error));
-    if (res->ok && req->original_titles && res->details.id[0] && !res->details.original_title) {
+    if (res->ok && req->original_titles && res->details.id[0] &&
+        (!res->details.original_title || !res->details.original_title[0])) {
         char orig[512];
         if (innertube_resolve_original_title(curl, res->details.id, orig, sizeof(orig))) {
             res->details.original_title = tt_strdup(orig);
@@ -388,6 +389,7 @@ static uint64_t bump_list_gen(AppState *app) {
 
 static void submit_original_title_job(AppState *app, const char *video_id, uint64_t gen) {
     if (!app || !app->pool || !video_id || !video_id[0]) return;
+    if (!app->cfg.original_titles) return;
     OriginalTitleJobReq *req = calloc(1, sizeof(OriginalTitleJobReq));
     if (!req) return;
     req->video_id = tt_strdup(video_id);
@@ -410,7 +412,8 @@ static void enqueue_original_title_jobs(AppState *app) {
     size_t queued = 0;
     for (size_t i = 0; i < list->count && queued < ORIGINAL_TITLE_LIST_CAP; i++) {
         MediaItem *it = &list->items[i];
-        if (it->kind == ITEM_VIDEO && it->id[0] && !it->original_title) {
+        if (it->kind == ITEM_VIDEO && it->id[0] &&
+            (!it->original_title || !it->original_title[0])) {
             submit_original_title_job(app, it->id, app->list_gen);
             queued++;
         }
@@ -615,6 +618,7 @@ static void cb_show_favorites(void *ctx) {
         media_list_append_move(&ml, &it);
     }
     ui_set_list(app->ui, &ml, false);
+    enqueue_original_title_jobs(app);
     sync_ui_nav(app);
     sync_selected_item_details(app);
     ui_set_status(app->ui, "Favorites (%zu items)", app->favs.count);
@@ -675,6 +679,9 @@ static void cb_show_history(void *ctx) {
         it.kind = ITEM_VIDEO;
         snprintf(it.id, sizeof(it.id), "%s", h->video_id);
         it.title = tt_strdup(h->title);
+        if (app->cfg.original_titles) {
+            it.original_title = tt_strdup(h->original_title);
+        }
         it.author = tt_strdup(h->author);
         it.author_id = tt_strdup(h->author_id);
         it.duration_text = tt_strdup(h->duration_text);
@@ -683,6 +690,7 @@ static void cb_show_history(void *ctx) {
         media_list_append_move(&ml, &it);
     }
     ui_set_list(app->ui, &ml, false);
+    enqueue_original_title_jobs(app);
     sync_ui_nav(app);
     sync_selected_item_details(app);
     ui_set_status(app->ui, "History (%zu videos)", app->history.count);
@@ -723,7 +731,7 @@ static void cb_activate_item(void *ctx, size_t index) {
             const char *pname = app->player_label[0]
                                     ? app->player_label
                                     : (app->cfg.player_path ? app->cfg.player_path : "mpv");
-            const char *vtitle = (it->title && it->title[0]) ? it->title : it->id;
+            const char *vtitle = player_video_title(it);
             bool warn_ytdlp = false;
             bool has_custom_ytdlp = (app->cfg.ytdlp_path && app->cfg.ytdlp_path[0] != '\0');
             if ((!app->player_label[0] && !is_vlc_player_name(pname)) || has_custom_ytdlp) {
@@ -774,7 +782,7 @@ static void cb_download_video(void *ctx) {
     char err[256] = {0};
     if (player_download_start(&app->cfg, it, dir, sizeof(dir), err, sizeof(err))) {
         ui_set_status(app->ui, "Downloading to %s: %s",
-                      dir, (it->title && it->title[0]) ? it->title : it->id);
+                      dir, player_video_title(it));
         wayland_request_redraw(app->wl);
     } else {
         ui_set_status(app->ui, "%s", err[0] ? err : "Failed to start download");
@@ -1084,6 +1092,7 @@ void app_process_async_results(AppState *app) {
     if (!app || !app->pool || !app->ui) return;
     http_pool_drain_notify(app->pool);
     HttpResult res;
+    bool history_dirty = false;
     while (http_pool_pop_result(app->pool, &res)) {
         if (res.kind == RES_PROGRESS) {
             if (res.request_gen == app->list_gen && res.progress_text) {
@@ -1161,6 +1170,16 @@ void app_process_async_results(AppState *app) {
                         applied = true;
                     }
                 }
+                for (size_t i = 0; i < app->history.count; i++) {
+                    HistoryEntry *h = &app->history.items[i];
+                    if (strcmp(h->video_id, ot->video_id) == 0 &&
+                        (!h->original_title || !h->original_title[0])) {
+                        free(h->original_title);
+                        h->original_title = tt_strdup(ot->title);
+                        history_dirty = true;
+                        break;
+                    }
+                }
                 if (applied) wayland_request_redraw(app->wl);
             }
         } else if (res.job_type == JOB_NEXT) {
@@ -1235,6 +1254,13 @@ void app_process_async_results(AppState *app) {
             }
         }
         http_result_free(&res);
+    }
+    if (history_dirty) {
+        char *hp = history_path(app);
+        if (hp) {
+            history_save(&app->history, hp);
+            free(hp);
+        }
     }
 }
 

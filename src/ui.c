@@ -1119,34 +1119,6 @@ void ui_set_list(UiState *ui, MediaList *new_list, bool append) {
     wayland_request_redraw(ui->wl);
 }
 
-static void replace_if_nonempty(char **dst, const char *src) {
-    if (src && src[0]) {
-        free(*dst);
-        *dst = tt_strdup(src);
-    }
-}
-
-static void merge_media_details(MediaItem *dst, const MediaItem *src) {
-    if (!dst || !src) return;
-    replace_if_nonempty(&dst->title, src->title);
-    replace_if_nonempty(&dst->author, src->author);
-    replace_if_nonempty(&dst->author_id, src->author_id);
-    replace_if_nonempty(&dst->view_count_text, src->view_count_text);
-    replace_if_nonempty(&dst->published_text, src->published_text);
-    replace_if_nonempty(&dst->description, src->description);
-    if ((!dst->duration_text || !dst->duration_text[0]) && src->duration_text && src->duration_text[0]) {
-        free(dst->duration_text);
-        dst->duration_text = tt_strdup(src->duration_text);
-    }
-    if ((!dst->thumbnail_url || !dst->thumbnail_url[0]) && src->thumbnail_url && src->thumbnail_url[0]) {
-        free(dst->thumbnail_url);
-        dst->thumbnail_url = tt_strdup(src->thumbnail_url);
-    }
-    dst->is_live = dst->is_live || src->is_live;
-    dst->is_members_only = dst->is_members_only || src->is_members_only;
-    dst->details_loaded = dst->details_loaded || src->details_loaded;
-}
-
 void ui_set_detail_item(UiState *ui, const MediaItem *detail) {
     if (!ui || !detail) return;
     bool sel_matches = (ui->selected_idx >= 0 && (size_t)ui->selected_idx < ui->list.count &&
@@ -1155,26 +1127,9 @@ void ui_set_detail_item(UiState *ui, const MediaItem *detail) {
         return;
     }
 
-    if (sel_matches) {
-        MediaItem *sel = &ui->list.items[ui->selected_idx];
-        merge_media_details(sel, detail);
-        if (!ui->has_detail_item || strcmp(ui->detail_item.id, detail->id) != 0) {
-            media_item_free_fields(&ui->detail_item);
-            media_item_copy(&ui->detail_item, sel);
-            ui->has_detail_item = true;
-        } else {
-            merge_media_details(&ui->detail_item, detail);
-        }
-    } else {
-        if (!ui->has_detail_item || strcmp(ui->detail_item.id, detail->id) != 0) {
-            media_item_free_fields(&ui->detail_item);
-            media_item_copy(&ui->detail_item, detail);
-            ui->has_detail_item = true;
-        } else {
-            merge_media_details(&ui->detail_item, detail);
-        }
-        ui->detail_item.details_loaded = true;
-    }
+    MediaItem *sel = sel_matches ? &ui->list.items[ui->selected_idx] : NULL;
+    ui->has_detail_item = media_item_apply_detail_merge(sel, &ui->detail_item,
+                                                        ui->has_detail_item, detail);
     ui->desc_scroll_y = 0.0;
     wayland_request_redraw(ui->wl);
 }
