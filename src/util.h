@@ -52,6 +52,37 @@ int tt_base64_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap
 char *tt_url_encode(const char *s);
 char *tt_xml_unescape(const char *s);
 
+typedef struct {
+    size_t start;
+    size_t end;
+} TtTextSpan;
+
+typedef struct {
+    double x;
+    double y;
+    double w;
+    double h;
+} TtRectF;
+
+typedef struct {
+    TtRectF rect;
+    size_t link;
+} TtLinkRect;
+
+size_t tt_find_url_spans(const char *text, TtTextSpan *out, size_t max);
+bool tt_url_from_span(const char *text, TtTextSpan span, char *out, size_t out_cap);
+bool tt_open_url(const char *url, char *err_buf, size_t err_cap);
+
+struct _PangoLayout;
+size_t tt_layout_link_rects(struct _PangoLayout *layout, const TtTextSpan *spans,
+                            size_t span_count, TtLinkRect *out, size_t max);
+
+/* Pure description-link hit test: translate layout rectangles into the
+   description viewport by its origin and scroll offset, clip to that viewport,
+   and return the topmost matching link index (or -1). */
+ssize_t tt_desc_link_hit(const TtLinkRect *rects, size_t rect_count,
+                         TtRectF desc_area, double scroll_y, double x, double y);
+
 bool tt_parse_age_seconds(const char *spec, int64_t *out_seconds);
 bool tt_parse_iso8601_utc(const char *s, int64_t *out_epoch);
 

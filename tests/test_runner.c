@@ -1948,6 +1948,46 @@ static void test_original_opt_out_display_and_merge(void) {
     media_item_free_fields(&localized_refresh);
 }
 
+static void test_url_span_detection_and_open_rules(void) {
+    const char *text =
+        "Read https://Example.com/a_(b), www.youtube.com/@chan and youtu.be/x. "
+        "Wiki en.wikipedia.org/wiki/Test. Not ftp://example.com or a@b.com or https://x.com/...";
+    TtTextSpan spans[8];
+    size_t n = tt_find_url_spans(text, spans, 8);
+    assert(n == 4);
+    char url[256];
+    assert(tt_url_from_span(text, spans[0], url, sizeof(url)));
+    assert(strcmp(url, "https://Example.com/a_(b)") == 0);
+    assert(tt_url_from_span(text, spans[1], url, sizeof(url)));
+    assert(strcmp(url, "https://www.youtube.com/@chan") == 0);
+    assert(tt_url_from_span(text, spans[2], url, sizeof(url)));
+    assert(strcmp(url, "https://youtu.be/x") == 0);
+    assert(tt_url_from_span(text, spans[3], url, sizeof(url)));
+    assert(strcmp(url, "https://en.wikipedia.org/wiki/Test") == 0);
+
+    char err[64] = {0};
+    assert(!tt_open_url("ftp://example.com", err, sizeof(err)));
+    assert(err[0] != '\0');
+    assert(!tt_open_url("javascript:alert(1)", err, sizeof(err)));
+    assert(!tt_open_url("https://exa mple.com", err, sizeof(err)));
+    assert(!tt_open_url("", err, sizeof(err)));
+}
+
+static void test_desc_link_hit_translation_and_clipping(void) {
+    TtLinkRect rects[2] = {0};
+    rects[0].rect = (TtRectF){10.0, 30.0, 40.0, 15.0};
+    rects[0].link = 0;
+    rects[1].rect = (TtRectF){100.0, 10.0, 50.0, 15.0};
+    rects[1].link = 1;
+    TtRectF area = {50.0, 100.0, 200.0, 50.0};
+
+    assert(tt_desc_link_hit(NULL, 0, area, 0.0, 60.0, 140.0) == -1);
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 65.0, 140.0) == 0);
+    assert(tt_desc_link_hit(rects, 2, area, 20.0, 65.0, 140.0) == -1);
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 160.0, 112.0) == 1);
+    assert(tt_desc_link_hit(rects, 2, area, 0.0, 100.0, 150.0) == -1);
+}
+
 static void test_non_english_lockup_and_badges(void) {
     const char *vi_browse =
         "{"
@@ -2319,6 +2359,8 @@ int main(void) {
     RUN_TEST(test_original_description_and_url_links);
     RUN_TEST(test_history_original_title_roundtrip);
     RUN_TEST(test_original_opt_out_display_and_merge);
+    RUN_TEST(test_url_span_detection_and_open_rules);
+    RUN_TEST(test_desc_link_hit_translation_and_clipping);
     RUN_TEST(test_non_english_lockup_and_badges);
     RUN_TEST(test_pe_subsystem_and_runtime_dep_checks);
     RUN_TEST(test_ytdlp_path_resolution_and_mpv_opts);

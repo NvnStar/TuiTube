@@ -91,6 +91,7 @@ typedef enum {
     HIT_ACT_FAVORITE,
     HIT_ACT_COPY_URL,
     HIT_DESC_SCROLLBAR,
+    HIT_DESC_LINK,
     HIT_RIGHT_PANE,
     HIT_CTX_ITEM,
     HIT_CTX_MENU,
@@ -193,6 +194,12 @@ struct UiState {
     double list_scroll_y;
     double desc_scroll_y;
     double desc_max_scroll;
+    TtTextSpan desc_link_spans[64];
+    size_t desc_link_count;
+    TtLinkRect desc_link_rects[512];
+    size_t desc_link_rect_count;
+    char *desc_link_cache_text;
+    ssize_t hover_desc_link;
     bool loading_more;
 
     char status_text[256];
@@ -984,6 +991,7 @@ void ui_destroy(UiState *ui) {
 #endif
     free(ui->font_family);
     if (ui->mascot_surf) cairo_surface_destroy(ui->mascot_surf);
+    free(ui->desc_link_cache_text);
     free(ui->search_buf);
     ime_clear_preedit(ui);
     media_list_free(&ui->list);
@@ -1072,6 +1080,11 @@ void ui_set_status(UiState *ui, const char *fmt, ...) {
 }
 
 static void sync_detail_from_selection(UiState *ui) {
+    ui->desc_link_count = 0;
+    ui->desc_link_rect_count = 0;
+    free(ui->desc_link_cache_text);
+    ui->desc_link_cache_text = NULL;
+    ui->hover_desc_link = -1;
     media_item_free_fields(&ui->detail_item);
     ui->has_detail_item = false;
     ui->desc_scroll_y = 0.0;
@@ -1119,33 +1132,24 @@ void ui_set_list(UiState *ui, MediaList *new_list, bool append) {
     wayland_request_redraw(ui->wl);
 }
 
-static void replace_if_nonempty(char **dst, const char *src) {
-    if (src && src[0]) {
-        free(*dst);
-        *dst = tt_strdup(src);
+void ui_set_detail_item(UiState *ui, const MediaItem *detail) {
+    if (!ui || !detail) return;
+    ui->desc_link_count = 0;
+    ui->desc_link_rect_count = 0;
+    free(ui->desc_link_cache_text);
+    ui->desc_link_cache_text = NULL;
+    ui->hover_desc_link = -1;
+    bool sel_matches = (ui->selected_idx >= 0 && (size_t)ui->selected_idx < ui->list.count &&
+                        strcmp(ui->list.items[ui->selected_idx].id, detail->id) == 0);
+    if (ui->view_kind != UI_VIEW_NEXT && !sel_matches) {
+        return;
     }
-}
 
-static void merge_media_details(MediaItem *dst, const MediaItem *src) {
-    if (!dst || !src) return;
-    replace_if_nonempty(&dst->title, src->title);
-    replace_if_nonempty(&dst->original_title, src->original_title);
-    replace_if_nonempty(&dst->author, src->author);
-    replace_if_nonempty(&dst->author_id, src->author_id);
-    replace_if_nonempty(&dst->view_count_text, src->view_count_text);
-    replace_if_nonempty(&dst->published_text, src->published_text);
-    replace_if_nonempty(&dst->description, src->description);
-    if ((!dst->duration_text || !dst->duration_text[0]) && src->duration_text && src->duration_text[0]) {
-        free(dst->duration_text);
-        dst->duration_text = tt_strdup(src->duration_text);
-    }
-    if ((!dst->thumbnail_url || !dst->thumbnail_url[0]) && src->thumbnail_url && src->thumbnail_url[0]) {
-        free(dst->thumbnail_url);
-        dst->thumbnail_url = tt_strdup(src->thumbnail_url);
-    }
-    dst->is_live = dst->is_live || src->is_live;
-    dst->is_members_only = dst->is_members_only || src->is_members_only;
-    dst->details_loaded = true;
+    MediaItem *sel = sel_matches ? &ui->list.items[ui->selected_idx] : NULL;
+    ui->has_detail_item = media_item_apply_detail_merge(sel, &ui->detail_item,
+                                                        ui->has_detail_item, detail);
+    ui->desc_scroll_y = 0.0;
+    wayland_request_redraw(ui->wl);
 }
 
 bool ui_set_detail_original_title(UiState *ui, const char *video_id, const char *title) {
@@ -1163,38 +1167,6 @@ bool ui_set_detail_original_title(UiState *ui, const char *video_id, const char 
     if (!changed) return false;
     wayland_request_redraw(ui->wl);
     return true;
-}
-
-void ui_set_detail_item(UiState *ui, const MediaItem *detail) {
-    if (!ui || !detail) return;
-    bool sel_matches = (ui->selected_idx >= 0 && (size_t)ui->selected_idx < ui->list.count &&
-                        strcmp(ui->list.items[ui->selected_idx].id, detail->id) == 0);
-    if (ui->view_kind != UI_VIEW_NEXT && !sel_matches) {
-        return;
-    }
-
-    if (sel_matches) {
-        MediaItem *sel = &ui->list.items[ui->selected_idx];
-        merge_media_details(sel, detail);
-        if (!ui->has_detail_item || strcmp(ui->detail_item.id, detail->id) != 0) {
-            media_item_free_fields(&ui->detail_item);
-            media_item_copy(&ui->detail_item, sel);
-            ui->has_detail_item = true;
-        } else {
-            merge_media_details(&ui->detail_item, detail);
-        }
-    } else {
-        if (!ui->has_detail_item || strcmp(ui->detail_item.id, detail->id) != 0) {
-            media_item_free_fields(&ui->detail_item);
-            media_item_copy(&ui->detail_item, detail);
-            ui->has_detail_item = true;
-        } else {
-            merge_media_details(&ui->detail_item, detail);
-        }
-        ui->detail_item.details_loaded = true;
-    }
-    ui->desc_scroll_y = 0.0;
-    wayland_request_redraw(ui->wl);
 }
 
 void ui_mark_video_watched(UiState *ui, const char *video_id) {
@@ -1309,6 +1281,11 @@ static void clamp_list_scroll(UiState *ui, const Layout *L) {
 
 void ui_restore_list_state(UiState *ui, MediaList *restored, ssize_t selected_idx, double scroll_y) {
     if (!ui || !restored) return;
+    ui->desc_link_count = 0;
+    ui->desc_link_rect_count = 0;
+    free(ui->desc_link_cache_text);
+    ui->desc_link_cache_text = NULL;
+    ui->hover_desc_link = -1;
     ui->loading_more = false;
     ui->busy = false;
     ui->error_text[0] = '\0';
@@ -1465,6 +1442,113 @@ static void draw_badge_pill(cairo_t *cr, const UiState *ui, double x, double y,
     draw_text_line(cr, ui, text, br.x + 4.0, br.y, br.w - 8.0, br.h,
                    (ColorRGBA){255, 255, 255, 255}, 1.0, 0.78, true,
                    PANGO_ALIGN_CENTER, true);
+}
+
+static void desc_links_sync(UiState *ui, const char *desc) {
+    if (!ui) return;
+    if (!desc) desc = "";
+    if (ui->desc_link_cache_text && strcmp(ui->desc_link_cache_text, desc) == 0) return;
+    free(ui->desc_link_cache_text);
+    ui->desc_link_cache_text = tt_strdup(desc);
+    ui->desc_link_count = tt_find_url_spans(desc, ui->desc_link_spans,
+                                            sizeof(ui->desc_link_spans) / sizeof(ui->desc_link_spans[0]));
+    ui->desc_link_rect_count = 0;
+    ui->hover_desc_link = -1;
+}
+
+static PangoAttrList *desc_links_attrs(const UiState *ui) {
+    if (!ui || ui->desc_link_count == 0) return NULL;
+    PangoAttrList *attrs = pango_attr_list_new();
+    if (!attrs) return NULL;
+    ColorRGBA accent = ui->cfg->theme.elem_selected.bg;
+    for (size_t i = 0; i < ui->desc_link_count; i++) {
+        TtTextSpan span = ui->desc_link_spans[i];
+        PangoAttribute *u = pango_attr_underline_new(PANGO_UNDERLINE_SINGLE);
+        u->start_index = (guint)span.start;
+        u->end_index = (guint)span.end;
+        pango_attr_list_insert(attrs, u);
+        PangoAttribute *fg = pango_attr_foreground_new(
+            (guint16)(accent.r * 257u), (guint16)(accent.g * 257u),
+            (guint16)(accent.b * 257u));
+        fg->start_index = (guint)span.start;
+        fg->end_index = (guint)span.end;
+        pango_attr_list_insert(attrs, fg);
+        PangoAttribute *fa = pango_attr_foreground_alpha_new((guint16)(accent.a * 257u));
+        fa->start_index = (guint)span.start;
+        fa->end_index = (guint)span.end;
+        pango_attr_list_insert(attrs, fa);
+    }
+    return attrs;
+}
+
+static void desc_links_update_rects(UiState *ui, PangoLayout *layout) {
+    ui->desc_link_rect_count = 0;
+    if (!ui || !layout || ui->desc_link_count == 0) return;
+    ui->desc_link_rect_count = tt_layout_link_rects(
+        layout, ui->desc_link_spans, ui->desc_link_count,
+        ui->desc_link_rects,
+        sizeof(ui->desc_link_rects) / sizeof(ui->desc_link_rects[0]));
+}
+
+static void desc_layout_apply(UiState *ui, PangoLayout *layout, const char *desc, double text_w) {
+    PangoFontDescription *dd = make_font_desc(ui, 0.95, false);
+    pango_layout_set_font_description(layout, dd);
+    pango_font_description_free(dd);
+    pango_layout_set_text(layout, desc, -1);
+    pango_layout_set_width(layout, (int)(text_w * PANGO_SCALE));
+    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+    pango_layout_set_spacing(layout, (int)(ui->cfg->font_size * 0.35 * PANGO_SCALE));
+    PangoAttrList *attrs = desc_links_attrs(ui);
+    if (attrs) {
+        pango_layout_set_attributes(layout, attrs);
+        pango_attr_list_unref(attrs);
+    }
+}
+
+static double desc_text_width(const UiState *ui, const Layout *L)
+{
+    double pad = SP_LG;
+    double cw = L->right_pane.w - pad * 2.0;
+    double text_w = cw - 12.0;
+    if (text_w < 40.0) text_w = cw;
+    (void)ui;
+    return text_w;
+}
+
+static bool desc_links_ensure_rects(UiState *ui, const Layout *L) {
+    if (!ui || !L) return false;
+    const MediaItem *item = ui_get_detail_item(ui);
+    const char *desc = media_item_display_description_for(item, ui->cfg->original_titles);
+    if (!desc || !desc[0] || L->desc_area.h <= 10.0) return false;
+
+    desc_links_sync(ui, desc);
+    if (ui->desc_link_count == 0) return false;
+    if (ui->desc_link_rect_count > 0) return true;
+
+    double text_w = desc_text_width(ui, L);
+    if (text_w < 10.0) return false;
+    cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    if (!surf) return false;
+    cairo_t *cr = cairo_create(surf);
+    if (!cr) {
+        cairo_surface_destroy(surf);
+        return false;
+    }
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    if (layout) {
+        desc_layout_apply(ui, layout, desc, text_w);
+        int dw = 0, dh = 0;
+        pango_layout_get_pixel_size(layout, &dw, &dh);
+        ui->desc_max_scroll = (double)dh - L->desc_area.h;
+        if (ui->desc_max_scroll < 0.0) ui->desc_max_scroll = 0.0;
+        if (ui->desc_scroll_y > ui->desc_max_scroll) ui->desc_scroll_y = ui->desc_max_scroll;
+        if (ui->desc_scroll_y < 0.0) ui->desc_scroll_y = 0.0;
+        desc_links_update_rects(ui, layout);
+        g_object_unref(layout);
+    }
+    cairo_destroy(cr);
+    cairo_surface_destroy(surf);
+    return ui->desc_link_rect_count > 0;
 }
 
 static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
@@ -1727,21 +1811,17 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
         }
 
         const char *desc = media_item_display_description_for(item, ui->cfg->original_titles);
+        desc_links_sync(ui, desc ? desc : "");
+        ui->desc_link_rect_count = 0;
         if (desc && desc[0]) {
-            double text_w = cw - 12.0;
-            if (text_w < 40.0) text_w = cw;
+            double text_w = desc_text_width(ui, L);
 
             PangoLayout *dl = pango_cairo_create_layout(cr);
-            PangoFontDescription *dd = make_font_desc(ui, 0.95, false);
-            pango_layout_set_font_description(dl, dd);
-            pango_font_description_free(dd);
-            pango_layout_set_text(dl, desc, -1);
-            pango_layout_set_width(dl, (int)(text_w * PANGO_SCALE));
-            pango_layout_set_wrap(dl, PANGO_WRAP_WORD_CHAR);
-            pango_layout_set_spacing(dl, (int)(ui->cfg->font_size * 0.35 * PANGO_SCALE));
+            desc_layout_apply(ui, dl, desc, text_w);
 
             int dw = 0, dh = 0;
             pango_layout_get_pixel_size(dl, &dw, &dh);
+            desc_links_update_rects(ui, dl);
             ui->desc_max_scroll = (double)dh - desc_h;
             if (ui->desc_max_scroll < 0.0) ui->desc_max_scroll = 0.0;
             if (ui->desc_scroll_y > ui->desc_max_scroll) ui->desc_scroll_y = ui->desc_max_scroll;
@@ -2642,6 +2722,7 @@ void ui_on_resize(void *ctx, int width, int height) {
 }
 
 static HitId hit_test(UiState *ui, const Layout *L, double x, double y) {
+    ui->hover_desc_link = -1;
     if (ui->show_help) {
         if (pt_in_rect(x, y, L->help_close_btn)) return HIT_HELP_CLOSE;
         if (pt_in_rect(x, y, L->help_modal_box)) return HIT_HELP_MODAL;
@@ -2711,6 +2792,16 @@ static HitId hit_test(UiState *ui, const Layout *L, double x, double y) {
         if (pt_in_rect(x, y, L->act_copy)) return HIT_ACT_COPY_URL;
         if (ui->desc_max_scroll > 0.0 && pt_in_rect(x, y, L->desc_scrollbar)) {
             return HIT_DESC_SCROLLBAR;
+        }
+        if (pt_in_rect(x, y, L->desc_area)) {
+            desc_links_ensure_rects(ui, L);
+            TtRectF area = {L->desc_area.x, L->desc_area.y, L->desc_area.w, L->desc_area.h};
+            ssize_t link = tt_desc_link_hit(ui->desc_link_rects, ui->desc_link_rect_count,
+                                            area, ui->desc_scroll_y, x, y);
+            if (link >= 0) {
+                ui->hover_desc_link = link;
+                return HIT_DESC_LINK;
+            }
         }
         return HIT_RIGHT_PANE;
     }
@@ -2783,6 +2874,7 @@ static TtCursorShape cursor_for_hit(const UiState *ui, HitId h) {
         case HIT_ACT_COPY_URL:
         case HIT_CTX_ITEM:
         case HIT_HELP_CLOSE:
+        case HIT_DESC_LINK:
             return TT_CURSOR_POINTER;
         case HIT_ACT_DOWNLOAD: {
             const MediaItem *it = ui_get_detail_item(ui);
@@ -2883,6 +2975,7 @@ void ui_on_pointer_leave(void *ctx) {
     UiState *ui = ctx;
     ui->hover_id = HIT_NONE;
     ui->hover_idx = -1;
+    ui->hover_desc_link = -1;
     ui->ctx_menu.hover_idx = -1;
     wayland_request_redraw(ui->wl);
 }
@@ -2912,9 +3005,32 @@ static void copy_item_field(UiState *ui, int which) {
     }
 }
 
+static void open_desc_link(UiState *ui) {
+    const MediaItem *it = ui_get_detail_item(ui);
+    const char *desc = media_item_display_description_for(it, ui->cfg->original_titles);
+    if (!desc || !desc[0] || ui->hover_desc_link < 0 ||
+        (size_t)ui->hover_desc_link >= ui->desc_link_count) {
+        return;
+    }
+    char url[2048];
+    TtTextSpan span = ui->desc_link_spans[ui->hover_desc_link];
+    if (!tt_url_from_span(desc, span, url, sizeof(url))) return;
+    char err[256] = {0};
+    if (!tt_open_url(url, err, sizeof(err))) {
+        ui_set_status(ui, "Could not open link: %s", err[0] ? err : "unknown error");
+    }
+}
+
 static void select_list_row(UiState *ui, size_t idx) {
     if (idx >= ui->list.count) return;
     bool changed = ((ssize_t)idx != ui->selected_idx);
+    if (changed) {
+        ui->desc_link_count = 0;
+        ui->desc_link_rect_count = 0;
+        free(ui->desc_link_cache_text);
+        ui->desc_link_cache_text = NULL;
+        ui->hover_desc_link = -1;
+    }
     ui->selected_idx = (ssize_t)idx;
     const MediaItem *it = &ui->list.items[idx];
     if (changed) {
@@ -3251,6 +3367,9 @@ void ui_on_pointer_button(void *ctx, TtMouseButton btn, bool pressed,
             break;
         case HIT_ACT_COPY_URL:
             copy_item_field(ui, 0);
+            break;
+        case HIT_DESC_LINK:
+            open_desc_link(ui);
             break;
         case HIT_RIGHT_PANE:
             ui->search_sel_all = false;
