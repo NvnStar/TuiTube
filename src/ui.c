@@ -1478,17 +1478,20 @@ static void desc_links_update_rects(UiState *ui, PangoLayout *layout) {
         if (!line) break;
         int line_start = line->start_index;
         int line_end = line_start + line->length;
-        PangoRectangle logical;
-        pango_layout_iter_get_line_extents(iter, NULL, &logical);
+        int y_units = 0, h_units = 0;
+        pango_layout_iter_get_line_yrange(iter, &y_units, &h_units);
         for (size_t i = 0; i < ui->desc_link_count; i++) {
             TtTextSpan span = ui->desc_link_spans[i];
             if ((int)span.end <= line_start || (int)span.start >= line_end) continue;
-            int local_start = (int)span.start > line_start ? (int)span.start - line_start : 0;
-            int local_end = (int)span.end < line_end ? (int)span.end - line_start : line->length;
-            if (local_end <= local_start) continue;
+            /* Pango's x-range API takes layout-absolute byte indexes, not
+               line-relative ones.  Clamp to this line so a link spanning a
+               wrap boundary produces one rectangle per visual line. */
+            int range_start = (int)span.start > line_start ? (int)span.start : line_start;
+            int range_end = (int)span.end < line_end ? (int)span.end : line_end;
+            if (range_end <= range_start) continue;
             int *ranges = NULL;
             int n_ranges = 0;
-            pango_layout_line_get_x_ranges(line, local_start, local_end, &ranges, &n_ranges);
+            pango_layout_line_get_x_ranges(line, range_start, range_end, &ranges, &n_ranges);
             for (int r = 0; r < n_ranges; r++) {
                 double x1 = (double)ranges[r * 2] / PANGO_SCALE;
                 double x2 = (double)ranges[r * 2 + 1] / PANGO_SCALE;
@@ -1506,9 +1509,9 @@ static void desc_links_update_rects(UiState *ui, PangoLayout *layout) {
                 size_t slot = ui->desc_link_rect_count++;
                 ui->desc_link_rects[slot].rect = (Rect){
                     x1,
-                    (double)logical.y / PANGO_SCALE,
+                    (double)y_units / PANGO_SCALE,
                     x2 - x1,
-                    (double)logical.height / PANGO_SCALE
+                    (double)h_units / PANGO_SCALE
                 };
                 ui->desc_link_rects[slot].link = i;
             }
@@ -1517,6 +1520,67 @@ static void desc_links_update_rects(UiState *ui, PangoLayout *layout) {
         if (!pango_layout_iter_next_line(iter)) break;
     }
     pango_layout_iter_free(iter);
+}
+
+static void desc_layout_apply(UiState *ui, PangoLayout *layout, const char *desc, double text_w) {
+    PangoFontDescription *dd = make_font_desc(ui, 0.95, false);
+    pango_layout_set_font_description(layout, dd);
+    pango_font_description_free(dd);
+    pango_layout_set_text(layout, desc, -1);
+    pango_layout_set_width(layout, (int)(text_w * PANGO_SCALE));
+    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+    pango_layout_set_spacing(layout, (int)(ui->cfg->font_size * 0.35 * PANGO_SCALE));
+    PangoAttrList *attrs = desc_links_attrs(ui);
+    if (attrs) {
+        pango_layout_set_attributes(layout, attrs);
+        pango_attr_list_unref(attrs);
+    }
+}
+
+static double desc_text_width(const UiState *ui, const Layout *L)
+{
+    double pad = SP_LG;
+    double cw = L->right_pane.w - pad * 2.0;
+    double text_w = cw - 12.0;
+    if (text_w < 40.0) text_w = cw;
+    (void)ui;
+    return text_w;
+}
+
+static bool desc_links_ensure_rects(UiState *ui, const Layout *L) {
+    if (!ui || !L) return false;
+    const MediaItem *item = ui_get_detail_item(ui);
+    const char *desc = media_item_display_description(item);
+    if (!desc || !desc[0] || L->desc_area.h <= 10.0) return false;
+
+    desc_links_sync(ui, desc);
+    if (ui->desc_link_count == 0) return false;
+    if (ui->desc_link_rect_count > 0) return true;
+
+    double text_w = desc_text_width(ui, L);
+    if (text_w < 10.0) return false;
+    cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    if (!surf) return false;
+    cairo_t *cr = cairo_create(surf);
+    if (!cr) {
+        cairo_surface_destroy(surf);
+        return false;
+    }
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    if (layout) {
+        desc_layout_apply(ui, layout, desc, text_w);
+        int dw = 0, dh = 0;
+        pango_layout_get_pixel_size(layout, &dw, &dh);
+        ui->desc_max_scroll = (double)dh - L->desc_area.h;
+        if (ui->desc_max_scroll < 0.0) ui->desc_max_scroll = 0.0;
+        if (ui->desc_scroll_y > ui->desc_max_scroll) ui->desc_scroll_y = ui->desc_max_scroll;
+        if (ui->desc_scroll_y < 0.0) ui->desc_scroll_y = 0.0;
+        desc_links_update_rects(ui, layout);
+        g_object_unref(layout);
+    }
+    cairo_destroy(cr);
+    cairo_surface_destroy(surf);
+    return ui->desc_link_rect_count > 0;
 }
 
 static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
@@ -1782,22 +1846,10 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
         desc_links_sync(ui, desc ? desc : "");
         ui->desc_link_rect_count = 0;
         if (desc && desc[0]) {
-            double text_w = cw - 12.0;
-            if (text_w < 40.0) text_w = cw;
+            double text_w = desc_text_width(ui, L);
 
             PangoLayout *dl = pango_cairo_create_layout(cr);
-            PangoFontDescription *dd = make_font_desc(ui, 0.95, false);
-            pango_layout_set_font_description(dl, dd);
-            pango_font_description_free(dd);
-            pango_layout_set_text(dl, desc, -1);
-            pango_layout_set_width(dl, (int)(text_w * PANGO_SCALE));
-            pango_layout_set_wrap(dl, PANGO_WRAP_WORD_CHAR);
-            pango_layout_set_spacing(dl, (int)(ui->cfg->font_size * 0.35 * PANGO_SCALE));
-            PangoAttrList *attrs = desc_links_attrs(ui);
-            if (attrs) {
-                pango_layout_set_attributes(dl, attrs);
-                pango_attr_list_unref(attrs);
-            }
+            desc_layout_apply(ui, dl, desc, text_w);
 
             int dw = 0, dh = 0;
             pango_layout_get_pixel_size(dl, &dw, &dh);
@@ -2774,6 +2826,7 @@ static HitId hit_test(UiState *ui, const Layout *L, double x, double y) {
             return HIT_DESC_SCROLLBAR;
         }
         if (pt_in_rect(x, y, L->desc_area)) {
+            desc_links_ensure_rects(ui, L);
             for (size_t i = ui->desc_link_rect_count; i > 0; i--) {
                 Rect r = ui->desc_link_rects[i - 1].rect;
                 Rect hit_rect = {
