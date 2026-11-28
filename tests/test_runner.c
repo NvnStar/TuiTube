@@ -1968,18 +1968,23 @@ static void test_background_title_patch_is_field_only(void) {
     assert(!media_item_set_original_title(&detail, ""));
     assert(!media_item_set_original_title(NULL, "x"));
 
-    /* A stale detail response merged after the patch must not clobber the
-       newer title/description that were already shown. */
-    MediaItem stale = {0};
-    stale.kind = ITEM_VIDEO;
-    snprintf(stale.id, sizeof(stale.id), "patchVid1");
-    stale.title = tt_strdup("Stale title");
-    stale.description = tt_strdup("Stale description");
-    media_item_merge_details(&detail, &stale);
-    assert(strcmp(detail.title, "Stale title") == 0);
+    /* media_item_merge_details treats its source as the newer, authoritative
+       detail response for localized fields, while preserving a non-empty
+       original when the source has none. Stale-response rejection belongs to
+       the request_gen checks in app_process_async_results(), not this helper. */
+    MediaItem incoming = {0};
+    incoming.kind = ITEM_VIDEO;
+    snprintf(incoming.id, sizeof(incoming.id), "patchVid1");
+    incoming.title = tt_strdup("Newer detail title");
+    incoming.description = tt_strdup("Newer detail description");
+    media_item_merge_details(&detail, &incoming);
+    assert(strcmp(detail.title, "Newer detail title") == 0);
+    assert(strcmp(detail.description, "Newer detail description") == 0);
+    assert(strcmp(detail.original_title, "Late original title") == 0);
+    assert(strcmp(detail.author, "Channel") == 0);
 
     media_item_free_fields(&detail);
-    media_item_free_fields(&stale);
+    media_item_free_fields(&incoming);
 }
 
 static void test_copy_description_gating_and_player_opt_out(void) {
@@ -2038,18 +2043,31 @@ static void test_player_view_hides_resolved_original(void) {
     row.title = tt_strdup("Localized view title");
     row.original_title = tt_strdup("Original view title");
 
-    /* The app hands play hooks a shallow view whose `title` is the displayed
-       title and whose original field is cleared, so an untouched consumer that
-       reads `video->title` still honours the opt-out. */
-    MediaItem view = row;
-    view.title = (char *)media_item_display_title_for(&row, false);
-    view.original_title = NULL;
+    /* The production helper hands play hooks a shallow view whose `title` is
+       the displayed title and whose original field is cleared, so an untouched
+       consumer that reads `video->title` still honours the opt-out. */
+    MediaItem view;
+    player_make_play_view(&row, false, &view);
+    assert(view.title == row.title);
+    assert(view.original_title == NULL);
     assert(strcmp(view.title, "Localized view title") == 0);
     assert(strcmp(player_video_title(&view), "Localized view title") == 0);
+    assert(strcmp(row.original_title, "Original view title") == 0);
 
-    view.title = (char *)media_item_display_title_for(&row, true);
+    player_make_play_view(&row, true, &view);
+    assert(view.title == row.original_title);
+    assert(view.original_title == NULL);
     assert(strcmp(view.title, "Original view title") == 0);
     assert(strcmp(player_video_title(&view), "Original view title") == 0);
+    assert(strcmp(row.original_title, "Original view title") == 0);
+
+    memset(&view, 0x7f, sizeof(view));
+    player_make_play_view(NULL, true, &view);
+    assert(view.kind == ITEM_VIDEO);
+    assert(view.id[0] == '\0');
+    assert(view.title == NULL);
+    assert(view.original_title == NULL);
+    player_make_play_view(&row, true, NULL);
 
     media_item_free_fields(&row);
 }
@@ -2185,6 +2203,16 @@ static void test_original_description_and_url_links(void) {
     assert(tt_url_from_span(shortener, spans[1], url, sizeof(url)));
     assert(strcmp(url, "https://t.co/x") == 0);
 
+    const char *filenames =
+        "README.md (README.md) config.json Node.js libfoo.so image.png www.foo";
+    assert(tt_find_url_spans(filenames, spans, 8) == 0);
+
+    const char *explicit_file = "https://README.md";
+    n = tt_find_url_spans(explicit_file, spans, 8);
+    assert(n == 1);
+    assert(tt_url_from_span(explicit_file, spans[0], url, sizeof(url)));
+    assert(strcmp(url, "https://README.md") == 0);
+
     TtTextSpan none[4];
     assert(tt_find_url_spans("mail me at a@b.com or ftp://x", none, 4) == 0);
     const char *caps = "HTTP://Example.COM/path";
@@ -2198,6 +2226,48 @@ static void test_original_description_and_url_links(void) {
     assert(!tt_open_url("javascript:alert(1)", err, sizeof(err)));
     assert(!tt_open_url("https://exa mple.com", err, sizeof(err)));
     assert(!tt_open_url("", err, sizeof(err)));
+}
+
+static void test_url_scan_long_token(void) {
+    enum { LONG_TOKEN_BYTES = 64 * 1024 };
+    char *long_token = malloc((size_t)LONG_TOKEN_BYTES + 1);
+    assert(long_token);
+    for (size_t i = 0; i < LONG_TOKEN_BYTES; i++) {
+        long_token[i] = (i % 2 == 0) ? 'a' : ',';
+    }
+    long_token[LONG_TOKEN_BYTES] = '\0';
+
+    TtTextSpan spans[4];
+    assert(tt_find_url_spans(long_token, spans, 4) == 0);
+
+    char *with_url = tt_asprintf("%s https://example.com/ok", long_token);
+    assert(with_url);
+    size_t n = tt_find_url_spans(with_url, spans, 4);
+    assert(n == 1);
+    char url[64];
+    assert(tt_url_from_span(with_url, spans[0], url, sizeof(url)));
+    assert(strcmp(url, "https://example.com/ok") == 0);
+    free(with_url);
+    free(long_token);
+
+    char explicit_url[400];
+    size_t pos = (size_t)snprintf(explicit_url, sizeof(explicit_url),
+                                  "https://example.com/");
+    while (pos < 300) explicit_url[pos++] = 'a';
+    explicit_url[pos] = '\0';
+    n = tt_find_url_spans(explicit_url, spans, 4);
+    assert(n == 1);
+    assert(spans[0].start == 0);
+    assert(spans[0].end == strlen(explicit_url));
+
+    enum { CAP_BYTES = 2048 };
+    char *at_cap = malloc(CAP_BYTES + 1);
+    assert(at_cap);
+    size_t prefix = (size_t)snprintf(at_cap, CAP_BYTES + 1, "https://example.com/");
+    memset(at_cap + prefix, 'a', CAP_BYTES - prefix);
+    at_cap[CAP_BYTES] = '\0';
+    assert(tt_find_url_spans(at_cap, spans, 4) == 1);
+    free(at_cap);
 }
 
 static void test_url_link_rect_geometry(void) {
@@ -2757,6 +2827,7 @@ int main(void) {
     RUN_TEST(test_original_titles);
     RUN_TEST(test_original_title_detail_merge);
     RUN_TEST(test_original_description_and_url_links);
+    RUN_TEST(test_url_scan_long_token);
     RUN_TEST(test_original_opt_out_display_and_merge);
     RUN_TEST(test_background_title_patch_is_field_only);
     RUN_TEST(test_copy_description_gating_and_player_opt_out);

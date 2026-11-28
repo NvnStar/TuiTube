@@ -528,6 +528,17 @@ const char *player_video_title_for(const MediaItem *video, bool use_original) {
     return (title && title[0]) ? title : video->id;
 }
 
+void player_make_play_view(const MediaItem *video, bool use_original, MediaItem *out) {
+    if (!out) return;
+    if (!video) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    *out = *video;
+    out->title = (char *)media_item_display_title_for(video, use_original);
+    out->original_title = NULL;
+}
+
 const char *player_video_title(const MediaItem *video) {
     return player_video_title_for(video, true);
 }

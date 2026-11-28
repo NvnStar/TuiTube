@@ -423,12 +423,13 @@ static void submit_original_title_job(AppState *app, const char *video_id, uint6
                            free_original_title_res);
 }
 
-static void enqueue_original_title_jobs(AppState *app) {
+static void enqueue_original_title_jobs_from(AppState *app, size_t start) {
     if (!app || !app->cfg.original_titles || !app->ui) return;
     MediaList *list = ui_get_list(app->ui);
     if (!list) return;
+    if (start >= list->count) return;
     size_t queued = 0;
-    for (size_t i = 0; i < list->count && queued < ORIGINAL_TITLE_LIST_CAP; i++) {
+    for (size_t i = start; i < list->count && queued < ORIGINAL_TITLE_LIST_CAP; i++) {
         MediaItem *it = &list->items[i];
         if (it->kind == ITEM_VIDEO && it->id[0] &&
             (!it->original_title || !it->original_title[0])) {
@@ -636,9 +637,9 @@ static void cb_show_favorites(void *ctx) {
         media_list_append_move(&ml, &it);
     }
     ui_set_list(app->ui, &ml, false);
-    enqueue_original_title_jobs(app);
     sync_ui_nav(app);
     sync_selected_item_details(app);
+    enqueue_original_title_jobs_from(app, 0);
     ui_set_status(app->ui, "Favorites (%zu items)", app->favs.count);
 }
 
@@ -708,9 +709,9 @@ static void cb_show_history(void *ctx) {
         media_list_append_move(&ml, &it);
     }
     ui_set_list(app->ui, &ml, false);
-    enqueue_original_title_jobs(app);
     sync_ui_nav(app);
     sync_selected_item_details(app);
+    enqueue_original_title_jobs_from(app, 0);
     ui_set_status(app->ui, "History (%zu videos)", app->history.count);
 }
 
@@ -737,16 +738,6 @@ static bool is_vlc_player_name(const char *player_path) {
     return tt_strcasecmp(base, "vlc") == 0 || tt_strcasecmp(base, "vlc.exe") == 0;
 }
 
-/* Play hooks only read id/title fields. Expose the display title as `title` so
-   the play hook (including the untouched mpv plugin) honours the config flag,
-   and hide the resolved original so no caller can double-apply it. */
-static MediaItem play_item_for_config(const MediaItem *it, bool original_titles) {
-    MediaItem view = *it;
-    view.title = (char *)media_item_display_title_for(it, original_titles);
-    view.original_title = NULL;
-    return view;
-}
-
 static void cb_activate_item(void *ctx, size_t index) {
     AppState *app = ctx;
     MediaList *ml = ui_get_list(app->ui);
@@ -754,7 +745,8 @@ static void cb_activate_item(void *ctx, size_t index) {
     MediaItem *it = &ml->items[index];
 
     if (it->kind == ITEM_VIDEO) {
-        MediaItem playback = play_item_for_config(it, app->cfg.original_titles);
+        MediaItem playback;
+        player_make_play_view(it, app->cfg.original_titles, &playback);
         char err[256] = {0};
         if (app->play_fn && app->play_fn(app->play_ctx, &app->cfg, &playback, err, sizeof(err))) {
             const char *pname = app->player_label[0]
@@ -1144,11 +1136,16 @@ void app_process_async_results(AppState *app) {
                 ui_set_busy(app->ui, false);
                 if (lr->ok) {
                     ui_set_error(app->ui, NULL);
+                    size_t title_start = 0;
+                    if (lr->append) {
+                        MediaList *cur = ui_get_list(app->ui);
+                        if (cur) title_start = cur->count;
+                    }
                     ui_set_list(app->ui, &lr->list, lr->append);
                     if (!lr->append) {
                         sync_selected_item_details(app);
                     }
-                    enqueue_original_title_jobs(app);
+                    enqueue_original_title_jobs_from(app, title_start);
                     ui_set_status(app->ui, "Loaded %zu items", ui_get_list(app->ui)->count);
                 } else {
                     const char *emsg = lr->error[0] ? lr->error : "Request failed";
@@ -1209,11 +1206,16 @@ void app_process_async_results(AppState *app) {
                     ui_set_busy(app->ui, false);
                     if (nr->ok) {
                         ui_set_error(app->ui, NULL);
+                        size_t title_start = 0;
+                        if (nr->append) {
+                            MediaList *cur = ui_get_list(app->ui);
+                            if (cur) title_start = cur->count;
+                        }
                         ui_set_list(app->ui, &nr->recommended, nr->append);
                         if (!nr->append && nr->details.id[0]) {
                             ui_set_detail_item(app->ui, &nr->details);
                         }
-                        enqueue_original_title_jobs(app);
+                        enqueue_original_title_jobs_from(app, title_start);
                         ui_set_status(app->ui, "Loaded %zu recommended videos",
                                       ui_get_list(app->ui)->count);
                     } else {
@@ -1257,7 +1259,7 @@ void app_process_async_results(AppState *app) {
                         ui_set_list(app->ui, &rr->list, false);
                         sync_ui_nav(app);
                         sync_selected_item_details(app);
-                        enqueue_original_title_jobs(app);
+                        enqueue_original_title_jobs_from(app, 0);
                         ui_set_status(app->ui, "Loaded %zu items", ui_get_list(app->ui)->count);
                     }
                 } else {

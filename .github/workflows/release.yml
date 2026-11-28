@@ -258,7 +258,7 @@ jobs:
 
           ### What's New
           - **Original titles and descriptions:** `original_titles` (default `true`) restores the uploader's original title **and** the selected video's description from neutral `youtubei/v1/player` metadata, with locale-translated text kept as a silent fallback. Setting it to `false` suppresses originals everywhere, including after detail refresh and in History/Favorites.
-          - **Clickable description links:** plain HTTP(S), `www.`, and conservative bare-domain URLs in the detail description are underlined; clicking one opens the default browser. Unsupported schemes and truncated `...` links are ignored.
+          - **Clickable description links:** plain HTTP(S), `www.`, and conservative bare-domain URLs in the detail description are underlined; clicking one opens the default browser. Bare domains are limited to a curated set of common TLDs, and unbroken tokens longer than 2048 bytes are not linkified. Unsupported schemes and truncated `...` links are ignored.
           - **Copy Description** copies the description exactly as displayed (original when available, otherwise localized), and description scrolling/link hit-testing stays aligned.
 
           > [!NOTE]

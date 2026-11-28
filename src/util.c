@@ -2112,11 +2112,25 @@ static bool url_ascii_label(const char *s, size_t len) {
 }
 
 static bool url_tld_ok(const char *s, size_t len) {
+    static const char *const tlds[] = {
+        "com", "org", "net", "edu", "gov", "mil", "int",
+        "io", "dev", "app", "ai", "co", "me", "tv",
+        "info", "biz", "xyz", "online", "site", "store",
+        "blog", "cloud", "tech", "news", "live", "link",
+        "be", "ly", "us", "uk", "de", "fr", "es", "it",
+        "nl", "se", "no", "fi", "dk", "pl", "cz", "at",
+        "ch", "ie", "pt", "gr", "ro", "hu", "ca", "au",
+        "nz", "jp", "kr", "cn", "tw", "hk", "sg", "my",
+        "id", "th", "vn", "ph", "in", "ru", "ua", "tr",
+        "il", "ae", "sa", "za", "br", "mx", "ar", "cl",
+    };
     if (len < 2 || len > 24) return false;
-    for (size_t i = 0; i < len; i++) {
-        if (!isalpha((unsigned char)s[i])) return false;
+    for (size_t i = 0; i < sizeof(tlds) / sizeof(tlds[0]); i++) {
+        if (strlen(tlds[i]) == len && tt_strncasecmp(s, tlds[i], len) == 0) {
+            return true;
+        }
     }
-    return true;
+    return false;
 }
 
 static bool url_bare_host_ok(const char *host, size_t len) {
@@ -2224,6 +2238,8 @@ static bool url_token_is_truncated(const char *text, size_t start, size_t end) {
     return end >= start + 3 && memcmp(text + end - 3, "...", 3) == 0;
 }
 
+#define URL_TOKEN_MAX_BYTES 2048
+
 size_t tt_find_url_spans(const char *text, TtTextSpan *out, size_t max) {
     if (!text || !out || max == 0) return 0;
     size_t len = strlen(text);
@@ -2244,6 +2260,10 @@ size_t tt_find_url_spans(const char *text, TtTextSpan *out, size_t max) {
 
         size_t end = i;
         while (end < len && !url_char_is_space_or_control((unsigned char)text[end])) end++;
+        if (end - i > URL_TOKEN_MAX_BYTES) {
+            i = end - 1;
+            continue;
+        }
         if (url_token_is_truncated(text, i, end)) continue;
         end = url_trim_end(text, i, end);
         if (end > i && url_validate_token(text, i, end, explicit_scheme)) {

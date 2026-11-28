@@ -30,6 +30,9 @@ bool player_map_video_format(const char *video_format, bool allow_hdr, bool all_
 
 const char *player_video_title(const MediaItem *video);
 const char *player_video_title_for(const MediaItem *video, bool use_original);
+/* Builds a shallow, borrowed-string view for play hooks: `title` is the
+   displayed title and `original_title` is cleared. Do not free its fields. */
+void player_make_play_view(const MediaItem *video, bool use_original, MediaItem *out);
 bool player_build_title_args(const MediaItem *video, char **out_mpv, char **out_vlc);
 bool player_build_title_args_for(const MediaItem *video, bool use_original,
                                  char **out_mpv, char **out_vlc);
