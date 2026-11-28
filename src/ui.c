@@ -1695,10 +1695,24 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
     bool has_author_link = (item->author && item->author[0]) &&
                            ((item->author_id && item->author_id[0]) || item->kind == ITEM_CHANNEL);
     if (item->author && item->author[0]) {
-        double aw = 0.0, ah = 0.0;
-        measure_text_size(ui, item->author, 0.95, PANGO_WEIGHT_SEMIBOLD, &aw, &ah);
-        double pill_w = fmin(cw, aw + (has_author_link ? 14.0 : 0.0));
-        double pill_h = fmax(line_h, ah + 4.0);
+        /* Measure with the same Cairo/Pango context that draws the text.
+           The shared measurement layout can differ slightly from the scaled
+           render context, which makes Pango ellipsize a name that fits. */
+        PangoLayout *al = pango_cairo_create_layout(cr);
+        PangoFontDescription *ad = make_font_desc_w(ui, 0.95, PANGO_WEIGHT_BOLD);
+        pango_layout_set_font_description(al, ad);
+        pango_font_description_free(ad);
+        pango_layout_set_text(al, item->author, -1);
+        pango_layout_set_width(al, -1);
+        pango_layout_set_single_paragraph_mode(al, TRUE);
+        int aw = 0, ah = 0;
+        pango_layout_get_pixel_size(al, &aw, &ah);
+
+        double pad_x = has_author_link ? 7.0 : 0.0;
+        double needed_w = (double)aw + pad_x * 2.0 + 1.0;
+        double pill_w = fmin(cw, needed_w);
+        double pill_h = fmax(line_h, (double)ah + 4.0);
+        bool fits = needed_w <= cw;
         if (has_author_link) {
             Rect ar = {meta_x, y, pill_w, pill_h};
             L->detail_author = ar;
@@ -1706,9 +1720,19 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
             draw_rounded_rect(cr, ar, 4.0);
             set_cairo_color(cr, ahot ? t->elem_hover.bg : t->elem_normal.bg, ahot ? 1.0 : 0.85);
             cairo_fill(cr);
-            draw_text_line(cr, ui, item->author, ar.x + 7.0, ar.y, ar.w - 14.0, ar.h,
-                           ahot ? t->elem_hover.fg : t->elem_normal.fg, 1.0, 0.95,
-                           true, PANGO_ALIGN_LEFT, true);
+
+            if (!fits) {
+                pango_layout_set_width(al, (int)((ar.w - pad_x * 2.0) * PANGO_SCALE));
+                pango_layout_set_ellipsize(al, PANGO_ELLIPSIZE_END);
+            }
+            int lw = 0, lh = 0;
+            pango_layout_get_pixel_size(al, &lw, &lh);
+            double ty = ar.y + (ar.h - lh) * 0.5;
+            set_cairo_color(cr, ahot ? t->elem_hover.fg : t->elem_normal.fg, 1.0);
+            cairo_move_to(cr, ar.x + pad_x, ty);
+            pango_cairo_show_layout(cr, al);
+            cairo_new_path(cr);
+
             if (ahot) {
                 set_cairo_color(cr, t->elem_selected.bg, 0.9);
                 cairo_set_line_width(cr, 1.0);
@@ -1717,9 +1741,19 @@ static void render_right_pane(UiState *ui, cairo_t *cr, Layout *L) {
                 cairo_stroke(cr);
             }
         } else {
-            draw_text_line(cr, ui, item->author, meta_x, y, pill_w, pill_h,
-                           t->text_normal.fg, 0.88, 0.95, true, PANGO_ALIGN_LEFT, true);
+            if (!fits) {
+                pango_layout_set_width(al, (int)(pill_w * PANGO_SCALE));
+                pango_layout_set_ellipsize(al, PANGO_ELLIPSIZE_END);
+            }
+            int lw = 0, lh = 0;
+            pango_layout_get_pixel_size(al, &lw, &lh);
+            double ty = y + (pill_h - lh) * 0.5;
+            set_cairo_color(cr, t->text_normal.fg, 0.88);
+            cairo_move_to(cr, meta_x, ty);
+            pango_cairo_show_layout(cr, al);
+            cairo_new_path(cr);
         }
+        g_object_unref(al);
         meta_x += pill_w + SP_SM;
         line_h = pill_h;
     }
