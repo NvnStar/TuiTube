@@ -57,9 +57,25 @@ typedef struct {
     size_t end;
 } TtTextSpan;
 
+typedef struct {
+    double x;
+    double y;
+    double w;
+    double h;
+} TtRectF;
+
+typedef struct {
+    TtRectF rect;
+    size_t link;
+} TtLinkRect;
+
 size_t tt_find_url_spans(const char *text, TtTextSpan *out, size_t max);
 bool tt_url_from_span(const char *text, TtTextSpan span, char *out, size_t out_cap);
 bool tt_open_url(const char *url, char *err_buf, size_t err_cap);
+
+struct _PangoLayout;
+size_t tt_layout_link_rects(struct _PangoLayout *layout, const TtTextSpan *spans,
+                            size_t span_count, TtLinkRect *out, size_t max);
 
 bool tt_parse_age_seconds(const char *spec, int64_t *out_seconds);
 bool tt_parse_iso8601_utc(const char *s, int64_t *out_epoch);

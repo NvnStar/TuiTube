@@ -8,6 +8,7 @@
 
 #include <assert.h>
 #include <math.h>
+#include <pango/pangocairo.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1980,6 +1981,85 @@ static void test_original_description_and_url_links(void) {
     assert(!tt_open_url("", err, sizeof(err)));
 }
 
+static void test_url_link_rect_geometry(void) {
+    const char *text =
+        "Line one with a link https://example.com/path here and more wrapping words to force "
+        "a second visual line with www.youtube.com/@chan too.";
+    TtTextSpan spans[8];
+    size_t span_count = tt_find_url_spans(text, spans, 8);
+    assert(span_count == 2);
+
+    /* Use a private font map/context so Pango's global default map (and its
+       fontconfig caches) is never created inside the sanitizer run. */
+    PangoFontMap *fm = pango_cairo_font_map_new();
+    assert(fm != NULL);
+    PangoContext *ctx = pango_font_map_create_context(fm);
+    assert(ctx != NULL);
+    PangoLayout *layout = pango_layout_new(ctx);
+    assert(layout != NULL);
+
+    PangoFontDescription *fd = pango_font_description_new();
+    pango_font_description_set_family(fd, "Sans");
+    pango_font_description_set_absolute_size(fd, 13.0 * PANGO_SCALE);
+    pango_layout_set_font_description(layout, fd);
+    pango_font_description_free(fd);
+    pango_layout_set_text(layout, text, -1);
+    pango_layout_set_width(layout, (int)(420 * PANGO_SCALE));
+    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+
+    TtLinkRect rects[16];
+    size_t rect_count = tt_layout_link_rects(layout, spans, span_count, rects, 16);
+    assert(rect_count > 0);
+
+    /* Every rectangle must be a plausible, positive-size hit target. */
+    for (size_t i = 0; i < rect_count; i++) {
+        assert(rects[i].link < span_count);
+        assert(rects[i].rect.w > 0.5);
+        assert(rects[i].rect.h > 0.5);
+    }
+
+    /* Both links must produce at least one rectangle. */
+    bool seen[2] = {false, false};
+    for (size_t i = 0; i < rect_count; i++) seen[rects[i].link] = true;
+    assert(seen[0] && seen[1]);
+
+    /*
+     * Regression guard against passing line-relative byte indexes to Pango.
+     * That bug is invisible on the first visual line (line_start == 0), so the
+     * assertion must target a link that begins on a later line and wraps.
+     * Cross-check every rectangle against Pango's own index-to-position
+     * oracle for the first byte of its link.
+     */
+    for (size_t i = 0; i < rect_count; i++) {
+        const TtTextSpan *span = &spans[rects[i].link];
+        PangoRectangle pos;
+        pango_layout_index_to_pos(layout, (int)span->start, &pos);
+        double want_x = (double)pos.x / PANGO_SCALE;
+        double want_y = (double)pos.y / PANGO_SCALE;
+        /* Only the first rectangle of each link starts at the link's first byte. */
+        bool first_of_link = true;
+        for (size_t j = 0; j < i; j++) {
+            if (rects[j].link == rects[i].link) first_of_link = false;
+        }
+        if (first_of_link) {
+            assert(fabs(rects[i].rect.x - want_x) < 2.0);
+            assert(fabs(rects[i].rect.y - want_y) < 2.0);
+        }
+    }
+
+    /* The second link begins on a later line; a line-relative index bug moves
+       it away from the oracle position measured above. */
+    size_t link_one_rects = 0;
+    for (size_t i = 0; i < rect_count; i++) {
+        if (rects[i].link == 1) link_one_rects++;
+    }
+    assert(link_one_rects >= 2);
+
+    g_object_unref(layout);
+    g_object_unref(ctx);
+    g_object_unref(fm);
+}
+
 static void test_history_original_title_roundtrip(void) {
     HistoryList hl;
     history_init(&hl);
@@ -2447,6 +2527,7 @@ int main(void) {
     RUN_TEST(test_original_titles);
     RUN_TEST(test_original_title_detail_merge);
     RUN_TEST(test_original_description_and_url_links);
+    RUN_TEST(test_url_link_rect_geometry);
     RUN_TEST(test_history_original_title_roundtrip);
     RUN_TEST(test_player_original_title_selection);
     RUN_TEST(test_non_english_lockup_and_badges);

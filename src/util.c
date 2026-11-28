@@ -11,6 +11,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <pango/pango-layout.h>
+
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
@@ -2272,6 +2274,61 @@ bool tt_url_from_span(const char *text, TtTextSpan span, char *out, size_t out_c
 
 static void set_url_error(char *err_buf, size_t err_cap, const char *msg) {
     if (err_buf && err_cap > 0) snprintf(err_buf, err_cap, "%s", msg ? msg : "Browser launch failed");
+}
+
+size_t tt_layout_link_rects(struct _PangoLayout *layout, const TtTextSpan *spans,
+                            size_t span_count, TtLinkRect *out, size_t max) {
+    if (!layout || !spans || !out || span_count == 0 || max == 0) return 0;
+
+    size_t count = 0;
+    PangoLayoutIter *iter = pango_layout_get_iter(layout);
+    if (!iter) return 0;
+    for (;;) {
+        PangoLayoutLine *line = pango_layout_iter_get_line_readonly(iter);
+        if (!line) break;
+        int line_start = line->start_index;
+        int line_end = line_start + line->length;
+        int y_units = 0, h_units = 0;
+        pango_layout_iter_get_line_yrange(iter, &y_units, &h_units);
+        for (size_t i = 0; i < span_count; i++) {
+            TtTextSpan span = spans[i];
+            if ((int)span.end <= line_start || (int)span.start >= line_end) continue;
+            /* Pango's x-range API takes layout-absolute byte indexes, not
+               line-relative ones.  Clamp to this line so a link spanning a
+               wrap boundary produces one rectangle per visual line. */
+            int range_start = (int)span.start > line_start ? (int)span.start : line_start;
+            int range_end = (int)span.end < line_end ? (int)span.end : line_end;
+            if (range_end <= range_start) continue;
+            int *ranges = NULL;
+            int n_ranges = 0;
+            pango_layout_line_get_x_ranges(line, range_start, range_end, &ranges, &n_ranges);
+            for (int r = 0; r < n_ranges; r++) {
+                double x1 = (double)ranges[r * 2] / PANGO_SCALE;
+                double x2 = (double)ranges[r * 2 + 1] / PANGO_SCALE;
+                if (x2 < x1) {
+                    double t = x1;
+                    x1 = x2;
+                    x2 = t;
+                }
+                if (x2 - x1 < 0.5) continue;
+                if (count >= max) {
+                    g_free(ranges);
+                    pango_layout_iter_free(iter);
+                    return count;
+                }
+                out[count].rect.x = x1;
+                out[count].rect.y = (double)y_units / PANGO_SCALE;
+                out[count].rect.w = x2 - x1;
+                out[count].rect.h = (double)h_units / PANGO_SCALE;
+                out[count].link = i;
+                count++;
+            }
+            g_free(ranges);
+        }
+        if (!pango_layout_iter_next_line(iter)) break;
+    }
+    pango_layout_iter_free(iter);
+    return count;
 }
 
 bool tt_open_url(const char *url, char *err_buf, size_t err_cap) {

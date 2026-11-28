@@ -196,10 +196,7 @@ struct UiState {
     double desc_max_scroll;
     TtTextSpan desc_link_spans[64];
     size_t desc_link_count;
-    struct {
-        Rect rect;
-        size_t link;
-    } desc_link_rects[512];
+    TtLinkRect desc_link_rects[512];
     size_t desc_link_rect_count;
     char *desc_link_cache_text;
     ssize_t hover_desc_link;
@@ -1470,56 +1467,10 @@ static PangoAttrList *desc_links_attrs(const UiState *ui) {
 static void desc_links_update_rects(UiState *ui, PangoLayout *layout) {
     ui->desc_link_rect_count = 0;
     if (!ui || !layout || ui->desc_link_count == 0) return;
-
-    PangoLayoutIter *iter = pango_layout_get_iter(layout);
-    if (!iter) return;
-    for (;;) {
-        PangoLayoutLine *line = pango_layout_iter_get_line_readonly(iter);
-        if (!line) break;
-        int line_start = line->start_index;
-        int line_end = line_start + line->length;
-        int y_units = 0, h_units = 0;
-        pango_layout_iter_get_line_yrange(iter, &y_units, &h_units);
-        for (size_t i = 0; i < ui->desc_link_count; i++) {
-            TtTextSpan span = ui->desc_link_spans[i];
-            if ((int)span.end <= line_start || (int)span.start >= line_end) continue;
-            /* Pango's x-range API takes layout-absolute byte indexes, not
-               line-relative ones.  Clamp to this line so a link spanning a
-               wrap boundary produces one rectangle per visual line. */
-            int range_start = (int)span.start > line_start ? (int)span.start : line_start;
-            int range_end = (int)span.end < line_end ? (int)span.end : line_end;
-            if (range_end <= range_start) continue;
-            int *ranges = NULL;
-            int n_ranges = 0;
-            pango_layout_line_get_x_ranges(line, range_start, range_end, &ranges, &n_ranges);
-            for (int r = 0; r < n_ranges; r++) {
-                double x1 = (double)ranges[r * 2] / PANGO_SCALE;
-                double x2 = (double)ranges[r * 2 + 1] / PANGO_SCALE;
-                if (x2 < x1) {
-                    double t = x1;
-                    x1 = x2;
-                    x2 = t;
-                }
-                if (x2 - x1 < 0.5) continue;
-                if (ui->desc_link_rect_count >= sizeof(ui->desc_link_rects) / sizeof(ui->desc_link_rects[0])) {
-                    g_free(ranges);
-                    pango_layout_iter_free(iter);
-                    return;
-                }
-                size_t slot = ui->desc_link_rect_count++;
-                ui->desc_link_rects[slot].rect = (Rect){
-                    x1,
-                    (double)y_units / PANGO_SCALE,
-                    x2 - x1,
-                    (double)h_units / PANGO_SCALE
-                };
-                ui->desc_link_rects[slot].link = i;
-            }
-            g_free(ranges);
-        }
-        if (!pango_layout_iter_next_line(iter)) break;
-    }
-    pango_layout_iter_free(iter);
+    ui->desc_link_rect_count = tt_layout_link_rects(
+        layout, ui->desc_link_spans, ui->desc_link_count,
+        ui->desc_link_rects,
+        sizeof(ui->desc_link_rects) / sizeof(ui->desc_link_rects[0]));
 }
 
 static void desc_layout_apply(UiState *ui, PangoLayout *layout, const char *desc, double text_w) {
@@ -2828,7 +2779,7 @@ static HitId hit_test(UiState *ui, const Layout *L, double x, double y) {
         if (pt_in_rect(x, y, L->desc_area)) {
             desc_links_ensure_rects(ui, L);
             for (size_t i = ui->desc_link_rect_count; i > 0; i--) {
-                Rect r = ui->desc_link_rects[i - 1].rect;
+                TtRectF r = ui->desc_link_rects[i - 1].rect;
                 Rect hit_rect = {
                     L->desc_area.x + r.x,
                     L->desc_area.y - ui->desc_scroll_y + r.y,
