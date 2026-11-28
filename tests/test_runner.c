@@ -1812,6 +1812,142 @@ static void test_copy_description_gating_and_player_opt_out(void) {
     media_item_free_fields(&item);
 }
 
+static void test_original_description_and_url_links(void) {
+    char title[128];
+    char *desc = NULL;
+    const char *player =
+        "{\"videoDetails\":{\"title\":\"Vinh Xo goc\","
+        "\"shortDescription\":\"Dong 1\\nXem https://youtube.com/@VinhXo (nguon).\"}}";
+    assert(innertube_parse_player_metadata_json(player, strlen(player), title, sizeof(title), &desc));
+    assert(strcmp(title, "Vinh Xo goc") == 0);
+    assert(desc && strcmp(desc, "Dong 1\nXem https://youtube.com/@VinhXo (nguon).") == 0);
+    free(desc);
+    desc = NULL;
+
+    const char *desc_only =
+        "{\"videoDetails\":{\"title\":\"\",\"shortDescription\":\"Only description\"}}";
+    assert(innertube_parse_player_metadata_json(desc_only, strlen(desc_only), title,
+                                                sizeof(title), &desc));
+    assert(title[0] == '\0');
+    assert(desc && strcmp(desc, "Only description") == 0);
+    free(desc);
+    desc = NULL;
+
+    const char *no_details = "{\"playabilityStatus\":{\"status\":\"OK\"}}";
+    assert(!innertube_parse_player_metadata_json(no_details, strlen(no_details), title,
+                                                 sizeof(title), &desc));
+    assert(desc == NULL);
+    const char *empty_meta = "{\"videoDetails\":{\"title\":\"\",\"shortDescription\":\"\"}}";
+    assert(!innertube_parse_player_metadata_json(empty_meta, strlen(empty_meta), title,
+                                                 sizeof(title), &desc));
+    assert(desc == NULL);
+    const char *malformed = "{\"videoDetails\":";
+    assert(!innertube_parse_player_metadata_json(malformed, strlen(malformed), title,
+                                                 sizeof(title), &desc));
+    assert(desc == NULL);
+}
+
+static void test_history_original_title_roundtrip(void) {
+    HistoryList hl;
+    history_init(&hl);
+
+    MediaItem v = {0};
+    v.kind = ITEM_VIDEO;
+    snprintf(v.id, sizeof(v.id), "histOrig01");
+    v.title = tt_strdup("Localized history title");
+    v.original_title = tt_strdup("Original history title");
+    v.author = tt_strdup("History Channel");
+    assert(history_record(&hl, &v, 1234));
+
+    char hist_path[PATH_MAX];
+    test_make_temp_file("tuitube_test_hist_orig.json", hist_path, sizeof(hist_path));
+    assert(history_save(&hl, hist_path));
+    history_free(&hl);
+
+    history_init(&hl);
+    assert(history_load(&hl, hist_path));
+    assert(hl.count == 1);
+    assert(strcmp(hl.items[0].title, "Localized history title") == 0);
+    assert(hl.items[0].original_title &&
+           strcmp(hl.items[0].original_title, "Original history title") == 0);
+    history_free(&hl);
+    test_unlink_file(hist_path);
+
+    /* Backward compatibility: files without original_title still load. */
+    const char *legacy =
+        "[\n"
+        "  {\"video_id\":\"legacy01\",\"title\":\"Legacy title\",\"author\":\"Old\"}\n"
+        "]\n";
+    assert(tt_write_file_atomic(hist_path, legacy, strlen(legacy)));
+    history_init(&hl);
+    assert(history_load(&hl, hist_path));
+    assert(hl.count == 1 && strcmp(hl.items[0].title, "Legacy title") == 0);
+    assert(hl.items[0].original_title && hl.items[0].original_title[0] == '\0');
+    history_free(&hl);
+
+    /* A later play without a resolved original keeps the persisted one. */
+    history_free(&hl);
+    history_init(&hl);
+    MediaItem with_orig = {0};
+    with_orig.kind = ITEM_VIDEO;
+    snprintf(with_orig.id, sizeof(with_orig.id), "keepOrig01");
+    with_orig.title = tt_strdup("Keep localized");
+    with_orig.original_title = tt_strdup("Keep original");
+    assert(history_record(&hl, &with_orig, 1000));
+    assert(history_save(&hl, hist_path));
+    history_free(&hl);
+
+    history_init(&hl);
+    assert(history_load(&hl, hist_path));
+    MediaItem localized_only = {0};
+    localized_only.kind = ITEM_VIDEO;
+    snprintf(localized_only.id, sizeof(localized_only.id), "keepOrig01");
+    localized_only.title = tt_strdup("Keep localized again");
+    assert(history_record(&hl, &localized_only, 2000));
+    assert(hl.items[0].original_title &&
+           strcmp(hl.items[0].original_title, "Keep original") == 0);
+    assert(strcmp(hl.items[0].title, "Keep localized again") == 0);
+    history_free(&hl);
+    test_unlink_file(hist_path);
+    media_item_free_fields(&v);
+    media_item_free_fields(&with_orig);
+    media_item_free_fields(&localized_only);
+}
+
+static void test_original_opt_out_display_and_merge(void) {
+    MediaItem row = {0};
+    row.kind = ITEM_VIDEO;
+    snprintf(row.id, sizeof(row.id), "optOut01");
+    row.title = tt_strdup("Localized row title");
+    row.original_title = tt_strdup("Original row title");
+    row.description = tt_strdup("Localized row description");
+    row.original_description = tt_strdup("Original row description");
+
+    assert(strcmp(media_item_display_title_for(&row, false), "Localized row title") == 0);
+    assert(strcmp(media_item_display_description_for(&row, false),
+                  "Localized row description") == 0);
+    assert(media_item_has_description_for(&row, false));
+
+    /* A localized refresh after an original detail response keeps both kinds of
+       metadata; display selection decides what is shown. */
+    MediaItem pane;
+    assert(media_item_copy(&pane, &row));
+    MediaItem localized_refresh = {0};
+    localized_refresh.kind = ITEM_VIDEO;
+    snprintf(localized_refresh.id, sizeof(localized_refresh.id), "optOut01");
+    localized_refresh.title = tt_strdup("Newer localized detail title");
+    localized_refresh.description = tt_strdup("Newer localized detail description");
+    assert(media_item_apply_detail_merge(&row, &pane, true, &localized_refresh));
+    assert(strcmp(media_item_display_title_for(&row, false),
+                  "Newer localized detail title") == 0);
+    assert(strcmp(media_item_display_description_for(&row, false),
+                  "Newer localized detail description") == 0);
+
+    media_item_free_fields(&row);
+    media_item_free_fields(&pane);
+    media_item_free_fields(&localized_refresh);
+}
+
 static void test_non_english_lockup_and_badges(void) {
     const char *vi_browse =
         "{"
@@ -2180,6 +2316,9 @@ int main(void) {
     RUN_TEST(test_original_title_detail_merge);
     RUN_TEST(test_background_title_patch_is_field_only);
     RUN_TEST(test_copy_description_gating_and_player_opt_out);
+    RUN_TEST(test_original_description_and_url_links);
+    RUN_TEST(test_history_original_title_roundtrip);
+    RUN_TEST(test_original_opt_out_display_and_merge);
     RUN_TEST(test_non_english_lockup_and_badges);
     RUN_TEST(test_pe_subsystem_and_runtime_dep_checks);
     RUN_TEST(test_ytdlp_path_resolution_and_mpv_opts);
